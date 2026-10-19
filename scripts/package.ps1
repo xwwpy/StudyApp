@@ -39,7 +39,9 @@ try {
     Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/release-notes.md') -Destination (Join-Path $staging 'RELEASE-NOTES.md')
     Copy-Item -LiteralPath (Join-Path $repoRoot 'Cargo.lock') -Destination (Join-Path $staging 'Cargo.lock')
     [IO.Directory]::CreateDirectory((Join-Path $staging 'docs')) | Out-Null
-    Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/cloud-contract.md') -Destination (Join-Path $staging 'docs/cloud-contract.md')
+    foreach ($document in @('cloud-contract.md', 'sync-guide.md')) {
+        Copy-Item -LiteralPath (Join-Path $repoRoot "docs/$document") -Destination (Join-Path $staging "docs/$document")
+    }
     if (Test-Path -LiteralPath (Join-Path $repoRoot 'docs/verification.md') -PathType Leaf) {
         Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/verification.md') -Destination (Join-Path $staging 'docs/verification.md')
     }

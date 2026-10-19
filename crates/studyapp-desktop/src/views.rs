@@ -8,7 +8,6 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
     input::{Input, Textarea},
-    text::TextView,
     tooltip::Tooltip,
 };
 use gpui_kit::{prelude::FluentBuilder, *};
@@ -30,13 +29,13 @@ fn optional_stamp(time: Option<i64>, empty: &str) -> String {
 }
 fn review_tip(review: &Review) -> String {
     format!(
-        "学习时间：{}\n上次复习：{}\n下次复习：{}",
+        "最近学习：{}\n上次复习：{}\n下次复习：{}",
         stamp(review.learned_at),
         optional_stamp(review.last_review_at, "尚未复习"),
         optional_stamp(review.next_review_at, "本轮已完成")
     )
 }
-fn note_tip(snapshot: &Snapshot, id: &str) -> String {
+pub(crate) fn note_tip(snapshot: &Snapshot, id: &str) -> String {
     let learned = snapshot
         .sessions
         .iter()
@@ -451,193 +450,6 @@ impl StudyApp {
             )
     }
 
-    pub fn notes(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
-        let query = self.search.read(cx).value().to_lowercase();
-        let notes = snapshot.notes.iter().filter(|n| {
-            query.is_empty()
-                || n.title.to_lowercase().contains(&query)
-                || n.path.to_lowercase().contains(&query)
-        });
-        let list = column()
-            .w(px(265.))
-            .flex_shrink_0()
-            .child(Input::new(&self.search).cleanable(true))
-            .children(notes.map(|note| {
-                let id = note.id.clone();
-                let tip = note_tip(snapshot, &id);
-                let chosen = self.selected_note.as_ref() == Some(&id);
-                card()
-                    .id(SharedString::from(format!("note-{id}")))
-                    .p_4()
-                    .gap_2()
-                    .cursor_pointer()
-                    .when(chosen, |c| c.border_color(rgb(GREEN)).bg(rgb(LIGHT)))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(note.title.clone()),
-                    )
-                    .child(muted(format!(
-                        "{} 个版本  ·  {}",
-                        snapshot.versions.iter().filter(|v| v.note_id == id).count(),
-                        stamp(note.updated_at)
-                    )))
-                    .when(note.missing, |c| c.child(pill("原文件失联", 0xFFF0E9)))
-                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected_note = Some(id.clone());
-                        this.selected_version = None;
-                        this.refresh_preview();
-                        cx.notify();
-                    }))
-            }));
-        let selected = snapshot
-            .notes
-            .iter()
-            .find(|n| Some(&n.id) == self.selected_note.as_ref());
-        let detail = if let Some(note) = selected {
-            let id = note.id.clone();
-            let versions: Vec<_> = snapshot
-                .versions
-                .iter()
-                .filter(|v| v.note_id == id)
-                .collect();
-            let version = versions
-                .iter()
-                .rev()
-                .find(|v| self.selected_version.as_ref().is_none_or(|id| id == &v.id));
-            let mut reader = card()
-                .flex_1()
-                .min_w_0()
-                .child(
-                    row()
-                        .child(heading(note.title.clone()))
-                        .child(div().flex_1())
-                        .child(
-                            Button::new("record-note")
-                                .small()
-                                .primary()
-                                .label("记录学习")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_editor(EditorMode::Manual, window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("relink-note")
-                                .small()
-                                .ghost()
-                                .label("重新关联")
-                                .on_click(cx.listener(move |this, _, _, _| {
-                                    this.picker("relink", Some(id.clone()))
-                                })),
-                        ),
-                )
-                .child(muted(note.path.clone()))
-                .children(
-                    note.error
-                        .as_ref()
-                        .map(|error| pill(error.clone(), 0xFFF0E9)),
-                )
-                .child(
-                    row()
-                        .child(
-                            Button::new("preview-tab")
-                                .small()
-                                .ghost()
-                                .selected(!self.history)
-                                .label("阅读笔记")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.history = false;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new("history-tab")
-                                .small()
-                                .ghost()
-                                .selected(self.history)
-                                .label(format!("变更历史 ({})", versions.len()))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.history = true;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(muted(note_tip(snapshot, &note.id)));
-            if self.history {
-                reader = reader.child(row().flex_wrap().children(versions.iter().rev().map(|v| {
-                    let id = v.id.clone();
-                    Button::new(SharedString::from(format!("version-{id}")))
-                        .small()
-                        .selected(self.selected_version.as_ref() == Some(&id))
-                        .label(format!(
-                            "{}{}",
-                            stamp(v.captured_at),
-                            if v.offline { " · 离线" } else { "" }
-                        ))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.selected_version = Some(id.clone());
-                            this.refresh_preview();
-                            cx.notify();
-                        }))
-                })));
-                if let Some(version) = version {
-                    reader = reader
-                        .child(muted(version.summary.clone()))
-                        .child(muted(if version.offline {
-                            "离线期间的变更仅形成历史，不算作当前学习时间段。"
-                        } else {
-                            "新增行以 + 标记，删除行以 − 标记。"
-                        }))
-                        .child(
-                            column().gap_0().p_4().bg(rgb(BG)).rounded_lg().children(
-                                version
-                                    .diff
-                                    .lines()
-                                    .take(1500)
-                                    .enumerate()
-                                    .map(|(i, line)| {
-                                        let color = if line.starts_with('+') {
-                                            GREEN
-                                        } else if line.starts_with('-') {
-                                            0xB45142
-                                        } else {
-                                            MUTED
-                                        };
-                                        div()
-                                            .id(("diff-line", i))
-                                            .font_family("Consolas")
-                                            .text_xs()
-                                            .text_color(rgb(color))
-                                            .child(line.to_owned())
-                                    }),
-                            ),
-                        );
-                    if version.diff.is_empty() {
-                        reader = reader.child(muted("首次导入的基线快照，没有前一版本差异。"));
-                    }
-                    if version.diff.lines().count() > 1500 {
-                        reader =
-                            reader.child(muted("差异预览显示前 1,500 行；完整内容保存在快照中。"));
-                    }
-                }
-            } else {
-                reader = reader.child(TextView::html(
-                    SharedString::from(format!("markdown-{}", self.preview_key)),
-                    self.preview_html.clone(),
-                ));
-            }
-            reader
-        } else {
-            empty(
-                "选择一份笔记",
-                "在左侧选择笔记，阅读内容或查看每次更改。悬停可查看学习与复习时间。",
-            )
-            .flex_1()
-        };
-        row().items_start().w_full().child(list).child(detail)
-    }
-
     pub fn reviews(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
         let now = Utc::now().timestamp();
         let today = today_date();
@@ -965,10 +777,13 @@ impl StudyApp {
                         )),
                 ),
         );
+        let record_date = self.record_date.read(cx).value();
+        let record_date = record_date.trim();
         let sessions: Vec<_> = snapshot
             .sessions
             .iter()
             .rev()
+            .filter(|s| record_date.is_empty() || day_of(s.ended_at) == record_date)
             .filter(|s| match self.record_filter {
                 1 => s.status == SessionStatus::Learned,
                 2 => s.status == SessionStatus::Missed,
@@ -981,6 +796,12 @@ impl StudyApp {
                 .child(
                     row()
                         .child(heading(format!("全部学习记录 · {} 条", sessions.len())))
+                        .child(
+                            div()
+                                .id("record-date-filter")
+                                .w(px(210.))
+                                .child(Input::new(&self.record_date).cleanable(true)),
+                        )
                         .child(div().flex_1())
                         .children(
                             ["全部", "已学习", "未学习", "待回答"]
@@ -1038,17 +859,18 @@ impl StudyApp {
                 match result { Ok(settings) => this.send(Command::SaveSettings(settings), cx), Err(e) => { this.notice = Some(Err(e.to_string())); cx.notify(); } }
             }))))
             .child(card().child(heading("数据保存"))
-                .child(row().child(pill("✓ 本地保存", LIGHT)).child(Button::new("cloud-disabled").label("云端保存 · 尚未接入").disabled(true)).child(Button::new("hybrid-disabled").label("本地 + 云端 · 尚未接入").disabled(true)))
+                .child(row().child(pill("✓ 本地资料库", LIGHT)).child(muted("可在下方配置笔记文件同步")))
                 .child(muted(snapshot.data_path.clone()))
                 .child(row().child(Button::new("switch-library").label("选择资料库目录").on_click(cx.listener(|this, _, _, _| this.picker("library", None))))
                     .child(Button::new("backup").label("导出备份").on_click(cx.listener(|this, _, _, _| this.picker("backup", None))))
                     .child(Button::new("restore").label("从备份恢复").on_click(cx.listener(|this, _, _, _| this.picker("restore", None)))))
                 .child(muted("切换目录会打开该目录的资料库，原资料保留。要迁移资料，请先导出备份、切换目录，再恢复备份。")))
+            .child(self.sync_panel.clone())
             .child(card().child(heading("账户与微信登录"))
                 .child(row().child(pill("本地访客", LIGHT)).child(Button::new("wechat-disabled").label("微信登录 · 尚未连接服务").disabled(true)))
-                .child(muted("本地版无需登录。后续连接服务端后，可启用微信扫码登录与跨设备同步。")))
+                .child(muted("无需登录即可使用本地功能及自己的文件同步服务。微信登录仍保留后续接入。")))
             .child(card().child(heading("文件历史与隐私"))
-                .child(muted("应用只追踪你导入的 Markdown 文件；保留内容快照，不改写原文件。运行时约每 3 秒检查一次，快速连续保存会合并为稳定版本。"))
+                .child(muted("新建笔记保存在资料库 notes 目录，保存时自动生成版本；外部导入文件保持只读。运行时约每 3 秒检查文件改动，快速连续保存会合并为稳定版本。"))
                 .child(muted("离线期间只能比较上次快照与当前内容，无法还原中间的每一次保存。文件变化用于建议摘要，必须由你确认才会记为学习。"))
                 .child(muted("笔记预览不加载图片或执行 HTML；学习时长来自你的确认，不代表对实际专注的自动测量。")))
     }

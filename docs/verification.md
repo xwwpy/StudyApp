@@ -1,8 +1,34 @@
 # 验证记录
 
+## 0.2.0 本地验收
+
+2026-10-19，Windows x64 / Rust 1.98.0 / GPUI Kit 0.7.3，使用提交的 Cargo.lock：
+
+- `cargo test --workspace --all-features --locked`：95 项通过（核心 53、桌面 28、同步 14），无失败。覆盖两个独立资料库互传、双边冲突、下载副本离线归属、配置失败及副本编辑后的幂等重试、并发修改保护、跨库旧请求拒绝、1 万条同步基线重启、DPAPI 与回环 HTTP WebDAV 条件写入。
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`、格式检查通过。
+- 最终原生窗口冒烟通过：五页渲染、复习完成/撤销、计时暂停、设置保存、备份恢复、学习版本选择；真实平台文件拖放、新建/编辑/预览 Markdown、草稿恢复、版本累积，以及通过设置页测试连接和同步到本地目录。实际目标 Markdown 文件和 UI 成功状态均断言通过。证据目录 `.scratch/smoke-v020-final-e5f1be59266f4b12904068e961865ac9`，截图包含 `note-editor.png`、`sync-settings.png`。
+- `cargo-audit 0.22.2`：0 个已知漏洞，8 个上游停止维护提示，未忽略公告。使用官方 RustSec 公告提交 `999ec89d5d3f10f20be14750ec8c2d8b44e0ac9b`，本机采用已下载公告 `--no-fetch`。
+- `cargo-deny 0.20.2 --locked check licenses bans sources` 全部通过。新增 TLS 依赖所用 ISC 许可证已加入允许列表，发布包保留依赖声明及许可证文件。
+- 独立代码审查发现的文件覆盖竞态、硬链接不支持时的阻塞、远端版本错误学习归属、配置容量与重试、重复同步、未保存目标、跨库异步请求问题均已修复并复核。保留文件夹第三方写入和真实服务商兼容性边界。
+
+### 发布流程与范围
+
+2026-10-19：工作区已升级至 0.2.0，并新增 `studyapp-sync`。0.2.0 的功能范围包含托管 Markdown、草稿、拖入及 WebDAV / 文件夹同步；下方 0.1.0 结果只记录旧版本，不能作为新增同步依赖、整套窗口流程或真实存储服务的验收证据。
+
+- 笔记 UI 已通过集成编译，4 项草稿测试通过，覆盖恢复、关闭前刷新、资料库隔离、清空顺序与损坏文件保留。命令：`cargo test -p studyapp-desktop --bin studyapp drafts::tests --offline`。
+- CI 配置已要求 Windows / Linux 同时运行 `studyapp-core` 与 `studyapp-sync` 测试。Windows 工作区全特性测试、Clippy 和原生窗口冒烟仍保留。Release 同样以两平台业务测试为前置条件。
+- 发布脚本验证通过：PowerShell AST 语法检查；用现有 0.2.0 调试 EXE 在全新 `.scratch/package-v020-validation-9efb3281bf0d433495906f9cbe4a9cf5` 目录打包成功。ZIP 935 个条目包含同步指南、发布说明、锁文件及 reqwest / quick-xml 通知，未包含资料库、草稿或凭据；SHA256 一致，重复输出和工作区版本不匹配均在写入前被拒绝。这项检查验证打包脚本，不作为最终 release 二进制验收。
+- 三份 workflow YAML 解析通过，结构断言确认 Windows / Linux core+sync 矩阵、Windows 全特性测试 / Clippy / 原生 smoke、Release 前置依赖和全部 Actions 完整提交固定；`git diff --check` 通过。未在本地执行 GitHub Actions 或 Linux job。
+- 上述本地全量测试、增强原生冒烟与审计已实际执行；GitHub 对应提交的 CI/CD 结果以 Actions 和 Release 为准。
+- 自动化使用本地目录和回环 WebDAV fixture；未声称已用真实用户账号验证服务商 WebDAV、真实 NAS、微信登录、代码签名或自动更新。
+
+---
+
+## 0.1.0 历史验证记录
+
 验证日期：2026-10-19。Windows x64，Rust 1.98.0，GPUI Kit 0.7.3，使用提交的 Cargo.lock。
 
-## 本地执行
+### 本地执行
 
 - `cargo fmt --all -- --check`：通过。
 - `cargo test --workspace --all-features --locked --offline`：45 项通过（核心 35、呈现 4、工作线程 4、冒烟目录保护 2），无失败。
@@ -16,10 +42,10 @@
 - `cargo-deny 0.20.2 --locked check licenses bans sources`：三项通过；框架多版本依赖提示保留。
 - PowerShell 打包：真实 EXE 打包成功，ZIP 内容和 SHA256 校验一致，重复输出拒绝覆盖，非法版本参数被拒绝；不包含用户资料库。
 
-## 远端执行
+### 远端执行
 
-首次推送 `e0d203f` 的 [Security and licenses](https://github.com/xwwpy/StudyApp/actions/runs/39261248613) 已通过；[CI](https://github.com/xwwpy/StudyApp/actions/runs/39261248603) 的 Windows/Linux 核心测试已通过，Windows 桌面检查仍在执行。本地随后修复了独立代码审查发现的离线恢复归属和版本关联问题，上述 45 项测试与增强后的原生冒烟已覆盖这些修复。最终提交、标签对应的远端结果以 [Actions](https://github.com/xwwpy/StudyApp/actions) 和 [Release](https://github.com/xwwpy/StudyApp/releases/tag/v0.1.0) 页面为准；工作流源码本身不作为执行成功证据。
+最终提交 `faa9279` 的 [main CI](https://github.com/xwwpy/StudyApp/actions/runs/39262465983) 已全部通过，包括 Windows/Linux 核心测试和 Windows 桌面原生窗口测试。[v0.1.0 发布流水线](https://github.com/xwwpy/StudyApp/actions/runs/39262466051) 的构建、审计、原生冒烟、打包与发布均成功，[Release](https://github.com/xwwpy/StudyApp/releases/tag/v0.1.0) 已发布。
 
-## 范围
+### 当时范围
 
-当前交付为 Windows 本地版本。微信登录、云端保存、双端同步保留接口与设置入口，尚未接入后端；没有自动更新和代码签名。系统通知还受 Windows 通知权限影响。文件历史为运行时轮询快照，不能还原关闭应用期间的每次编辑。
+0.1.0 交付为 Windows 本地版本。微信登录、云端保存、双端同步保留接口与设置入口，尚未接入后端；没有自动更新和代码签名。系统通知还受 Windows 通知权限影响。文件历史为运行时轮询快照，不能还原关闭应用期间的每次编辑。

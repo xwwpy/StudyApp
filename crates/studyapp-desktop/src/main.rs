@@ -3,7 +3,14 @@
 mod app;
 mod assets;
 mod components;
+mod credentials;
+mod drafts;
+mod imports;
+mod note_editor;
+mod notes_view;
 mod smoke;
+mod sync_runtime;
+mod sync_ui;
 mod views;
 mod worker;
 

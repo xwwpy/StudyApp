@@ -156,9 +156,86 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
                 assert_eq!(session.version_ids, vec![snapshot.versions[0].id.clone()]);
                 assert_eq!(snapshot.reviews.len(), 2);
             }).expect("saved learning snapshot association");
+
+            // Exercise native file-drop delivery, then the actual managed-note controls.
+            let dropped = database.with_file_name("dropped.md");
+            std::fs::write(&dropped, "# 拖入的 Markdown\n文件拖放集成验证").unwrap();
+            window.update(cx, |_, window, cx| {
+                window.click(("nav", 1_usize), cx);
+                let position = point(px(450.), px(200.));
+                window.dispatch_event(PlatformInput::FileDrop(FileDropEvent::Entered { position, paths: ExternalPaths(vec![dropped].into_iter().collect()) }), cx);
+                window.render_frame(cx);
+                window.dispatch_event(PlatformInput::FileDrop(FileDropEvent::Pending { position }), cx);
+                window.render_frame(cx);
+                window.dispatch_event(PlatformInput::FileDrop(FileDropEvent::Submit { position }), cx);
+            }).expect("native file drop");
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            window.update(cx, |_, window, cx| {
+                assert_eq!(view.read(cx).snapshot.as_ref().unwrap().notes.len(), 2);
+                window.click("new-note", cx);
+                assert!(view.read(cx).note_editor.is_some());
+                view.update(cx, |app, cx| {
+                    app.note_title.update(cx, |s, cx| s.set_value("原生编辑测试", window, cx));
+                    app.note_content.update(cx, |s, cx| s.set_value("# 原生编辑测试\n\n第一次保存。", window, cx));
+                });
+                window.click("note-preview-toggle", cx);
+                assert!(view.read(cx).note_preview);
+                window.render_to_image().unwrap().save(database.with_file_name("note-editor.png")).unwrap();
+                window.click("save-note", cx);
+            }).expect("create managed note");
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let managed_id = window.update(cx, |_, window, cx| {
+                let app = view.read(cx);
+                assert!(app.note_editor.is_none());
+                let id = app.selected_note.clone().unwrap();
+                let note = app.snapshot.as_ref().unwrap().notes.iter().find(|n| n.id == id).unwrap();
+                assert!(note.managed);
+                assert!(Path::new(&note.path).is_file());
+                window.click("edit-note", cx);
+                view.update(cx, |app, cx| app.note_content.update(cx, |s, cx| s.set_value("# 原生编辑测试\n\n第二次保存，保留历史。", window, cx)));
+                window.click("keep-note-draft", cx);
+                assert!(view.read(cx).recoverable_draft.is_some());
+                window.click("recover-note-draft", cx);
+                assert!(view.read(cx).note_content.read(cx).value().contains("第二次保存"));
+                window.click("save-note", cx);
+                id
+            }).expect("edit and recover draft");
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let sync_folder = database.with_file_name("sync-target");
+            std::fs::create_dir(&sync_folder).unwrap();
+            window.update(cx, |_, window, cx| {
+                let snapshot = view.read(cx).snapshot.as_ref().unwrap();
+                assert_eq!(snapshot.versions.iter().filter(|v| v.note_id == managed_id).count(), 2);
+                window.click(("nav", 4_usize), cx);
+                // Scroll the actual settings surface to expose the sync card.
+                window.dispatch_event(ScrollWheelEvent { position: point(px(800.), px(450.)), delta: ScrollDelta::Pixels(point(px(0.), px(-520.))), ..Default::default() }.to_platform_input(), cx);
+                window.render_frame(cx);
+                window.click(("sync-target", 1_usize), cx);
+                let panel = view.read(cx).sync_panel.clone();
+                panel.update(cx, |panel, cx| panel.folder.update(cx, |s, cx| s.set_value(sync_folder.to_string_lossy().into_owned(), window, cx)));
+                window.click("save-sync-settings", cx);
+            }).expect("configure folder sync through interface");
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            window.update(cx, |_, window, cx| {
+                window.click("test-sync", cx);
+            }).expect("test folder connection");
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            window.update(cx, |_, window, cx| {
+                assert!(view.read(cx).sync_panel.read(cx).status.message.contains("连接测试成功"));
+                window.click("sync-now", cx);
+            }).expect("sync notes through interface");
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            window.update(cx, |_, window, cx| {
+                let panel = view.read(cx).sync_panel.read(cx);
+                assert!(!panel.status.busy);
+                assert!(panel.status.last_success.is_some(), "{}", panel.status.message);
+                assert!(sync_folder.join("StudyApp/notes").join(format!("{managed_id}.md")).is_file());
+                window.render_frame(cx);
+                window.render_to_image().unwrap().save(database.with_file_name("sync-settings.png")).unwrap();
+            }).expect("synced markdown verified");
         }
         let report = database.with_file_name("smoke-result.txt");
-        std::fs::write(report, "PASS: five native pages rendered; ui-test additionally captured screenshots and exercised navigation, review checkbox, undo, pause, settings save, backup restore refresh, learning save and version validation.\n").expect("write smoke report");
+        std::fs::write(report, "PASS: five native pages rendered; ui-test captured screenshots and exercised navigation, review checkbox, undo, pause, settings save, backup restore refresh, learning version validation, native file drop, note create/edit/preview, draft recovery, version history, folder connection and actual Markdown sync.\n").expect("write smoke report");
         cx.update(|cx| cx.quit());
     }).detach();
 }

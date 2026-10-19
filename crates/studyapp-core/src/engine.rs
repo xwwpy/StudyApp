@@ -10,6 +10,7 @@ pub struct Engine {
     conn: Connection,
     path: PathBuf,
     state: State,
+    managed_storage_checked: bool,
 }
 fn id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -28,10 +29,41 @@ impl Engine {
         storage::configure(&conn)?;
         let path = std::fs::canonicalize(database)?;
         let mut state = storage::load(&conn)?.unwrap_or_else(|| State::new(now));
+        crate::managed::rebase(&mut state, &path)?;
+        let recovered_conflict = crate::managed::recover(&mut conn, &path, &mut state)
+            .context("托管笔记恢复未完成，原文和写入草稿仍保留；请排除文件占用或目录错误后重试")?;
         state.last_tick = state.last_tick.max(now);
         state.expire(now);
-        let mut engine = Self { conn, path, state };
+        let mut engine = Self {
+            conn,
+            path,
+            state,
+            managed_storage_checked: false,
+        };
+        let recovery_errors: Vec<_> = if recovered_conflict {
+            engine
+                .state
+                .notes
+                .iter()
+                .filter_map(|note| note.error.clone().map(|error| (note.id.clone(), error)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         engine.apply(Command::Scan { offline: true }, now)?;
+        if !recovery_errors.is_empty() {
+            for (id, error) in recovery_errors {
+                if let Some(note) = engine.state.notes.iter_mut().find(|note| note.id == id) {
+                    note.error = Some(error);
+                }
+            }
+            storage::save(
+                &mut engine.conn,
+                &engine.state,
+                engine.state.versions.len(),
+                false,
+            )?;
+        }
         Ok(engine)
     }
     pub fn snapshot(&self) -> Snapshot {
@@ -39,6 +71,7 @@ impl Engine {
             .snapshot(self.path.to_string_lossy().into_owned())
     }
     pub fn apply(&mut self, command: Command, now: i64) -> Result<String> {
+        self.recover_writes()?;
         if let Command::Backup(path) = &command {
             self.backup(path)?;
             return Ok(format!("备份已保存：{}", path.display()));
@@ -48,6 +81,97 @@ impl Engine {
         }
         let mut next = self.state.clone();
         next.expire(now);
+        match &command {
+            Command::CreateNote { title, content } => {
+                let write = crate::managed::create(
+                    &mut next,
+                    &self.path,
+                    id(),
+                    title.clone(),
+                    content.clone(),
+                    now,
+                    false,
+                )?;
+                self.write_managed(next, vec![write], false)?;
+                return Ok("笔记已创建".into());
+            }
+            Command::SaveNote {
+                note_id,
+                expected_hash,
+                content,
+            } => {
+                if let Some(write) = crate::managed::edit(
+                    &mut next,
+                    &self.path,
+                    note_id,
+                    expected_hash,
+                    content.clone(),
+                    now,
+                    false,
+                )? {
+                    self.write_managed(next, vec![write], false)?;
+                }
+                return Ok("笔记已保存".into());
+            }
+            Command::ReceiveSyncedNote {
+                note_id,
+                expected_hash,
+                content,
+            } => {
+                crate::managed::validate_id(note_id)?;
+                let write = if let Some(hash) = expected_hash {
+                    crate::managed::edit(
+                        &mut next,
+                        &self.path,
+                        note_id,
+                        hash,
+                        content.clone(),
+                        now,
+                        true,
+                    )?
+                } else {
+                    Some(crate::managed::create(
+                        &mut next,
+                        &self.path,
+                        note_id.clone(),
+                        String::new(),
+                        content.clone(),
+                        now,
+                        true,
+                    )?)
+                };
+                if let Some(write) = write {
+                    self.write_managed(next, vec![write], false)?;
+                }
+                return Ok("同步笔记已接收（离线版本）".into());
+            }
+            Command::ReceiveSyncedCopy {
+                note_id,
+                title,
+                content,
+            } => {
+                let write = crate::managed::create(
+                    &mut next,
+                    &self.path,
+                    note_id.clone(),
+                    title.clone(),
+                    content.clone(),
+                    now,
+                    true,
+                )?;
+                self.write_managed(next, vec![write], false)?;
+                return Ok("同步副本已接收（离线版本）".into());
+            }
+            Command::ExportNote {
+                note_id,
+                version_id,
+                path,
+            } => {
+                crate::managed::export(&next, note_id, version_id.as_deref(), path)?;
+                return Ok(format!("Markdown 已导出：{}", path.display()));
+            }
+            _ => {}
+        }
         let message = match command {
             Command::SaveSettings(settings) => {
                 settings.validate()?;
@@ -284,13 +408,20 @@ impl Engine {
                 next.validate()?;
                 "已撤销上次复习".into()
             }
-            Command::Backup(_) | Command::Restore(_) => unreachable!(),
+            Command::Backup(_)
+            | Command::Restore(_)
+            | Command::CreateNote { .. }
+            | Command::SaveNote { .. }
+            | Command::ReceiveSyncedNote { .. }
+            | Command::ReceiveSyncedCopy { .. }
+            | Command::ExportNote { .. } => unreachable!(),
         };
         storage::save(&mut self.conn, &next, self.state.versions.len(), false)?;
         self.state = next;
         Ok(message)
     }
     pub fn tick(&mut self, now: i64, elapsed_seconds: u64) -> Result<()> {
+        self.recover_writes()?;
         let mut next = self.state.clone();
         next.expire(now);
         if !next.timer.paused && (1..=10).contains(&elapsed_seconds) && now > next.last_tick {
@@ -321,6 +452,7 @@ impl Engine {
         Ok(())
     }
     pub fn checkpoint(&mut self) -> Result<()> {
+        self.recover_writes()?;
         storage::save(
             &mut self.conn,
             &self.state,
@@ -530,10 +662,32 @@ impl Engine {
         restored.last_tick = restored.last_tick.max(now);
         restored.candidates.clear();
         restored.expire(now);
-        crate::notes::scan(&mut restored, true, now);
-        storage::save(&mut self.conn, &restored, 0, true)?;
-        self.state = restored;
+        let writes = crate::managed::restore_writes(&mut restored, &self.path, now)?;
+        crate::notes::scan_external(&mut restored, true, now);
+        self.write_managed(restored, writes, true)?;
         Ok(format!("资料库已恢复；恢复前备份：{}", pre.display()))
+    }
+    fn write_managed(
+        &mut self,
+        next: State,
+        writes: Vec<crate::managed::Write>,
+        replace: bool,
+    ) -> Result<()> {
+        if !self.managed_storage_checked && !writes.is_empty() {
+            crate::managed::check_filesystem(&self.path)?;
+            self.managed_storage_checked = true;
+        }
+        crate::managed::prepare(&mut self.conn, &self.state, next, writes, replace)?;
+        self.recover_writes()
+    }
+    fn recover_writes(&mut self) -> Result<()> {
+        let conflict = crate::managed::recover(&mut self.conn, &self.path, &mut self.state)
+            .context("托管写入未完成，原文和草稿仍保留；排除文件占用或目录错误后重试")?;
+        ensure!(
+            !conflict,
+            "发现外部修改：外部文件未被覆盖，待保存草稿已保留在版本历史"
+        );
+        Ok(())
     }
 }
 fn unique(ids: Vec<String>) -> Vec<String> {
@@ -541,4 +695,46 @@ fn unique(ids: Vec<String>) -> Vec<String> {
     ids.into_iter()
         .filter(|id| seen.insert(id.clone()))
         .collect()
+}
+
+#[cfg(test)]
+mod managed_storage_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_hard_links_never_leave_a_blocking_write_intent() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let mut engine = Engine::open(&dir.join("library.sqlite"), 1000).unwrap();
+        crate::managed::FAIL_LINK_PROBE.with(|fail| fail.set(true));
+        assert!(
+            engine
+                .apply(
+                    Command::CreateNote {
+                        title: "draft".into(),
+                        content: "draft remains in editor".into()
+                    },
+                    1001
+                )
+                .is_err()
+        );
+        let count: i64 = engine
+            .conn
+            .query_row("SELECT count(*) FROM write_intents", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(engine.snapshot().notes.is_empty());
+        engine.apply(Command::SetPaused(true), 1002).unwrap();
+        engine.checkpoint().unwrap();
+        assert!(engine.snapshot().timer.paused);
+        engine
+            .apply(
+                Command::CreateNote {
+                    title: "retry".into(),
+                    content: "saved after retry".into(),
+                },
+                1003,
+            )
+            .unwrap();
+        assert_eq!(engine.snapshot().notes.len(), 1);
+    }
 }

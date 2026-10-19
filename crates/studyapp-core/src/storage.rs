@@ -9,7 +9,7 @@ use std::{
 };
 
 pub(crate) const APP_ID: i32 = 0x53545544;
-pub(crate) const SCHEMA: i32 = 1;
+pub(crate) const SCHEMA: i32 = 2;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Undo {
     pub event_id: String,
@@ -133,6 +133,10 @@ impl State {
                 !n.id.is_empty() && n.revision > 0 && ids.insert(&n.id),
                 "笔记 ID 或修订号无效"
             );
+            if n.managed {
+                crate::managed::validate_id(&n.id)?;
+                ensure!(n.title.chars().count() <= 200, "托管笔记标题超过 200 字符");
+            }
         }
         let notes = ids;
         let mut version_ids = std::collections::HashSet::new();
@@ -376,12 +380,21 @@ pub(crate) fn initialize(conn: &mut Connection) -> Result<()> {
     );
     if app_id == 0 {
         let tx = conn.transaction()?;
-        tx.execute_batch("CREATE TABLE app_state (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL); CREATE TABLE note_versions (sequence INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, data TEXT NOT NULL);")?;
+        tx.execute_batch("CREATE TABLE app_state (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL); CREATE TABLE note_versions (sequence INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, data TEXT NOT NULL); CREATE TABLE write_intents (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);")?;
         tx.pragma_update(None, "application_id", APP_ID)?;
         tx.pragma_update(None, "user_version", SCHEMA)?;
         tx.commit()?;
     }
     let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version == 1 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE write_intents (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);",
+        )?;
+        tx.pragma_update(None, "user_version", SCHEMA)?;
+        tx.commit()?;
+        return Ok(());
+    }
     ensure!(version == SCHEMA, "资料库版本不受支持：{version}");
     Ok(())
 }
@@ -408,8 +421,18 @@ pub(crate) fn save(
     previous_count: usize,
     replace: bool,
 ) -> Result<()> {
-    let raw = serde_json::to_string(state)?;
     let tx = conn.transaction()?;
+    write_state(&tx, state, previous_count, replace)?;
+    tx.commit()?;
+    Ok(())
+}
+pub(crate) fn write_state(
+    tx: &rusqlite::Transaction<'_>,
+    state: &State,
+    previous_count: usize,
+    replace: bool,
+) -> Result<()> {
+    let raw = serde_json::to_string(state)?;
     if replace {
         tx.execute("DELETE FROM note_versions", [])?;
     }
@@ -424,7 +447,6 @@ pub(crate) fn save(
         )?;
     }
     tx.execute("INSERT INTO app_state(id,data) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET data=excluded.data", [raw])?;
-    tx.commit()?;
     Ok(())
 }
 pub(crate) fn verified_backup(path: &Path) -> Result<State> {
@@ -432,10 +454,18 @@ pub(crate) fn verified_backup(path: &Path) -> Result<State> {
     let app_id: i32 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
     let schema: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     ensure!(
-        app_id == APP_ID && schema == SCHEMA,
+        app_id == APP_ID && (schema == 1 || schema == SCHEMA),
         "备份不是受支持的 StudyApp 资料库"
     );
     let check: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
     ensure!(check == "ok", "备份完整性检查失败：{check}");
+    if schema >= 2 {
+        let pending: i64 =
+            conn.query_row("SELECT count(*) FROM write_intents", [], |r| r.get(0))?;
+        ensure!(
+            pending == 0,
+            "备份含有未完成的托管笔记写入，请先在原资料库恢复写入"
+        );
+    }
     load(&conn)?.context("备份中没有资料")
 }

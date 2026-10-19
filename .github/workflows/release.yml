@@ -12,7 +12,28 @@ env:
   RUST_BACKTRACE: '1'
 
 jobs:
+  core-sync:
+    name: Core and sync (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: release-core-sync-${{ matrix.os }}
+      - run: cargo test --locked -p studyapp-core -p studyapp-sync
+
   build:
+    needs: core-sync
     runs-on: windows-latest
     timeout-minutes: 90
     defaults:
@@ -62,7 +83,7 @@ jobs:
         with:
           name: windows-release-smoke
           path: |
-            ${{ env.SMOKE_DIR }}/page-*.png
+            ${{ env.SMOKE_DIR }}/*.png
             ${{ env.SMOKE_DIR }}/smoke-result.txt
           if-no-files-found: warn
           retention-days: 30

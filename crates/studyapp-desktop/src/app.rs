@@ -1,5 +1,6 @@
 use crate::{
     components::*,
+    drafts::{DraftStore, NoteDraft},
     worker::{Work, Worker},
 };
 use chrono::{Local, Utc};
@@ -56,6 +57,17 @@ pub struct StudyApp {
     pub record_limit: usize,
     pub review_filter: usize,
     pub last_library: String,
+    pub drafts: DraftStore,
+    pub note_title: Entity<InputState>,
+    pub note_content: Entity<TextareaState>,
+    pub note_editor: Option<NoteDraft>,
+    pub recoverable_draft: Option<NoteDraft>,
+    pub draft_loading: bool,
+    pub draft_failed: bool,
+    pub record_date: Entity<InputState>,
+    pub note_saving: bool,
+    pub note_preview: bool,
+    pub sync_panel: Entity<crate::sync_ui::SyncPanel>,
     notified: HashSet<String>,
     _poll: Task<()>,
 }
@@ -83,13 +95,48 @@ impl StudyApp {
                 }
             }
         });
-        let search = input("搜索笔记标题或路径", "", window, cx);
+        let search = input("搜索标题、路径与正文", "", window, cx);
         cx.subscribe(
             &search,
             |_, _, _: &gpui_kit::component::input::InputEvent, cx| cx.notify(),
         )
         .detach();
+        let record_date = input("学习日期 YYYY-MM-DD", "", window, cx);
+        cx.subscribe(
+            &record_date,
+            |this, _, _: &gpui_kit::component::input::InputEvent, cx| {
+                this.record_limit = 50;
+                cx.notify();
+            },
+        )
+        .detach();
+        let note_title = input("笔记标题", "", window, cx);
+        let note_content =
+            cx.new(|cx| TextareaState::new(window, cx).placeholder("使用标准 Markdown 记录知识…"));
+        cx.subscribe(
+            &note_title,
+            |this, _, _: &gpui_kit::component::input::InputEvent, cx| this.capture_note_draft(cx),
+        )
+        .detach();
+        cx.subscribe(
+            &note_content,
+            |this, _, _: &gpui_kit::component::input::InputEvent, cx| this.capture_note_draft(cx),
+        )
+        .detach();
+        let sync_panel =
+            cx.new(|cx| crate::sync_ui::SyncPanel::new(worker.sender.clone(), window, cx));
         Self {
+            sync_panel,
+            drafts: DraftStore::new(),
+            note_title,
+            note_content,
+            record_date,
+            draft_failed: false,
+            note_editor: None,
+            recoverable_draft: None,
+            draft_loading: true,
+            note_saving: false,
+            note_preview: false,
             worker,
             snapshot: None,
             page: Page::Today,
@@ -129,8 +176,26 @@ impl StudyApp {
     }
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut changed = false;
+        self.sync_panel
+            .update(cx, |panel, cx| panel.poll(window, cx));
+        let mut changed = self.poll_drafts(cx);
         while let Ok(update) = self.worker.receiver.try_recv() {
+            if let Some(status) = update.sync_status {
+                self.sync_panel.update(cx, |panel, cx| {
+                    panel.accept(status, update.library_replaced, window, cx)
+                });
+            }
+            if let Some(result) = update.note_result {
+                self.note_saving = false;
+                if let Ok(note_id) = result {
+                    self.selected_note = Some(note_id);
+                    self.selected_version = None;
+                    self.note_editor = None;
+                    self.recoverable_draft = None;
+                    self.drafts.save(&self.last_library, None);
+                    self.page = Page::Notes;
+                }
+            }
             if update.editor_result {
                 self.saving = false;
                 if update.notice.as_ref().is_some_and(Result::is_ok) {
@@ -142,7 +207,14 @@ impl StudyApp {
             }
             if let Some(snapshot) = update.snapshot {
                 if update.library_replaced || self.last_library != snapshot.data_path {
+                    self.capture_note_draft(cx);
+                    self.note_editor = None;
+                    self.recoverable_draft = None;
+                    self.note_saving = false;
+                    self.draft_loading = true;
+                    self.draft_failed = false;
                     self.last_library = snapshot.data_path.clone();
+                    self.drafts.load(&self.last_library);
                     self.selected_note = None;
                     self.selected_version = None;
                     self.preview_key.clear();
@@ -216,18 +288,29 @@ impl StudyApp {
     }
 
     pub fn send(&mut self, command: Command, cx: &mut Context<Self>) {
-        if self.worker.sender.send(Work::Apply(command)).is_err() {
+        if self
+            .worker
+            .sender
+            .send(Work::Scoped {
+                library: self.last_library.clone(),
+                work: Box::new(Work::Apply(command)),
+            })
+            .is_err()
+        {
             self.notice = Some(Err("后台服务已停止，请重新打开应用".into()));
             self.saving = false;
+            self.note_saving = false;
         }
         cx.notify();
     }
 
     pub fn picker(&self, action: &'static str, note: Option<String>) {
         let sender = self.worker.sender.clone();
+        let library = self.last_library.clone();
         std::thread::spawn(move || {
             let work = match action {
-                "import" => rfd::FileDialog::new().set_title("导入 Markdown 笔记").add_filter("Markdown", &["md", "markdown"]).pick_files().map(|files| Work::Apply(Command::Import(files))),
+                "import" => rfd::FileDialog::new().set_title("导入 Markdown 笔记").add_filter("Markdown", &["md", "markdown"]).pick_files().map(Work::ImportPaths),
+                "import-folder" => rfd::FileDialog::new().set_title("导入目录中的 Markdown").pick_folder().map(|p| Work::ImportPaths(vec![p])),
                 "relink" => rfd::FileDialog::new().add_filter("Markdown", &["md", "markdown"]).pick_file().zip(note).map(|(path, note_id)| Work::Apply(Command::Relink { note_id, path })),
                 "backup" => rfd::FileDialog::new().set_file_name(format!("StudyApp-{}.sqlite3", Local::now().format("%Y%m%d-%H%M%S"))).save_file().map(|p| Work::Apply(Command::Backup(p))),
                 "restore" => rfd::FileDialog::new().set_title("选择 StudyApp 备份（恢复前自动保留当前资料）").add_filter("SQLite 备份", &["sqlite3", "sqlite", "db"]).pick_file().and_then(|p| {
@@ -238,7 +321,10 @@ impl StudyApp {
                 _ => None,
             };
             if let Some(work) = work {
-                let _ = sender.send(work);
+                let _ = sender.send(Work::Scoped {
+                    library,
+                    work: Box::new(work),
+                });
             }
         });
     }
@@ -483,7 +569,10 @@ impl StudyApp {
                     )
                     .child(muted("记录 · 回顾 · 再次掌握")),
             )
-            .child(muted("v0.1.0  ·  数据保存在此设备"))
+            .child(muted(format!(
+                "v{}  ·  数据保存在此设备",
+                env!("CARGO_PKG_VERSION")
+            )))
     }
 }
 
@@ -531,6 +620,32 @@ impl Render for StudyApp {
                 )
         });
         row()
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                if this
+                    .worker
+                    .sender
+                    .send(Work::Scoped {
+                        library: this.last_library.clone(),
+                        work: Box::new(Work::ImportPaths(paths.paths().to_vec())),
+                    })
+                    .is_err()
+                {
+                    this.notice = Some(Err("后台服务已停止".into()));
+                } else {
+                    this.notice = Some(Ok("正在后台导入拖入的 Markdown 文件…".into()));
+                }
+                cx.notify();
+            }))
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.modifiers.control
+                    && event.keystroke.key.eq_ignore_ascii_case("s")
+                    && this.page == Page::Notes
+                    && this.note_editor.is_some()
+                {
+                    this.save_note(cx);
+                    cx.stop_propagation();
+                }
+            }))
             .gap_0()
             .size_full()
             .bg(rgb(BG))
@@ -565,6 +680,9 @@ impl Render for StudyApp {
                                         Local::now().format("%Y 年 %m 月 %d 日").to_string(),
                                     )),
                             )
+                            .child(Button::new("new-note").label("新建笔记").on_click(
+                                cx.listener(|this, _, window, cx| this.new_note(window, cx)),
+                            ))
                             .child(
                                 Button::new("header-import")
                                     .icon(IconName::Plus)

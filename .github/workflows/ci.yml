@@ -19,7 +19,7 @@ env:
 
 jobs:
   core:
-    name: Core (${{ matrix.os }})
+    name: Core and sync (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -36,9 +36,9 @@ jobs:
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
-          key: core-${{ matrix.os }}
+          key: core-sync-${{ matrix.os }}
       - run: cargo fmt --all -- --check
-      - run: cargo test --locked -p studyapp-core
+      - run: cargo test --locked -p studyapp-core -p studyapp-sync
 
   windows:
     name: Windows desktop and native smoke
@@ -73,7 +73,7 @@ jobs:
         with:
           name: windows-native-smoke
           path: |
-            ${{ env.SMOKE_DIR }}/page-*.png
+            ${{ env.SMOKE_DIR }}/*.png
             ${{ env.SMOKE_DIR }}/smoke-result.txt
           if-no-files-found: warn
           retention-days: 14

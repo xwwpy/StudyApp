@@ -17,6 +17,8 @@ pub struct Note {
     pub id: String,
     pub path: String,
     pub title: String,
+    #[serde(default)]
+    pub managed: bool,
     pub missing: bool,
     pub error: Option<String>,
     pub created_at: i64,
@@ -96,6 +98,30 @@ pub struct Snapshot {
 }
 #[derive(Clone, Debug)]
 pub enum Command {
+    CreateNote {
+        title: String,
+        content: String,
+    },
+    SaveNote {
+        note_id: String,
+        expected_hash: String,
+        content: String,
+    },
+    ReceiveSyncedNote {
+        note_id: String,
+        expected_hash: Option<String>,
+        content: String,
+    },
+    ReceiveSyncedCopy {
+        note_id: String,
+        title: String,
+        content: String,
+    },
+    ExportNote {
+        note_id: String,
+        version_id: Option<String>,
+        path: PathBuf,
+    },
     Import(Vec<PathBuf>),
     Relink {
         note_id: String,

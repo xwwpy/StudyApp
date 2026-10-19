@@ -7,8 +7,8 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-const MAX_BYTES: u64 = 10 * 1024 * 1024;
-fn read(path: &Path) -> Result<String> {
+pub(crate) const MAX_BYTES: u64 = 10 * 1024 * 1024;
+pub(crate) fn read(path: &Path) -> Result<String> {
     ensure!(
         path.extension()
             .and_then(|s| s.to_str())
@@ -23,10 +23,10 @@ fn read(path: &Path) -> Result<String> {
     let text = String::from_utf8(bytes).context("笔记不是有效的 UTF-8 文本")?;
     Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).into())
 }
-fn hash(content: &str) -> String {
+pub(crate) fn hash(content: &str) -> String {
     format!("{:x}", Sha256::digest(content.as_bytes()))
 }
-fn title(content: &str, path: &Path) -> String {
+pub(crate) fn title(content: &str, path: &Path) -> String {
     content
         .lines()
         .find_map(|line| {
@@ -43,7 +43,7 @@ fn title(content: &str, path: &Path) -> String {
         .take(200)
         .collect()
 }
-fn append_version(
+pub(crate) fn append_version(
     state: &mut State,
     index: usize,
     content: String,
@@ -100,7 +100,9 @@ fn append_version(
         summary,
         diff,
     };
-    state.notes[index].title = title(&version.content, Path::new(&state.notes[index].path));
+    if !state.notes[index].managed || version.content.lines().any(|line| line.starts_with("# ")) {
+        state.notes[index].title = title(&version.content, Path::new(&state.notes[index].path));
+    }
     state.notes[index].updated_at = now;
     state.notes[index].revision += 1;
     Arc::make_mut(&mut state.versions).push(version);
@@ -130,6 +132,7 @@ pub(crate) fn import(state: &mut State, paths: Vec<PathBuf>, now: i64) -> String
                 id: uuid::Uuid::new_v4().to_string(),
                 path: key,
                 title: title(&content, &canonical),
+                managed: false,
                 missing: false,
                 error: None,
                 created_at: now,
@@ -167,6 +170,7 @@ pub(crate) fn relink(state: &mut State, note_id: &str, path: PathBuf, now: i64) 
         .iter()
         .position(|n| n.id == note_id)
         .context("找不到笔记")?;
+    ensure!(!state.notes[index].managed, "托管笔记不能关联外部路径");
     let path = std::fs::canonicalize(path)?;
     let key = path.to_string_lossy().into_owned();
     ensure!(
@@ -197,18 +201,36 @@ pub(crate) fn relink(state: &mut State, note_id: &str, path: PathBuf, now: i64) 
     Ok(())
 }
 pub(crate) fn scan(state: &mut State, offline: bool, now: i64) -> String {
+    scan_filtered(state, offline, now, false)
+}
+pub(crate) fn scan_external(state: &mut State, offline: bool, now: i64) -> String {
+    scan_filtered(state, offline, now, true)
+}
+fn scan_filtered(state: &mut State, offline: bool, now: i64, external_only: bool) -> String {
     if offline {
-        state
-            .offline_unreconciled_notes
-            .extend(state.notes.iter().map(|note| note.id.clone()));
+        state.offline_unreconciled_notes.extend(
+            state
+                .notes
+                .iter()
+                .filter(|note| !external_only || !note.managed)
+                .map(|note| note.id.clone()),
+        );
     }
     let mut captured = 0;
     let mut errors = 0;
     for index in 0..state.notes.len() {
+        if external_only && state.notes[index].managed {
+            continue;
+        }
         let path = PathBuf::from(&state.notes[index].path);
         let note_id = state.notes[index].id.clone();
         let capture_offline = offline || state.offline_unreconciled_notes.contains(&note_id);
-        match read(&path) {
+        let content = if state.notes[index].managed {
+            crate::managed::read_content(&path)
+        } else {
+            read(&path)
+        };
+        match content {
             Ok(content) => {
                 if state.notes[index].missing || state.notes[index].error.is_some() {
                     state.notes[index].updated_at = now;

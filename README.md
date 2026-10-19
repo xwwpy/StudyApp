@@ -2,13 +2,13 @@
 
 使用 GPUI Kit 0.7.3 构建的 Windows 中文学习桌面应用。创建或导入自己的 Markdown 笔记，定时确认学习内容，安排间隔复习，并将笔记文件同步到自己的 WebDAV、文件夹或兼容 NAS。无需 StudyApp 账户即可使用。
 
-当前版本为 **0.2.0**，采用本地优先存储。已支持托管 Markdown 编辑与版本历史、拖入导入，以及用户自有存储的笔记同步。**同步仅传输最新 Markdown，不传输学习记录、复习计划或完整版本历史**。微信登录和 StudyApp 账户云服务仍为预留接口，见 [同步指南](docs/sync-guide.md) 与 [扩展边界](docs/cloud-contract.md)。
+当前版本为 **0.2.1**，采用本地优先存储。已支持托管 Markdown 编辑与版本历史、拖入导入，以及用户自有存储的笔记同步。**同步仅传输最新 Markdown，不传输学习记录、复习计划或完整版本历史**。微信登录和 StudyApp 账户云服务仍为预留接口，见 [同步指南](docs/sync-guide.md) 与 [扩展边界](docs/cloud-contract.md)。
 
 ![StudyApp 今日学习原生界面](docs/images/dashboard.png)
 
 ## 启动
 
-从 [GitHub Releases](https://github.com/xwwpy/StudyApp/releases) 下载可用的 Windows x64 ZIP，解压后运行 `studyapp.exe`。ZIP 是免安装程序包，默认资料保存在用户应用数据目录，而非解压目录。发布程序**未进行代码签名**；尚无自动更新器。版本对应的标签为 `v0.2.0`；只有该标签的发布工作流成功，Release 才会出现对应下载。
+从 [GitHub Releases](https://github.com/xwwpy/StudyApp/releases) 下载可用的 Windows x64 ZIP，解压后运行 `studyapp.exe`。ZIP 是免安装程序包，默认资料保存在用户应用数据目录，而非解压目录。发布程序**未进行代码签名**；尚无自动更新器。版本对应的标签为 `v0.2.1`；只有该标签的发布工作流成功，Release 才会出现对应下载。
 
 支持 Windows 10/11 x64，使用 Windows 图形渲染；远程桌面、显卡驱动及受限运行环境可能影响窗口创建。若系统提示缺少 MSVC 运行库，安装微软 [Visual C++ x64 Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)。Linux CI 测试学习核心和同步库，不提供 Linux 桌面程序。
 

@@ -220,25 +220,48 @@ fn database_failure_leaves_original_file_and_snapshot_intact() {
 fn disk_failure_is_visible_and_retry_recovers_durable_draft() {
     let (dir, mut engine) = fixture();
     std::fs::write(dir.join("notes"), "blocking file").unwrap();
-    assert!(
-        engine
-            .apply(
-                Command::CreateNote {
-                    title: "draft".into(),
-                    content: "recover me".into()
-                },
-                1001
-            )
-            .is_err()
+    let command = Command::CreateNote {
+        title: "draft".into(),
+        content: "recover me".into(),
+    };
+    let before = serde_json::to_value(engine.snapshot()).unwrap();
+    assert!(engine.apply(command.clone(), 1001).is_err());
+    assert_eq!(serde_json::to_value(engine.snapshot()).unwrap(), before);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("notes")).unwrap(),
+        "blocking file"
     );
+    let conn = rusqlite::Connection::open(dir.join("learning.sqlite")).unwrap();
+    let pending: i64 = conn
+        .query_row("SELECT count(*) FROM write_intents", [], |row| row.get(0))
+        .unwrap();
+    assert!((0..=1).contains(&pending));
+    drop(conn);
     drop(engine);
     std::fs::rename(dir.join("notes"), dir.join("retained-blocker")).unwrap();
-    let engine = Engine::open(&dir.join("learning.sqlite"), 1002).unwrap();
+    let mut engine = Engine::open(&dir.join("learning.sqlite"), 1002).unwrap();
+    // ENOTDIR can reject the command before journaling on Unix, whereas Windows
+    // can reach the durable intent before discovering the obstructed directory.
+    // An early rejection requires an explicit retry; a durable intent replays.
+    if pending == 0 {
+        assert!(engine.snapshot().notes.is_empty());
+        engine.apply(command, 1003).unwrap();
+    }
     assert_eq!(engine.snapshot().notes.len(), 1);
+    assert_eq!(engine.snapshot().versions.len(), 1);
     assert_eq!(
         std::fs::read_to_string(&engine.snapshot().notes[0].path).unwrap(),
         "recover me"
     );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("retained-blocker")).unwrap(),
+        "blocking file"
+    );
+    let conn = rusqlite::Connection::open(dir.join("learning.sqlite")).unwrap();
+    let pending: i64 = conn
+        .query_row("SELECT count(*) FROM write_intents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(pending, 0);
 }
 
 #[test]

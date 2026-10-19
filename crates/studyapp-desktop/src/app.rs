@@ -44,6 +44,7 @@ pub struct StudyApp {
     pub review_days: Entity<InputState>,
     pub editor: Option<EditorMode>,
     pub chosen_notes: HashSet<String>,
+    pub chosen_versions: HashSet<String>,
     pub saving: bool,
     pub selected_note: Option<String>,
     pub selected_version: Option<String>,
@@ -110,6 +111,7 @@ impl StudyApp {
             review_days: input("用逗号分隔天数", "1, 3, 7, 14, 30", window, cx),
             editor: None,
             chosen_notes: HashSet::new(),
+            chosen_versions: HashSet::new(),
             saving: false,
             selected_note: None,
             selected_version: None,
@@ -147,6 +149,7 @@ impl StudyApp {
                     self.editor = None;
                     self.saving = false;
                     self.chosen_notes.clear();
+                    self.chosen_versions.clear();
                     self.notified.clear();
                     self.interval.update(cx, |s, cx| {
                         s.set_value(snapshot.settings.interval_minutes.to_string(), window, cx)
@@ -188,6 +191,8 @@ impl StudyApp {
                                 s.set_value(session.suggested_summary.clone(), window, cx)
                             });
                             self.chosen_notes = session.note_ids.iter().cloned().collect();
+                            self.chosen_versions = session.version_ids.iter().cloned().collect();
+                            self.seed_versions(&snapshot, session.ended_at);
                             self.page = Page::Today;
                         }
                     }
@@ -241,6 +246,8 @@ impl StudyApp {
     pub fn open_editor(&mut self, mode: EditorMode, window: &mut Window, cx: &mut Context<Self>) {
         let mut text = String::new();
         self.chosen_notes.clear();
+        self.chosen_versions.clear();
+        let mut ended_at = Utc::now().timestamp();
         if let EditorMode::Pending(id) | EditorMode::Edit(id) = &mode {
             if let Some(session) = self
                 .snapshot
@@ -253,6 +260,8 @@ impl StudyApp {
                     session.summary.clone()
                 };
                 self.chosen_notes = session.note_ids.iter().cloned().collect();
+                self.chosen_versions = session.version_ids.iter().cloned().collect();
+                ended_at = session.ended_at;
             }
         } else {
             let start = Local::now() - chrono::Duration::minutes(30);
@@ -265,6 +274,9 @@ impl StudyApp {
                 self.chosen_notes.insert(note.clone());
             }
         }
+        if let Some(snapshot) = self.snapshot.clone() {
+            self.seed_versions(&snapshot, ended_at);
+        }
         self.summary
             .update(cx, |s, cx| s.set_value(text, window, cx));
         self.editor = Some(mode);
@@ -276,6 +288,14 @@ impl StudyApp {
     pub fn save_editor(&mut self, cx: &mut Context<Self>) {
         let summary = self.summary.read(cx).value().to_string();
         let note_ids = self.chosen_notes.iter().cloned().collect();
+        let version_ids = Some(self.snapshot.as_ref().map_or_else(Vec::new, |snapshot| {
+            snapshot
+                .versions
+                .iter()
+                .filter(|v| self.chosen_versions.contains(&v.id))
+                .map(|v| v.id.clone())
+                .collect()
+        }));
         let result = (|| -> anyhow::Result<Command> {
             Ok(
                 match self
@@ -287,12 +307,14 @@ impl StudyApp {
                         session_id,
                         summary,
                         note_ids,
+                        version_ids,
                     },
                     EditorMode::Edit(session_id) => Command::EditSession {
                         session_id,
                         summary,
                         learned: true,
                         note_ids,
+                        version_ids,
                     },
                     EditorMode::Manual => Command::Manual {
                         started_at: parse_local_time(&self.start.read(cx).value())?,
@@ -305,6 +327,7 @@ impl StudyApp {
                             .map_err(|_| anyhow::anyhow!("学习分钟数必须是整数"))?,
                         summary,
                         note_ids,
+                        version_ids,
                     },
                 },
             )
@@ -319,6 +342,60 @@ impl StudyApp {
                 cx.notify();
             }
         }
+    }
+
+    fn seed_versions(&mut self, snapshot: &Snapshot, ended_at: i64) {
+        self.chosen_versions.retain(|id| {
+            snapshot
+                .versions
+                .iter()
+                .any(|v| &v.id == id && self.chosen_notes.contains(&v.note_id))
+        });
+        for note in &self.chosen_notes {
+            if !snapshot
+                .versions
+                .iter()
+                .any(|v| &v.note_id == note && self.chosen_versions.contains(&v.id))
+            {
+                let version = snapshot
+                    .versions
+                    .iter()
+                    .rev()
+                    .find(|v| &v.note_id == note && v.captured_at <= ended_at)
+                    .or_else(|| snapshot.versions.iter().rev().find(|v| &v.note_id == note));
+                if let Some(version) = version {
+                    self.chosen_versions.insert(version.id.clone());
+                }
+            }
+        }
+    }
+
+    pub fn toggle_note(&mut self, id: &str, selected: bool) {
+        if selected {
+            self.chosen_notes.insert(id.to_owned());
+        } else {
+            self.chosen_notes.remove(id);
+        }
+        if let Some(snapshot) = self.snapshot.clone() {
+            let ended_at = match &self.editor {
+                Some(EditorMode::Pending(id) | EditorMode::Edit(id)) => snapshot
+                    .sessions
+                    .iter()
+                    .find(|s| &s.id == id)
+                    .map_or(Utc::now().timestamp(), |s| s.ended_at),
+                _ => Utc::now().timestamp(),
+            };
+            self.seed_versions(&snapshot, ended_at);
+        }
+    }
+
+    pub fn show_version(&mut self, note: String, version: String, cx: &mut Context<Self>) {
+        self.selected_note = Some(note);
+        self.selected_version = Some(version);
+        self.history = false;
+        self.page = Page::Notes;
+        self.refresh_preview();
+        cx.notify();
     }
 
     pub fn refresh_preview(&mut self) {

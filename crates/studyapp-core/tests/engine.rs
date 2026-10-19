@@ -60,6 +60,7 @@ fn submit_and_review_are_transactional_and_undo_restores_due_exactly() {
     engine
         .apply(
             Command::Submit {
+                version_ids: None,
                 session_id: id.clone(),
                 summary: "学习 Rust".into(),
                 note_ids: vec![],
@@ -71,6 +72,7 @@ fn submit_and_review_are_transactional_and_undo_restores_due_exactly() {
         engine
             .apply(
                 Command::Submit {
+                    version_ids: None,
                     session_id: id.clone(),
                     summary: "重复".into(),
                     note_ids: vec![]
@@ -127,6 +129,7 @@ fn submit_and_review_are_transactional_and_undo_restores_due_exactly() {
     engine
         .apply(
             Command::EditSession {
+                version_ids: None,
                 session_id: id,
                 summary: String::new(),
                 learned: false,
@@ -211,6 +214,7 @@ fn stats_split_confirmed_active_spans_at_midnight_and_ignore_missed() {
     engine
         .apply(
             Command::Manual {
+                version_ids: None,
                 started_at: 86340,
                 minutes: 2,
                 summary: "跨日学习".into(),
@@ -324,6 +328,7 @@ fn review_history_survives_edits_defaults_change_and_completes_final_stage() {
     engine
         .apply(
             Command::Manual {
+                version_ids: None,
                 started_at: 900,
                 minutes: 1,
                 summary: "初稿".into(),
@@ -347,6 +352,7 @@ fn review_history_survives_edits_defaults_change_and_completes_final_stage() {
     engine
         .apply(
             Command::EditSession {
+                version_ids: None,
                 session_id: session,
                 summary: "修改标题".into(),
                 learned: true,
@@ -534,6 +540,7 @@ fn learned_review_and_undo_persist_through_restarts() {
     engine
         .apply(
             Command::Manual {
+                version_ids: None,
                 started_at: 900,
                 minutes: 1,
                 summary: "持久化复习".into(),
@@ -595,6 +602,7 @@ fn stats_counts_review_events_and_corrections_with_timezone_offset() {
     engine
         .apply(
             Command::Manual {
+                version_ids: None,
                 started_at: 57540,
                 minutes: 2,
                 summary: "北京时间午夜".into(),
@@ -623,6 +631,7 @@ fn stats_counts_review_events_and_corrections_with_timezone_offset() {
     engine
         .apply(
             Command::EditSession {
+                version_ids: None,
                 session_id: session,
                 summary: String::new(),
                 learned: false,
@@ -701,6 +710,7 @@ fn submitted_and_corrected_reviews_derive_learning_date_from_session_end() {
     engine
         .apply(
             Command::Submit {
+                version_ids: None,
                 session_id: session_id.clone(),
                 summary: "定时提交".into(),
                 note_ids: vec![],
@@ -716,6 +726,7 @@ fn submitted_and_corrected_reviews_derive_learning_date_from_session_end() {
     engine
         .apply(
             Command::EditSession {
+                version_ids: None,
                 session_id: session_id.clone(),
                 summary: String::new(),
                 learned: false,
@@ -727,6 +738,7 @@ fn submitted_and_corrected_reviews_derive_learning_date_from_session_end() {
     engine
         .apply(
             Command::EditSession {
+                version_ids: None,
                 session_id,
                 summary: "一周后更正".into(),
                 learned: true,
@@ -758,6 +770,7 @@ fn two_completed_reviews(engine: &mut Engine) -> Vec<Review> {
         engine
             .apply(
                 Command::Manual {
+                    version_ids: None,
                     started_at: start,
                     minutes: 1,
                     summary: format!("复习 {start}"),
@@ -939,4 +952,366 @@ fn unreadable_note_at_resume_is_baselined_when_reading_recovers() {
     assert_eq!(snapshot.sessions[0].version_ids.len(), 1);
     assert!(snapshot.sessions[0].suggested_summary.contains("活动新增"));
     assert!(!snapshot.sessions[0].suggested_summary.contains("暂停修改"));
+}
+fn deferred_offline_reconciliation_case(restore: bool, missing: bool) {
+    let (dir, mut engine) = fixture();
+    short(&mut engine, 1000);
+    let source = dir.path().join("offline-recovery.md");
+    std::fs::write(&source, "# 主题\n基线\n").unwrap();
+    engine
+        .apply(Command::Import(vec![source.clone()]), 1000)
+        .unwrap();
+    std::fs::write(&source, "# 主题\n基线\n已运行学习\n").unwrap();
+    engine
+        .apply(Command::Scan { offline: false }, 1001)
+        .unwrap();
+    engine
+        .apply(Command::Scan { offline: false }, 1004)
+        .unwrap();
+    engine.tick(1004, 4).unwrap();
+    let legitimate_version = engine.snapshot().versions[1].id.clone();
+    let backup = dir.path().join("before-unreadable.sqlite");
+    if restore {
+        engine.apply(Command::Backup(backup.clone()), 1004).unwrap();
+    }
+    if missing {
+        std::fs::rename(&source, dir.path().join("retained-original.md")).unwrap();
+    } else {
+        std::fs::write(&source, [0xff]).unwrap();
+    }
+    if restore {
+        engine.apply(Command::Restore(backup), 2000).unwrap();
+    } else {
+        drop(engine);
+        engine = Engine::open(&dir.path().join("learning.sqlite"), 2000).unwrap();
+    }
+    assert!(engine.snapshot().notes[0].error.is_some());
+    assert_eq!(engine.snapshot().notes[0].missing, missing);
+    assert_eq!(engine.snapshot().timer.active_seconds, 4);
+    engine.checkpoint().unwrap();
+    let connection = rusqlite::Connection::open(dir.path().join("learning.sqlite")).unwrap();
+    let saved: String = connection
+        .query_row("SELECT data FROM app_state WHERE id=1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    assert!(
+        saved["offline_unreconciled_notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id.as_str() == Some(engine.snapshot().notes[0].id.as_str()))
+    );
+    drop(connection);
+    // Failed reconciliation must also survive a second shutdown/restart while
+    // the source remains unavailable.
+    drop(engine);
+    let mut engine = Engine::open(&dir.path().join("learning.sqlite"), 2000).unwrap();
+    assert!(engine.snapshot().notes[0].error.is_some());
+    std::fs::write(&source, "# 主题\n基线\n已运行学习\n离线知识\n").unwrap();
+    engine
+        .apply(Command::Scan { offline: false }, 2001)
+        .unwrap();
+    engine
+        .apply(Command::Scan { offline: false }, 2004)
+        .unwrap();
+    let recovered = engine.snapshot();
+    assert_eq!(recovered.versions.len(), 3);
+    assert!(
+        recovered.versions[2].offline,
+        "recovered version lost offline provenance: restore={restore}, missing={missing}"
+    );
+    let offline_version = recovered.versions[2].id.clone();
+    std::fs::write(&source, "# 主题\n基线\n已运行学习\n离线知识\n当前学习\n").unwrap();
+    engine
+        .apply(Command::Scan { offline: false }, 2005)
+        .unwrap();
+    engine
+        .apply(Command::Scan { offline: false }, 2008)
+        .unwrap();
+    let current_version = engine.snapshot().versions[3].id.clone();
+    assert!(!engine.snapshot().versions[3].offline);
+    engine.tick(2008, 8).unwrap();
+    for second in 1..=288 {
+        engine.tick(2008 + second, 1).unwrap();
+    }
+    let session = engine.snapshot().sessions[0].clone();
+    assert_eq!(session.active_seconds, 300);
+    assert_eq!(session.version_ids.len(), 2);
+    assert!(session.version_ids.contains(&legitimate_version));
+    assert!(session.version_ids.contains(&current_version));
+    assert!(!session.version_ids.contains(&offline_version));
+    assert!(session.suggested_summary.contains("已运行学习"));
+    assert!(session.suggested_summary.contains("当前学习"));
+    assert!(!session.suggested_summary.contains("离线知识"));
+}
+#[test]
+fn startup_defers_offline_classification_until_missing_or_unreadable_sources_recover() {
+    for missing in [false, true] {
+        deferred_offline_reconciliation_case(false, missing);
+    }
+}
+#[test]
+fn restore_defers_offline_classification_until_missing_or_unreadable_sources_recover() {
+    for missing in [false, true] {
+        deferred_offline_reconciliation_case(true, missing);
+    }
+}
+fn import_two_notes(dir: &TestDir, engine: &mut Engine) -> (String, String) {
+    let a = dir.path().join("version-a.md");
+    let b = dir.path().join("version-b.md");
+    std::fs::write(&a, "# A\n基线 A\n").unwrap();
+    std::fs::write(&b, "# B\n基线 B\n").unwrap();
+    engine.apply(Command::Import(vec![a, b]), 1000).unwrap();
+    let snapshot = engine.snapshot();
+    (snapshot.notes[0].id.clone(), snapshot.notes[1].id.clone())
+}
+#[test]
+fn submitting_unchanged_reading_anchors_the_selected_note_snapshot() {
+    let (dir, mut engine) = fixture();
+    short(&mut engine, 1000);
+    let (a, _) = import_two_notes(&dir, &mut engine);
+    let baseline = engine.snapshot().versions[0].id.clone();
+    cycle(&mut engine, 1000);
+    let session_id = engine.snapshot().sessions[0].id.clone();
+    engine
+        .apply(
+            Command::Submit {
+                session_id,
+                summary: "阅读未修改的 A".into(),
+                note_ids: vec![a],
+                version_ids: None,
+            },
+            1301,
+        )
+        .unwrap();
+    assert_eq!(engine.snapshot().sessions[0].version_ids, vec![baseline]);
+}
+#[test]
+fn replacing_detected_note_filters_its_versions_and_anchors_the_new_selection() {
+    let (dir, mut engine) = fixture();
+    short(&mut engine, 1000);
+    let (a, b) = import_two_notes(&dir, &mut engine);
+    let baseline_b = engine.snapshot().versions[1].id.clone();
+    std::fs::write(dir.path().join("version-a.md"), "# A\n活动修改 A\n").unwrap();
+    engine
+        .apply(Command::Scan { offline: false }, 1001)
+        .unwrap();
+    engine
+        .apply(Command::Scan { offline: false }, 1004)
+        .unwrap();
+    let changed_a = engine.snapshot().versions[2].id.clone();
+    cycle(&mut engine, 1000);
+    let pending = engine.snapshot().sessions[0].clone();
+    assert_eq!(pending.version_ids, vec![changed_a.clone()]);
+    engine
+        .apply(
+            Command::Submit {
+                session_id: pending.id.clone(),
+                summary: "实际阅读 B".into(),
+                note_ids: vec![b],
+                version_ids: None,
+            },
+            1301,
+        )
+        .unwrap();
+    assert_eq!(engine.snapshot().sessions[0].version_ids, vec![baseline_b]);
+    engine
+        .apply(
+            Command::EditSession {
+                session_id: pending.id,
+                summary: "改为 A".into(),
+                learned: true,
+                note_ids: vec![a],
+                version_ids: None,
+            },
+            1400,
+        )
+        .unwrap();
+    assert_eq!(engine.snapshot().sessions[0].version_ids, vec![changed_a]);
+}
+#[test]
+fn manual_snapshot_anchor_survives_later_source_and_summary_edits() {
+    let (dir, mut engine) = fixture();
+    let (a, _) = import_two_notes(&dir, &mut engine);
+    let baseline = engine.snapshot().versions[0].id.clone();
+    engine
+        .apply(
+            Command::Manual {
+                started_at: 1000,
+                minutes: 1,
+                summary: "最初阅读".into(),
+                note_ids: vec![a.clone()],
+                version_ids: None,
+            },
+            1061,
+        )
+        .unwrap();
+    let session = engine.snapshot().sessions[0].id.clone();
+    std::fs::write(dir.path().join("version-a.md"), "# A\n后来的内容\n").unwrap();
+    engine
+        .apply(Command::Scan { offline: false }, 1100)
+        .unwrap();
+    engine
+        .apply(Command::Scan { offline: false }, 1103)
+        .unwrap();
+    engine
+        .apply(
+            Command::EditSession {
+                session_id: session,
+                summary: "只更正摘要".into(),
+                learned: true,
+                note_ids: vec![a],
+                version_ids: None,
+            },
+            1200,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.snapshot().sessions[0].version_ids,
+        vec![baseline.clone()]
+    );
+    drop(engine);
+    let engine = Engine::open(&dir.path().join("learning.sqlite"), 2000).unwrap();
+    assert_eq!(engine.snapshot().sessions[0].version_ids, vec![baseline]);
+}
+#[test]
+fn default_version_anchor_uses_learning_time_and_explicit_note_fallback() {
+    let (dir, mut engine) = fixture();
+    let (a, _) = import_two_notes(&dir, &mut engine);
+    let baseline = engine.snapshot().versions[0].id.clone();
+    std::fs::write(dir.path().join("version-a.md"), "# A\n新内容\n").unwrap();
+    engine
+        .apply(Command::Scan { offline: false }, 1100)
+        .unwrap();
+    engine
+        .apply(Command::Scan { offline: false }, 1103)
+        .unwrap();
+    let latest = engine.snapshot().versions[2].id.clone();
+    engine
+        .apply(
+            Command::Manual {
+                started_at: 990,
+                minutes: 1,
+                summary: "导入后阅读".into(),
+                note_ids: vec![a.clone()],
+                version_ids: None,
+            },
+            1200,
+        )
+        .unwrap();
+    engine
+        .apply(
+            Command::Manual {
+                started_at: 800,
+                minutes: 1,
+                summary: "补记导入前的阅读".into(),
+                note_ids: vec![a],
+                version_ids: None,
+            },
+            1200,
+        )
+        .unwrap();
+    assert_eq!(engine.snapshot().sessions[0].version_ids, vec![baseline]);
+    assert_eq!(engine.snapshot().sessions[1].version_ids, vec![latest]);
+}
+#[test]
+fn explicit_version_range_is_persisted_deduplicated_and_validated_atomically() {
+    let (dir, mut engine) = fixture();
+    let (a, b) = import_two_notes(&dir, &mut engine);
+    let first = engine.snapshot().versions[0].id.clone();
+    let foreign = engine.snapshot().versions[1].id.clone();
+    std::fs::write(dir.path().join("version-a.md"), "# A\n第二版本\n").unwrap();
+    engine
+        .apply(Command::Scan { offline: false }, 1010)
+        .unwrap();
+    engine
+        .apply(Command::Scan { offline: false }, 1013)
+        .unwrap();
+    let second = engine.snapshot().versions[2].id.clone();
+    engine
+        .apply(
+            Command::Manual {
+                started_at: 1000,
+                minutes: 1,
+                summary: "选择两个版本".into(),
+                note_ids: vec![a.clone()],
+                version_ids: Some(vec![first.clone(), second.clone(), second.clone()]),
+            },
+            1100,
+        )
+        .unwrap();
+    let id = engine.snapshot().sessions[0].id.clone();
+    assert_eq!(
+        engine.snapshot().sessions[0].version_ids,
+        vec![first.clone(), second.clone()]
+    );
+    drop(engine);
+    let mut engine = Engine::open(&dir.path().join("learning.sqlite"), 1200).unwrap();
+    assert_eq!(
+        engine.snapshot().sessions[0].version_ids,
+        vec![first.clone(), second.clone()]
+    );
+    for (notes, versions) in [
+        (vec![a.clone()], vec![foreign]),
+        (vec![a.clone()], vec!["missing-version".into()]),
+        (vec![a.clone()], vec![]),
+        (vec![a.clone(), b], vec![first]),
+    ] {
+        assert!(
+            engine
+                .apply(
+                    Command::EditSession {
+                        session_id: id.clone(),
+                        summary: "无效选择".into(),
+                        learned: true,
+                        note_ids: notes,
+                        version_ids: Some(versions)
+                    },
+                    1201
+                )
+                .is_err()
+        );
+        assert_eq!(engine.snapshot().sessions[0].summary, "选择两个版本");
+        assert_eq!(engine.snapshot().sessions[0].version_ids.len(), 2);
+    }
+    engine
+        .apply(
+            Command::EditSession {
+                session_id: id,
+                summary: "只选第二版本".into(),
+                learned: true,
+                note_ids: vec![a],
+                version_ids: Some(vec![second.clone()]),
+            },
+            1202,
+        )
+        .unwrap();
+    assert_eq!(engine.snapshot().sessions[0].version_ids, vec![second]);
+}
+#[test]
+fn backup_rejects_versions_from_unassociated_notes() {
+    let (dir, mut engine) = fixture();
+    let (a, _) = import_two_notes(&dir, &mut engine);
+    engine
+        .apply(
+            Command::Manual {
+                started_at: 1000,
+                minutes: 1,
+                summary: "A 的学习".into(),
+                note_ids: vec![a],
+                version_ids: None,
+            },
+            1100,
+        )
+        .unwrap();
+    let foreign = engine.snapshot().versions[1].id.clone();
+    let backup = dir.path().join("foreign-version.sqlite");
+    engine.apply(Command::Backup(backup.clone()), 1100).unwrap();
+    alter_backup(&backup, |state| {
+        state["sessions"][0]["version_ids"] = serde_json::json!([foreign])
+    });
+    assert!(engine.apply(Command::Restore(backup), 1200).is_err());
+    assert_eq!(engine.snapshot().sessions[0].summary, "A 的学习");
 }

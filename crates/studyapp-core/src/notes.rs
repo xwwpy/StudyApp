@@ -184,6 +184,7 @@ pub(crate) fn relink(state: &mut State, note_id: &str, path: PathBuf, now: i64) 
     state.notes[index].revision += 1;
     state.candidates.remove(note_id);
     state.unattributed_notes.remove(note_id);
+    state.offline_unreconciled_notes.remove(note_id);
     if state
         .versions
         .iter()
@@ -196,11 +197,17 @@ pub(crate) fn relink(state: &mut State, note_id: &str, path: PathBuf, now: i64) 
     Ok(())
 }
 pub(crate) fn scan(state: &mut State, offline: bool, now: i64) -> String {
+    if offline {
+        state
+            .offline_unreconciled_notes
+            .extend(state.notes.iter().map(|note| note.id.clone()));
+    }
     let mut captured = 0;
     let mut errors = 0;
     for index in 0..state.notes.len() {
         let path = PathBuf::from(&state.notes[index].path);
         let note_id = state.notes[index].id.clone();
+        let capture_offline = offline || state.offline_unreconciled_notes.contains(&note_id);
         match read(&path) {
             Ok(content) => {
                 if state.notes[index].missing || state.notes[index].error.is_some() {
@@ -219,9 +226,10 @@ pub(crate) fn scan(state: &mut State, offline: bool, now: i64) -> String {
                 {
                     state.candidates.remove(&note_id);
                     state.unattributed_notes.remove(&note_id);
+                    state.offline_unreconciled_notes.remove(&note_id);
                     continue;
                 }
-                if offline
+                if capture_offline
                     || state.unattributed_notes.contains(&note_id)
                     || state
                         .candidates
@@ -230,9 +238,10 @@ pub(crate) fn scan(state: &mut State, offline: bool, now: i64) -> String {
                             *candidate == digest && now.saturating_sub(*first) >= 3
                         })
                 {
-                    append_version(state, index, content, now, offline, false);
+                    append_version(state, index, content, now, capture_offline, false);
                     state.candidates.remove(&note_id);
                     state.unattributed_notes.remove(&note_id);
+                    state.offline_unreconciled_notes.remove(&note_id);
                     captured += 1;
                 } else if state
                     .candidates

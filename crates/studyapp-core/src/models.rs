@@ -107,6 +107,7 @@ pub enum Command {
         session_id: String,
         summary: String,
         note_ids: Vec<String>,
+        version_ids: Option<Vec<String>>,
     },
     Skip {
         session_id: String,
@@ -116,12 +117,14 @@ pub enum Command {
         minutes: u32,
         summary: String,
         note_ids: Vec<String>,
+        version_ids: Option<Vec<String>>,
     },
     EditSession {
         session_id: String,
         summary: String,
         learned: bool,
         note_ids: Vec<String>,
+        version_ids: Option<Vec<String>>,
     },
     CompleteReview {
         review_id: String,

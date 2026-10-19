@@ -87,21 +87,33 @@ impl Engine {
                 session_id,
                 summary,
                 note_ids,
+                version_ids,
             } => {
                 Self::notes_exist(&next, &note_ids)?;
                 Self::summary_valid(&summary)?;
-                let session = next
+                let note_ids = unique(note_ids);
+                let index = next
                     .sessions
-                    .iter_mut()
-                    .find(|s| s.id == session_id)
+                    .iter()
+                    .position(|s| s.id == session_id)
                     .context("找不到学习记录")?;
+                let session = &next.sessions[index];
                 ensure!(
                     session.status == SessionStatus::Pending && now < session.deadline,
                     "该记录已处理或已超过回答期限，请使用更正功能"
                 );
+                let version_ids = Self::reconcile_versions(
+                    &next,
+                    &note_ids,
+                    &session.version_ids,
+                    version_ids,
+                    session.ended_at,
+                )?;
+                let session = &mut next.sessions[index];
                 session.status = SessionStatus::Learned;
                 session.summary = summary.trim().into();
-                session.note_ids = unique(note_ids);
+                session.note_ids = note_ids;
+                session.version_ids = version_ids;
                 session.updated_at = now;
                 session.revision += 1;
                 Self::ensure_review(&mut next, &session_id)?;
@@ -124,6 +136,7 @@ impl Engine {
                 minutes,
                 summary,
                 note_ids,
+                version_ids,
             } => {
                 Self::summary_valid(&summary)?;
                 Self::notes_exist(&next, &note_ids)?;
@@ -133,6 +146,9 @@ impl Engine {
                     .checked_add(seconds as i64)
                     .context("时间超出范围")?;
                 ensure!(ended_at <= now, "不能补记尚未结束的学习时段");
+                let note_ids = unique(note_ids);
+                let version_ids =
+                    Self::reconcile_versions(&next, &note_ids, &[], version_ids, ended_at)?;
                 let session_id = id();
                 next.sessions.push(Session {
                     id: session_id.clone(),
@@ -143,8 +159,8 @@ impl Engine {
                     status: SessionStatus::Learned,
                     summary: summary.trim().into(),
                     suggested_summary: String::new(),
-                    note_ids: unique(note_ids),
-                    version_ids: vec![],
+                    note_ids,
+                    version_ids,
                     spans: vec![ActiveSpan {
                         start: started_at,
                         end: ended_at,
@@ -160,18 +176,30 @@ impl Engine {
                 summary,
                 learned,
                 note_ids,
+                version_ids,
             } => {
                 Self::notes_exist(&next, &note_ids)?;
                 if learned {
                     Self::summary_valid(&summary)?;
                 }
-                let session = next
+                let note_ids = unique(note_ids);
+                let index = next
                     .sessions
-                    .iter_mut()
-                    .find(|s| s.id == session_id)
+                    .iter()
+                    .position(|s| s.id == session_id)
                     .context("找不到学习记录")?;
+                let session = &next.sessions[index];
+                let version_ids = Self::reconcile_versions(
+                    &next,
+                    &note_ids,
+                    &session.version_ids,
+                    version_ids,
+                    session.ended_at,
+                )?;
+                let session = &mut next.sessions[index];
                 session.summary = summary.trim().into();
-                session.note_ids = unique(note_ids);
+                session.note_ids = note_ids;
+                session.version_ids = version_ids;
                 session.status = if learned {
                     SessionStatus::Learned
                 } else {
@@ -315,6 +343,55 @@ impl Engine {
             "请填写学习摘要（最多 100000 字节）"
         );
         Ok(())
+    }
+    fn reconcile_versions(
+        state: &State,
+        notes: &[String],
+        existing: &[String],
+        explicit: Option<Vec<String>>,
+        ended_at: i64,
+    ) -> Result<Vec<String>> {
+        let versions: std::collections::HashMap<&str, &NoteVersion> =
+            state.versions.iter().map(|v| (v.id.as_str(), v)).collect();
+        let explicit_selection = explicit.is_some();
+        let mut chosen = if let Some(ids) = explicit {
+            let ids = unique(ids);
+            for id in &ids {
+                let version = versions.get(id.as_str()).context("选择的笔记版本不存在")?;
+                ensure!(notes.contains(&version.note_id), "选择的版本不属于关联笔记");
+            }
+            ids
+        } else {
+            unique(
+                existing
+                    .iter()
+                    .filter(|id| {
+                        versions
+                            .get(id.as_str())
+                            .is_some_and(|v| notes.contains(&v.note_id))
+                    })
+                    .cloned()
+                    .collect(),
+            )
+        };
+        for note_id in notes {
+            if chosen.iter().any(|id| {
+                versions
+                    .get(id.as_str())
+                    .is_some_and(|v| v.note_id == *note_id)
+            }) {
+                continue;
+            }
+            ensure!(!explicit_selection, "每份关联笔记至少需要选择一个版本");
+            let matching = || state.versions.iter().filter(|v| v.note_id == *note_id);
+            let version = matching()
+                .filter(|v| v.captured_at <= ended_at)
+                .max_by_key(|v| v.captured_at)
+                .or_else(|| matching().max_by_key(|v| v.captured_at))
+                .context("关联笔记没有可用的内容快照")?;
+            chosen.push(version.id.clone());
+        }
+        Ok(chosen)
     }
     fn ensure_review(state: &mut State, session_id: &str) -> Result<()> {
         let s = state

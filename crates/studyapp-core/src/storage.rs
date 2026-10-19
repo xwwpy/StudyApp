@@ -30,6 +30,10 @@ pub(crate) struct State {
     // baseline is captured, including across a restart.
     #[serde(default)]
     pub unattributed_notes: HashSet<String>,
+    // Startup/restore reconciliation can fail while a source is missing or
+    // unreadable. Its first recovered snapshot must keep offline provenance.
+    #[serde(default)]
+    pub offline_unreconciled_notes: HashSet<String>,
     #[serde(skip)]
     pub versions: Arc<Vec<NoteVersion>>,
     #[serde(skip)]
@@ -81,6 +85,7 @@ impl State {
             active_versions: vec![],
             last_tick: now,
             unattributed_notes: HashSet::new(),
+            offline_unreconciled_notes: HashSet::new(),
             versions: Arc::new(vec![]),
             candidates: HashMap::new(),
         }
@@ -156,7 +161,11 @@ impl State {
                     && s.started_at <= s.ended_at
                     && s.spans.iter().all(|p| p.start <= p.end)
                     && s.note_ids.iter().all(|n| notes.contains(n))
-                    && s.version_ids.iter().all(|id| version_ids.contains(id)),
+                    && s.version_ids.iter().all(|id| version_ids.contains(id)
+                        && self
+                            .versions
+                            .iter()
+                            .any(|v| v.id == *id && s.note_ids.contains(&v.note_id))),
                 "学习记录无效"
             );
             ensure!(
@@ -279,6 +288,12 @@ impl State {
         ensure!(
             self.unattributed_notes.iter().all(|id| notes.contains(id)),
             "暂停基线笔记关联无效"
+        );
+        ensure!(
+            self.offline_unreconciled_notes
+                .iter()
+                .all(|id| notes.contains(id)),
+            "离线基线笔记关联无效"
         );
         Ok(())
     }

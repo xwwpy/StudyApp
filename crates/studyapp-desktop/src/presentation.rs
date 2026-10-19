@@ -157,6 +157,7 @@ mod tests {
                     minutes: 23 * 60,
                     summary: "跨日记录".into(),
                     note_ids: vec![],
+                    version_ids: None,
                 },
                 end,
             )

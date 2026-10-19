@@ -216,6 +216,7 @@ mod tests {
         let saved = apply(
             &worker,
             Command::Manual {
+                version_ids: None,
                 started_at: now - 120,
                 minutes: 1,
                 summary: "备份中的学习".into(),
@@ -241,6 +242,7 @@ mod tests {
         let extra = apply(
             &worker,
             Command::Manual {
+                version_ids: None,
                 started_at: now - 240,
                 minutes: 1,
                 summary: "备份以后的学习".into(),
@@ -313,6 +315,7 @@ mod tests {
         let invalid = apply(
             &worker,
             Command::Manual {
+                version_ids: None,
                 started_at: chrono::Utc::now().timestamp() - 600,
                 minutes: 0,
                 summary: "无效时长".into(),
@@ -326,6 +329,7 @@ mod tests {
         worker
             .sender
             .send(Work::Apply(Command::Manual {
+                version_ids: None,
                 started_at: chrono::Utc::now().timestamp() - 600,
                 minutes: 10,
                 summary: "复习所有权".into(),

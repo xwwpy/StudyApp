@@ -165,7 +165,9 @@ impl StudyApp {
                     ),
             );
         if self.editor.is_some() {
-            content = content.child(self.editor_view(snapshot, cx));
+            content = column()
+                .child(self.editor_view(snapshot, cx))
+                .child(content);
         }
         let pending: Vec<_> = snapshot
             .sessions
@@ -289,15 +291,81 @@ impl StudyApp {
                             .label(note.title.clone())
                             .checked(selected)
                             .on_click(cx.listener(move |this, checked, _, cx| {
-                                if *checked {
-                                    this.chosen_notes.insert(id.clone());
-                                } else {
-                                    this.chosen_notes.remove(&id);
-                                }
+                                this.toggle_note(&id, *checked);
                                 cx.notify();
                             }))
                     })),
             );
+        if !self.chosen_notes.is_empty() {
+            view = view
+                .child(muted(
+                    "确认学习快照（每份笔记至少选择一个版本；时间为实际捕获时间，可多选或预览）",
+                ))
+                .child(
+                    column()
+                        .id("learning-versions")
+                        .max_h(px(220.))
+                        .overflow_y_scroll()
+                        .children(
+                            snapshot
+                                .versions
+                                .iter()
+                                .rev()
+                                .filter(|v| self.chosen_notes.contains(&v.note_id))
+                                .map(|version| {
+                                    let id = version.id.clone();
+                                    let preview_id = id.clone();
+                                    let note_id = version.note_id.clone();
+                                    let title = snapshot
+                                        .notes
+                                        .iter()
+                                        .find(|n| n.id == version.note_id)
+                                        .map_or("笔记", |n| n.title.as_str());
+                                    row()
+                                        .child(
+                                            Checkbox::new(SharedString::from(format!(
+                                                "associate-version-{id}"
+                                            )))
+                                            .checked(self.chosen_versions.contains(&id))
+                                            .label(format!(
+                                                "{} · {}{} · {}",
+                                                title,
+                                                stamp(version.captured_at),
+                                                if version.offline { " · 离线" } else { "" },
+                                                version
+                                                    .summary
+                                                    .chars()
+                                                    .take(70)
+                                                    .collect::<String>()
+                                            ))
+                                            .on_click(cx.listener(move |this, checked, _, cx| {
+                                                if *checked {
+                                                    this.chosen_versions.insert(id.clone());
+                                                } else {
+                                                    this.chosen_versions.remove(&id);
+                                                }
+                                                cx.notify();
+                                            })),
+                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "preview-learning-{preview_id}"
+                                            )))
+                                            .ghost()
+                                            .small()
+                                            .label("预览")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.show_version(
+                                                    note_id.clone(),
+                                                    preview_id.clone(),
+                                                    cx,
+                                                )
+                                            })),
+                                        )
+                                }),
+                        ),
+                );
+        }
         let skip = match mode {
             EditorMode::Pending(id) => Some(Command::Skip {
                 session_id: id.clone(),
@@ -307,6 +375,7 @@ impl StudyApp {
                 summary: self.summary.read(cx).value().to_string(),
                 learned: false,
                 note_ids: self.chosen_notes.iter().cloned().collect(),
+                version_ids: None,
             }),
             EditorMode::Manual => None,
         };
@@ -364,10 +433,11 @@ impl StudyApp {
                         session.summary.chars().take(160).collect::<String>()
                     }))
                     .child(muted(format!(
-                        "{}  ·  {} 分钟  ·  {} 份关联笔记",
+                        "{}  ·  {} 分钟  ·  {} 份关联笔记 · {} 个快照",
                         stamp(session.started_at),
                         session.active_seconds / 60,
-                        session.note_ids.len()
+                        session.note_ids.len(),
+                        session.version_ids.len()
                     ))),
             )
             .child(

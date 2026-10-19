@@ -14,6 +14,10 @@ pub fn prepare(database: &Path) -> anyhow::Result<()> {
     let folder = database
         .parent()
         .ok_or_else(|| anyhow::anyhow!("无效测试目录"))?;
+    anyhow::ensure!(
+        std::fs::read_dir(folder)?.next().transpose()?.is_none(),
+        "冒烟测试必须使用新的空目录，以免改变已有资料"
+    );
     let note = folder.join("example.md");
     std::fs::write(
         &note,
@@ -25,6 +29,7 @@ pub fn prepare(database: &Path) -> anyhow::Result<()> {
     let id = engine.snapshot().notes[0].id.clone();
     engine.apply(
         Command::Manual {
+            version_ids: None,
             started_at: now - 172800,
             minutes: 45,
             summary: "理解 Rust 所有权与借用规则".into(),
@@ -122,9 +127,72 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
                 assert_eq!(app.interval.read(cx).value().as_ref(), "25");
                 assert!(app.editor.is_none());
             }).expect("restore refreshed interface");
+            window.update(cx, |_, window, cx| {
+                window.click(("nav", 0_usize), cx);
+                window.click("manual-top", cx);
+                let version = view.read(cx).snapshot.as_ref().unwrap().versions[0].id.clone();
+                assert!(view.read(cx).chosen_versions.contains(&version));
+                window.click(SharedString::from(format!("associate-version-{version}")), cx);
+                assert!(!view.read(cx).chosen_versions.contains(&version));
+                view.update(cx, |app, cx| app.summary.update(cx, |s, cx| s.set_value("确认阅读了选定的所有权快照", window, cx)));
+                window.click("save-learning", cx);
+            }).expect("version selection validation");
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            window.update(cx, |_, window, cx| {
+                assert!(view.read(cx).editor.is_some());
+                assert!(view.read(cx).notice.as_ref().is_some_and(Result::is_err));
+                let version = view.read(cx).snapshot.as_ref().unwrap().versions[0].id.clone();
+                window.click(SharedString::from(format!("associate-version-{version}")), cx);
+                window.render_to_image().unwrap().save(database.with_file_name("learning-editor.png")).unwrap();
+                window.click("save-learning", cx);
+            }).expect("save selected version");
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            window.update(cx, |_, _, cx| {
+                let app = view.read(cx);
+                assert!(app.editor.is_none());
+                let snapshot = app.snapshot.as_ref().unwrap();
+                assert_eq!(snapshot.sessions.len(), 2);
+                let session = snapshot.sessions.iter().find(|s| s.summary == "确认阅读了选定的所有权快照").unwrap();
+                assert_eq!(session.version_ids, vec![snapshot.versions[0].id.clone()]);
+                assert_eq!(snapshot.reviews.len(), 2);
+            }).expect("saved learning snapshot association");
         }
         let report = database.with_file_name("smoke-result.txt");
-        std::fs::write(report, "PASS: five native pages rendered; ui-test additionally captured screenshots and exercised navigation, review checkbox, undo, pause, settings save and backup restore refresh.\n").expect("write smoke report");
+        std::fs::write(report, "PASS: five native pages rendered; ui-test additionally captured screenshots and exercised navigation, review checkbox, undo, pause, settings save, backup restore refresh, learning save and version validation.\n").expect("write smoke report");
         cx.update(|cx| cx.quit());
     }).detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare;
+    use studyapp_core::Engine;
+
+    #[test]
+    fn prepare_rejects_nonempty_directory_without_overwriting_notes_or_creating_database() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let note = directory.join("example.md");
+        let original = "# 用户原有笔记\n保留这些内容。\n";
+        std::fs::write(&note, original).unwrap();
+        let database = directory.join("studyapp.sqlite3");
+
+        assert!(prepare(&database).is_err());
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), original);
+        assert!(!database.exists());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn prepare_accepts_an_existing_empty_directory() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let database = directory.join("studyapp.sqlite3");
+
+        prepare(&database).unwrap();
+
+        assert!(database.is_file());
+        assert!(directory.join("example.md").is_file());
+        let engine = Engine::open(&database, chrono::Utc::now().timestamp()).unwrap();
+        assert_eq!(engine.snapshot().notes.len(), 1);
+        assert_eq!(engine.snapshot().sessions.len(), 1);
+    }
 }

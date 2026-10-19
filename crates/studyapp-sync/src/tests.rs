@@ -161,7 +161,24 @@ fn fixture(replies: Vec<Reply>) -> (String, std::thread::JoinHandle<Vec<String>>
             }
             response.push_str("\r\n");
             response.push_str(&body);
-            stream.write_all(response.as_bytes()).unwrap();
+            if let Err(error) = stream.write_all(response.as_bytes()) {
+                // Bounded clients may close as soon as Content-Length exceeds
+                // their limit. Linux reports EPIPE while Windows may buffer the
+                // whole response. Only these deliberately oversized replies may
+                // disconnect; ordinary fixture transport failures remain fatal.
+                let oversized = (status == 207 && body.len() > MAX_XML_BYTES)
+                    || (status == 200 && body.len() > MAX_CONTENT_BYTES);
+                assert!(
+                    oversized
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                    "unexpected fixture write failure: {error}"
+                );
+            }
         }
         requests
     });

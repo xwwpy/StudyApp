@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.98.0
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: release-windows
+      - name: Validate version tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo metadata failed' }
+          $versions = @($metadata.packages | ForEach-Object { $_.version } | Sort-Object -Unique)
+          if ($versions.Count -ne 1 -or $env:RELEASE_TAG -cne "v$($versions[0])") { throw 'Tag must equal every workspace package version prefixed with v' }
+          "RELEASE_VERSION=$($versions[0])" >> $env:GITHUB_ENV
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace --all-features
+      - name: Install pinned audit tools
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          if ($LASTEXITCODE -ne 0) { throw 'cargo-audit installation failed' }
+          cargo install cargo-deny --version 0.20.2 --locked
+          if ($LASTEXITCODE -ne 0) { throw 'cargo-deny installation failed' }
+      - run: cargo audit
+      - run: cargo deny --locked check licenses bans sources
+      - run: cargo build --locked -p studyapp-desktop --features ui-test
+      - name: Verify native UI before release
+        timeout-minutes: 3
+        run: |
+          $smokeDir = Join-Path $env:RUNNER_TEMP ('studyapp-release-smoke-' + [guid]::NewGuid().ToString('N'))
+          "SMOKE_DIR=$smokeDir" >> $env:GITHUB_ENV
+          ./scripts/smoke.ps1 -DataDirectory $smokeDir
+      - name: Preserve release smoke evidence
+        if: always() && env.SMOKE_DIR != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-release-smoke
+          path: |
+            ${{ env.SMOKE_DIR }}/page-*.png
+            ${{ env.SMOKE_DIR }}/smoke-result.txt
+          if-no-files-found: warn
+          retention-days: 30
+      - run: cargo build --locked --release -p studyapp-desktop
+      - name: Package portable executable and notices
+        run: ./scripts/package.ps1 -Version $env:RELEASE_VERSION
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-release
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Download release artifact using GitHub CLI
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          gh run download $env:RUN_ID --name windows-release --dir dist
+          if ($LASTEXITCODE -ne 0) { throw 'Artifact download failed' }
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $assets = @(Get-ChildItem -LiteralPath dist -File | Where-Object { $_.Extension -in '.zip', '.sha256' } | ForEach-Object { $_.FullName })
+          if ($assets.Count -ne 2) { throw 'Expected one ZIP and one checksum' }
+          gh release create $env:RELEASE_TAG @assets --verify-tag --title "StudyApp $env:RELEASE_TAG" --notes-file docs/release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

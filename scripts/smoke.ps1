@@ -1,0 +1,24 @@
+#requires -Version 7.0
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)]
+    [string]$DataDirectory,
+    [string]$BinaryPath = (Join-Path $PSScriptRoot '../target/debug/studyapp.exe')
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$binary = (Resolve-Path -LiteralPath $BinaryPath).Path
+$data = [IO.Path]::GetFullPath($DataDirectory)
+if (Test-Path -LiteralPath $data) { throw 'Smoke directory must be fresh; no existing fixtures are changed' }
+$process = Start-Process -FilePath $binary -ArgumentList @('--smoke-test', '--data-dir', ('"' + $data + '"')) -PassThru -WindowStyle Hidden
+if (-not $process.WaitForExit(90000)) { $process.Kill(); throw 'Native smoke exceeded 90 seconds' }
+if ($process.ExitCode -ne 0) { throw "Native smoke exit code: $($process.ExitCode)" }
+$report = Join-Path $data 'smoke-result.txt'
+if (-not (Test-Path -LiteralPath $report)) { throw 'Smoke report missing' }
+if ((Get-Content -LiteralPath $report -Raw) -notmatch '^PASS:') { throw 'Smoke report did not pass' }
+foreach ($index in 0..4) {
+    $image = Join-Path $data "page-$index.png"
+    if (-not (Test-Path -LiteralPath $image)) { throw "Screenshot missing: $image" }
+    if ((Get-Item -LiteralPath $image).Length -lt 1000) { throw "Screenshot is empty: $image" }
+}
+Write-Output "Native smoke passed; evidence retained at $data"

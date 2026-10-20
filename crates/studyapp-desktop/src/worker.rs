@@ -1,3 +1,4 @@
+use crate::storage_backend::StorageEvent;
 use std::{
     path::PathBuf,
     sync::{Arc, mpsc},
@@ -29,6 +30,11 @@ pub enum Work {
         result: Result<crate::sync_runtime::SyncCompletion, String>,
     },
     SwitchLibrary(PathBuf),
+    RefreshStorage,
+    DeleteManagedCopy {
+        note_id: String,
+    },
+    MigrateLibrary(PathBuf),
     Shutdown,
 }
 
@@ -39,6 +45,7 @@ pub struct Update {
     pub library_replaced: bool,
     pub note_result: Option<Result<String, String>>,
     pub sync_status: Option<crate::sync_runtime::SyncStatus>,
+    pub storage_event: Option<StorageEvent>,
 }
 
 pub struct Worker {
@@ -96,6 +103,7 @@ impl Worker {
                             library_replaced: false,
                             note_result: None,
                             sync_status: None,
+                            storage_event: None,
                         });
                         return;
                     }
@@ -110,6 +118,7 @@ impl Worker {
                 library_replaced: false,
                 note_result: None,
                 sync_status: Some(synchronization.status.clone()),
+                storage_event: None,
             });
             let mut last_tick = Instant::now();
             let mut last_scan = Instant::now();
@@ -131,9 +140,20 @@ impl Worker {
                             );
                             let note_result = matches!(
                                 work.as_ref(),
-                                Work::Apply(Command::CreateNote { .. } | Command::SaveNote { .. })
+                                Work::Apply(
+                                    Command::CreateNote { .. }
+                                        | Command::CreateNoteInFolder { .. }
+                                        | Command::SaveNote { .. }
+                                )
                             )
                             .then(|| Err(error.clone()));
+                            let storage_event = matches!(
+                                work.as_ref(),
+                                Work::RefreshStorage
+                                    | Work::DeleteManagedCopy { .. }
+                                    | Work::MigrateLibrary(_)
+                            )
+                            .then(|| StorageEvent::Finished(Err(error.clone())));
                             let _ = updates.send(Update {
                                 snapshot: Some(Arc::new(engine.snapshot())),
                                 notice: Some(Err(error)),
@@ -141,6 +161,7 @@ impl Worker {
                                 library_replaced: false,
                                 note_result,
                                 sync_status: None,
+                                storage_event,
                             });
                             continue;
                         }
@@ -155,6 +176,7 @@ impl Worker {
                 let mut library_replaced = false;
                 let mut note_result = None;
                 let mut sync_changed = false;
+                let mut storage_event = None;
                 match work {
                     Ok(Work::Scoped { .. }) => continue,
                     Ok(Work::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -164,7 +186,10 @@ impl Worker {
                         break;
                     }
                     Ok(Work::Apply(command)) => {
-                        let existing_notes = if matches!(&command, Command::CreateNote { .. }) {
+                        let existing_notes = if matches!(
+                            &command,
+                            Command::CreateNote { .. } | Command::CreateNoteInFolder { .. }
+                        ) {
                             Some(
                                 engine
                                     .snapshot()
@@ -315,10 +340,11 @@ impl Worker {
                             let (next_lock, next) =
                                 open_library(&directory.join("studyapp.sqlite3"), now)?;
                             if let Some(config) = &location_config {
-                                if let Some(parent) = config.parent() {
-                                    std::fs::create_dir_all(parent)?;
-                                }
-                                std::fs::write(config, serde_json::to_vec(&directory)?)?;
+                                let snapshot = next.snapshot();
+                                let directory = std::path::Path::new(&snapshot.data_path)
+                                    .parent()
+                                    .ok_or_else(|| anyhow::anyhow!("资料库目录不存在"))?;
+                                crate::storage_backend::persist_location(config, directory)?;
                             }
                             engine = next;
                             library_lock = next_lock;
@@ -335,6 +361,78 @@ impl Worker {
                             sync_changed = true;
                         }
                         notice = Some(result.map_err(|e| format!("{e:#}")));
+                        changed = true;
+                    }
+                    Ok(Work::RefreshStorage) => {
+                        let result = crate::storage_backend::inspect(&engine.snapshot())
+                            .map_err(|error| format!("{error:#}"));
+                        notice = Some(
+                            result
+                                .as_ref()
+                                .map(|_| "存储用量已更新".into())
+                                .map_err(Clone::clone),
+                        );
+                        storage_event = Some(StorageEvent::Finished(result));
+                        changed = true;
+                    }
+                    Ok(Work::DeleteManagedCopy { note_id }) => {
+                        let result = if synchronization.status.busy {
+                            Err("同步正在运行，请等待完成后再删除托管副本".into())
+                        } else {
+                            crate::storage_backend::delete_managed_copy(&mut engine, &note_id, now)
+                                .map_err(|error| format!("{error:#}"))
+                        };
+                        notice = Some(
+                            result
+                                .as_ref()
+                                .map(|_| "已删除选定的一个托管副本；历史和学习记录仍保留".into())
+                                .map_err(Clone::clone),
+                        );
+                        storage_event = Some(StorageEvent::Finished(result));
+                        changed = true;
+                    }
+                    Ok(Work::MigrateLibrary(directory)) => {
+                        let result =
+                            (|| -> anyhow::Result<crate::storage_backend::StorageReport> {
+                                anyhow::ensure!(
+                                    !synchronization.status.busy,
+                                    "同步正在运行，请等待完成后再迁移资料库"
+                                );
+                                let database = crate::storage_backend::prepare_migration(
+                                    &mut engine,
+                                    &directory,
+                                    now,
+                                )?;
+                                let (next_lock, next) = open_library(&database, now)?;
+                                let report = crate::storage_backend::inspect(&next.snapshot())?;
+                                if let Some(config) = &location_config {
+                                    let directory = database
+                                        .parent()
+                                        .ok_or_else(|| anyhow::anyhow!("迁移目录不存在"))?;
+                                    crate::storage_backend::persist_location(config, directory)?;
+                                }
+                                engine = next;
+                                library_lock = next_lock;
+                                last_tick = Instant::now();
+                                Ok(report)
+                            })()
+                            .map_err(|error| format!("{error:#}"));
+                        library_replaced = result.is_ok();
+                        if library_replaced {
+                            generation += 1;
+                            synchronization = crate::sync_runtime::SyncRuntime::load(
+                                std::path::Path::new(&engine.snapshot().data_path),
+                            );
+                            last_sync_attempt = Instant::now();
+                            sync_changed = true;
+                        }
+                        notice = Some(
+                            result
+                                .as_ref()
+                                .map(|_| "资料库已迁移并验证，原目录和全部源文件仍保留".into())
+                                .map_err(Clone::clone),
+                        );
+                        storage_event = Some(StorageEvent::Finished(result));
                         changed = true;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -398,6 +496,7 @@ impl Worker {
                             library_replaced,
                             note_result,
                             sync_status: sync_changed.then(|| synchronization.status.clone()),
+                            storage_event,
                         })
                         .is_err()
                 {
@@ -426,6 +525,215 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn storage_result(update: &Update) -> &Result<crate::storage_backend::StorageReport, String> {
+        let Some(StorageEvent::Finished(result)) = &update.storage_event else {
+            panic!("storage request must complete");
+        };
+        result
+    }
+
+    #[test]
+    fn storage_refresh_delete_and_migration_complete_and_remember_restart_location() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let source = root.join("original");
+        let config = root.join("config/location.json");
+        let worker = Worker::start(source.join("studyapp.sqlite3"), Some(config.clone()));
+        worker
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let created = apply(
+            &worker,
+            Command::CreateNoteInFolder {
+                title: "storage fixture".into(),
+                content: "retained".into(),
+                folder_id: None,
+            },
+        );
+        assert!(created.note_result.as_ref().unwrap().is_ok());
+        let note = created.snapshot.unwrap().notes[0].clone();
+        worker.sender.send(Work::RefreshStorage).unwrap();
+        let report = receive_notice(&worker);
+        assert_eq!(storage_result(&report).as_ref().unwrap().managed_bytes, 8);
+        std::fs::write(source.join("note-draft.json"), "null").unwrap();
+        let target = root.join("migrated");
+        worker
+            .sender
+            .send(Work::MigrateLibrary(target.clone()))
+            .unwrap();
+        let migrated = receive_notice(&worker);
+        assert!(storage_result(&migrated).is_ok(), "{:?}", migrated.notice);
+        assert!(migrated.library_replaced);
+        let migrated_note = migrated.snapshot.unwrap().notes[0].clone();
+        assert_eq!(migrated_note.id, note.id);
+        assert_ne!(migrated_note.path, note.path);
+        assert_eq!(std::fs::read_to_string(&note.path).unwrap(), "retained");
+        assert_eq!(
+            std::fs::read_to_string(target.join("note-draft.json")).unwrap(),
+            "null"
+        );
+        let remembered: PathBuf = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&remembered).unwrap(),
+            std::fs::canonicalize(&target).unwrap()
+        );
+        worker
+            .sender
+            .send(Work::DeleteManagedCopy {
+                note_id: note.id.clone(),
+            })
+            .unwrap();
+        let deleted = receive_notice(&worker);
+        assert!(storage_result(&deleted).is_ok(), "{:?}", deleted.notice);
+        assert!(deleted.snapshot.unwrap().notes[0].detached);
+        assert!(!PathBuf::from(migrated_note.path).exists());
+        assert_eq!(std::fs::read_to_string(&note.path).unwrap(), "retained");
+        drop(worker);
+        let restarted = Worker::start(remembered.join("studyapp.sqlite3"), Some(config));
+        let restarted = restarted
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(restarted.snapshot.as_ref().unwrap().notes[0].id, note.id);
+        assert!(restarted.snapshot.unwrap().notes[0].detached);
+    }
+
+    #[test]
+    fn migration_location_publish_failure_keeps_original_library_and_configuration() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let config = root.join("location.json");
+        std::fs::create_dir(&config).unwrap();
+        let worker = Worker::start(root.join("original/studyapp.sqlite3"), Some(config.clone()));
+        let origin = worker
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .snapshot
+            .unwrap()
+            .data_path
+            .clone();
+        let created = apply(
+            &worker,
+            Command::CreateNote {
+                title: "preserve".into(),
+                content: "original".into(),
+            },
+        );
+        let note = created.snapshot.unwrap().notes[0].clone();
+        worker
+            .sender
+            .send(Work::MigrateLibrary(root.join("target")))
+            .unwrap();
+        let rejected = receive_notice(&worker);
+        assert!(storage_result(&rejected).is_err());
+        assert!(!rejected.library_replaced);
+        assert_eq!(rejected.snapshot.unwrap().data_path, origin);
+        assert!(config.is_dir());
+        assert_eq!(std::fs::read_to_string(note.path).unwrap(), "original");
+    }
+
+    #[test]
+    fn explicit_data_directory_migration_does_not_write_global_location() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let unrelated_global = root.join("global/location.json");
+        std::fs::create_dir(unrelated_global.parent().unwrap()).unwrap();
+        std::fs::write(&unrelated_global, b"unchanged global preference").unwrap();
+        let worker = Worker::start(root.join("isolated/studyapp.sqlite3"), None);
+        worker
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        worker
+            .sender
+            .send(Work::MigrateLibrary(root.join("next-isolated")))
+            .unwrap();
+        let result = receive_notice(&worker);
+        assert!(storage_result(&result).is_ok(), "{:?}", result.notice);
+        assert!(result.library_replaced);
+        assert_eq!(
+            std::fs::read(unrelated_global).unwrap(),
+            b"unchanged global preference"
+        );
+        assert!(!root.join("location.json").exists());
+    }
+
+    #[test]
+    fn storage_mutations_are_rejected_during_sync_and_stale_requests_always_complete() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let worker = Worker::start(root.join("original/studyapp.sqlite3"), None);
+        let origin = worker
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .snapshot
+            .unwrap()
+            .data_path
+            .clone();
+        let created = apply(
+            &worker,
+            Command::CreateNote {
+                title: "preserve".into(),
+                content: "original".into(),
+            },
+        );
+        let note = created.snapshot.unwrap().notes[0].clone();
+        let rejected = while_network_sync_is_busy(&worker, || {
+            worker
+                .sender
+                .send(Work::DeleteManagedCopy {
+                    note_id: note.id.clone(),
+                })
+                .unwrap();
+            let deleted = receive_notice(&worker);
+            assert!(
+                storage_result(&deleted)
+                    .as_ref()
+                    .unwrap_err()
+                    .contains("同步")
+            );
+            assert!(!deleted.snapshot.unwrap().notes[0].detached);
+            worker
+                .sender
+                .send(Work::MigrateLibrary(root.join("busy-target")))
+                .unwrap();
+            receive_notice(&worker)
+        });
+        assert!(
+            storage_result(&rejected)
+                .as_ref()
+                .unwrap_err()
+                .contains("同步")
+        );
+        assert!(!root.join("busy-target").exists());
+        receive_notice(&worker);
+        worker
+            .sender
+            .send(Work::SwitchLibrary(root.join("next")))
+            .unwrap();
+        assert!(receive_notice(&worker).library_replaced);
+        for work in [
+            Work::RefreshStorage,
+            Work::DeleteManagedCopy {
+                note_id: note.id.clone(),
+            },
+            Work::MigrateLibrary(root.join("stale-target")),
+        ] {
+            worker
+                .sender
+                .send(Work::Scoped {
+                    library: origin.clone(),
+                    work: Box::new(work),
+                })
+                .unwrap();
+            let rejected = receive_notice(&worker);
+            assert!(storage_result(&rejected).is_err());
+            assert!(rejected.notice.unwrap().is_err());
+            assert!(rejected.note_result.is_none());
+            assert!(!rejected.editor_result);
+        }
+        assert_eq!(std::fs::read_to_string(note.path).unwrap(), "original");
+    }
 
     #[test]
     fn unmanage_is_rejected_while_network_sync_is_busy() {
@@ -665,6 +973,15 @@ mod tests {
                 Work::Apply(Command::CreateNote {
                     title: "stale new note".into(),
                     content: "preserve UI draft".into(),
+                }),
+                true,
+                false,
+            ),
+            (
+                Work::Apply(Command::CreateNoteInFolder {
+                    title: "stale folder note".into(),
+                    content: "preserve folder draft".into(),
+                    folder_id: None,
                 }),
                 true,
                 false,

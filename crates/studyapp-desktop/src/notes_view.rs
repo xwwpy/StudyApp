@@ -14,30 +14,61 @@ use gpui_kit::{
     *,
 };
 use studyapp_core::Snapshot;
-use studyapp_desktop::presentation::stamp;
+use studyapp_desktop::presentation::{display_path, stamp};
 
 impl StudyApp {
     pub fn notes(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
         let query = self.search.read(cx).value().to_lowercase();
-        let notes = snapshot.notes.iter().filter(|n| !n.detached).filter(|n| {
-            query.is_empty()
-                || n.title.to_lowercase().contains(&query)
-                || n.path.to_lowercase().contains(&query)
-                || snapshot
-                    .versions
-                    .iter()
-                    .rev()
-                    .find(|v| v.note_id == n.id)
-                    .is_some_and(|v| v.content.to_lowercase().contains(&query))
-        });
+        let notes = snapshot
+            .notes
+            .iter()
+            .filter(|n| {
+                n.detached == self.show_detached && self.folders.read(cx).filter().matches(n)
+            })
+            .filter(|n| {
+                query.is_empty()
+                    || n.title.to_lowercase().contains(&query)
+                    || n.path.to_lowercase().contains(&query)
+                    || snapshot
+                        .versions
+                        .iter()
+                        .rev()
+                        .find(|v| v.note_id == n.id)
+                        .is_some_and(|v| v.content.to_lowercase().contains(&query))
+            });
         let list = column()
             .id("note-list-scroll")
-            .w(px(265.))
-            .h_full()
+            .test_support()
+            .w_full()
+            .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .flex_shrink_0()
             .child(Input::new(&self.search).cleanable(true))
+            .child(
+                Button::new("show-detached-notes")
+                    .small()
+                    .ghost()
+                    .selected(self.show_detached)
+                    .label(if self.show_detached {
+                        "返回管理中的笔记"
+                    } else {
+                        "查看已取消管理"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_detached = !this.show_detached;
+                        this.selected_note = this.snapshot.as_ref().and_then(|s| {
+                            s.notes
+                                .iter()
+                                .find(|n| {
+                                    n.detached == this.show_detached
+                                        && this.folders.read(cx).filter().matches(n)
+                                })
+                                .map(|n| n.id.clone())
+                        });
+                        this.selected_version = None;
+                        cx.notify();
+                    })),
+            )
             .child(muted("可拖入多个 Markdown 或目录（最多 200 份，8 层）。"))
             .child(
                 Button::new("import-note-folder")
@@ -52,6 +83,7 @@ impl StudyApp {
                 let chosen = self.selected_note.as_ref() == Some(&id);
                 card()
                     .id(SharedString::from(format!("note-{id}")))
+                    .test_support()
                     .p_4()
                     .gap_2()
                     .cursor_pointer()
@@ -83,6 +115,7 @@ impl StudyApp {
         } else if let Some(note) = selected {
             let id = note.id.clone();
             let managed = note.managed && !note.detached;
+            let move_id = id.clone();
             let unmanage_id = id.clone();
             let export_id = id.clone();
             let export_version = self.selected_version.clone();
@@ -95,15 +128,26 @@ impl StudyApp {
                 .iter()
                 .rev()
                 .find(|v| self.selected_version.as_ref().is_none_or(|id| id == &v.id));
+            let historical =
+                version.is_some_and(|v| versions.last().is_some_and(|last| last.id != v.id));
+            let copy = !managed || historical;
             let mut reader = card()
                 .flex_1()
                 .h_full()
                 .min_h_0()
                 .min_w_0()
+                .overflow_hidden()
+                .gap_2()
                 .child(
                     row()
+                        .flex_shrink_0()
                         .flex_wrap()
-                        .child(heading(note.title.clone()))
+                        .child(
+                            heading(note.title.clone())
+                                .max_w(px(280.))
+                                .min_w_0()
+                                .truncate(),
+                        )
                         .child(div().flex_1())
                         .child(
                             Button::new("record-note")
@@ -118,13 +162,16 @@ impl StudyApp {
                             Button::new("edit-note")
                                 .small()
                                 .ghost()
-                                .label(if managed {
+                                .label(if historical {
+                                    "复制此版本后编辑"
+                                } else if managed {
                                     "编辑笔记"
                                 } else {
                                     "复制后编辑"
                                 })
+                                .disabled(self.storage_busy)
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open_note_editor(!managed, window, cx)
+                                    this.open_note_editor(copy, window, cx)
                                 })),
                         )
                         .child(
@@ -134,6 +181,18 @@ impl StudyApp {
                                 .label("导出 Markdown")
                                 .on_click(cx.listener(move |this, _, _, _| {
                                     this.export_note(export_id.clone(), export_version.clone())
+                                })),
+                        )
+                        .child(
+                            Button::new("move-note-folder")
+                                .small()
+                                .ghost()
+                                .label("移动到目录")
+                                .disabled(self.storage_busy)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.folders.update(cx, |panel, cx| {
+                                        panel.begin_move_note(move_id.clone(), cx)
+                                    });
                                 })),
                         )
                         .when(!note.detached, |r| {
@@ -168,7 +227,7 @@ impl StudyApp {
                 .when(note.detached, |c| {
                     c.child(muted("已取消管理 · 当前仅查看历史快照"))
                 })
-                .child(muted(note.path.clone()))
+                .child(muted(display_path(&note.path)).truncate().flex_shrink_0())
                 .child(muted(format!(
                     "{} · 创建：{} · 修改：{}",
                     if note.managed {
@@ -182,7 +241,7 @@ impl StudyApp {
                 .children(
                     note.error
                         .as_ref()
-                        .map(|error| pill(error.clone(), 0xFFF0E9)),
+                        .map(|error| pill(error.clone(), 0xFFF0E9).truncate()),
                 )
                 .child(
                     row()
@@ -209,63 +268,72 @@ impl StudyApp {
                                 })),
                         ),
                 )
-                .child(muted(note_tip(snapshot, &note.id)));
+                .child(
+                    muted(note_tip(snapshot, &note.id).replace('\n', " · "))
+                        .truncate()
+                        .text_xs()
+                        .flex_shrink_0(),
+                );
             if self.history {
-                reader = reader.child(row().flex_wrap().children(versions.iter().rev().map(|v| {
-                    let id = v.id.clone();
-                    Button::new(SharedString::from(format!("version-{id}")))
-                        .small()
-                        .selected(self.selected_version.as_ref() == Some(&id))
-                        .label(format!(
-                            "{}{}",
-                            stamp(v.captured_at),
-                            if v.offline { " · 离线" } else { "" }
-                        ))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.selected_version = Some(id.clone());
-                            cx.notify();
-                        }))
-                })));
+                let timeline = column()
+                    .id("history-versions-scroll")
+                    .w(px(145.))
+                    .h_full()
+                    .flex_shrink_0()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .gap_2()
+                    .children(versions.iter().rev().map(|v| {
+                        let id = v.id.clone();
+                        let chosen = version.is_some_and(|selected| selected.id == id);
+                        Button::new(SharedString::from(format!("version-{id}")))
+                            .small()
+                            .selected(chosen)
+                            .label(format!(
+                                "{}{}",
+                                stamp(v.captured_at),
+                                if v.offline { " · 离线" } else { "" }
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.selected_version = Some(id.clone());
+                                cx.notify();
+                            }))
+                    }));
+                let mut diff = column()
+                    .flex_1()
+                    .h_full()
+                    .min_h_0()
+                    .min_w_0()
+                    .gap_2()
+                    .overflow_hidden();
                 if let Some(version) = version {
-                    reader = reader
-                        .child(muted(version.summary.clone()))
-                        .child(muted(if version.offline {
-                            "离线期间的变更仅形成历史，不算作当前学习时间段。"
-                        } else {
-                            "新增行以 + 标记，删除行以 − 标记。"
-                        }))
+                    diff = diff
+                        .child(muted(version.summary.clone()).truncate().flex_shrink_0())
                         .child(
-                            column().gap_0().p_4().bg(rgb(BG)).rounded_lg().children(
-                                version
-                                    .diff
-                                    .lines()
-                                    .take(1500)
-                                    .enumerate()
-                                    .map(|(i, line)| {
-                                        let color = if line.starts_with('+') {
-                                            GREEN
-                                        } else if line.starts_with('-') {
-                                            0xB45142
-                                        } else {
-                                            MUTED
-                                        };
-                                        div()
-                                            .id(("diff-line", i))
-                                            .font_family("Consolas")
-                                            .text_xs()
-                                            .text_color(rgb(color))
-                                            .child(line.to_owned())
-                                    }),
-                            ),
+                            muted(if version.offline {
+                                "离线变更 · 不计入当前学习时段"
+                            } else {
+                                "+ 新增  /  − 删除 · 滚动查看全部差异"
+                            })
+                            .text_xs()
+                            .flex_shrink_0(),
                         );
                     if version.diff.is_empty() {
-                        reader = reader.child(muted("首次导入的基线快照，没有前一版本差异。"));
-                    }
-                    if version.diff.lines().count() > 1500 {
-                        reader =
-                            reader.child(muted("差异预览显示前 1,500 行；完整内容保存在快照中。"));
+                        diff = diff.child(muted("首次导入的基线快照，没有前一版本差异。"));
+                    } else {
+                        diff = diff.child(self.history_preview.render());
                     }
                 }
+                reader = reader.child(
+                    row()
+                        .items_stretch()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .child(timeline)
+                        .child(diff),
+                );
             } else {
                 reader = reader.child(self.note_content.clone());
             }
@@ -290,12 +358,16 @@ impl StudyApp {
             .when(self.recoverable_draft.is_some(), |c| c.child(card().id("draft-recovery").child(heading("发现未保存的笔记草稿"))
                 .child(muted("草稿仍保留在当前资料库，恢复后可继续编辑或另存为新笔记。"))
                 .child(row()
-                    .child(Button::new("recover-note-draft").primary().label("恢复草稿").on_click(cx.listener(|this, _, window, cx| this.recover_note(window, cx))))
-                    .child(Button::new("discard-recovered-draft").ghost().label("删除草稿").on_click(cx.listener(|this, _, _, cx| {
+                    .child(Button::new("recover-note-draft").disabled(self.storage_busy).primary().label("恢复草稿").on_click(cx.listener(|this, _, window, cx| this.recover_note(window, cx))))
+                    .child(Button::new("discard-recovered-draft").disabled(self.storage_busy).ghost().label("删除草稿").on_click(cx.listener(|this, _, _, cx| {
                         this.confirmation = Some(crate::editor_lifecycle::NoteConfirmation::DiscardDraft);
                         cx.notify();
                     })))
                 )))
-            .child(row().items_start().flex_1().min_h_0().w_full().child(list).child(detail))
+            .child(row().items_stretch().flex_1().min_h_0().w_full().overflow_hidden()
+                .child(column().w(px(265.)).h_full().min_h_0().flex_shrink_0().gap_2()
+                    .child(div().flex_1().max_h(px(285.)).min_h(px(120.)).child(self.folders.clone()))
+                    .child(list))
+                .child(detail))
     }
 }

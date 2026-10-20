@@ -171,6 +171,7 @@ pub(crate) fn import(state: &mut State, database: &Path, paths: Vec<PathBuf>, no
                 path: key,
                 title: title(&content, &canonical),
                 managed: false,
+                folder_id: None,
                 detached: false,
                 missing: false,
                 error: None,

@@ -379,6 +379,17 @@ impl MarkdownEditor {
     }
 
     #[cfg(all(windows, feature = "ui-test"))]
+    pub(crate) fn insert_text(
+        &self,
+        text: &str,
+    ) -> anyhow::Result<mpsc::Receiver<Result<(), String>>> {
+        self.host
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WebView 尚未创建"))?
+            .insert_text(text)
+    }
+
+    #[cfg(all(windows, feature = "ui-test"))]
     pub(crate) fn capture_png(
         &self,
         path: std::path::PathBuf,

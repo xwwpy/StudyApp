@@ -82,7 +82,13 @@ impl Engine {
         let mut next = self.state.clone();
         next.expire(now);
         match &command {
-            Command::CreateNote { title, content } => {
+            Command::CreateNote { title, content }
+            | Command::CreateNoteInFolder { title, content, .. } => {
+                let folder_id = match &command {
+                    Command::CreateNoteInFolder { folder_id, .. } => folder_id.clone(),
+                    _ => None,
+                };
+                crate::folders::require_target(&next, folder_id.as_deref())?;
                 let write = crate::managed::create(
                     &mut next,
                     &self.path,
@@ -92,6 +98,10 @@ impl Engine {
                     now,
                     false,
                 )?;
+                next.notes
+                    .last_mut()
+                    .expect("created managed note")
+                    .folder_id = folder_id;
                 self.write_managed(next, vec![write], false)?;
                 return Ok("笔记已创建".into());
             }
@@ -173,6 +183,29 @@ impl Engine {
             _ => {}
         }
         let message = match command {
+            Command::CreateFolder { name, parent_id } => {
+                crate::folders::create(&mut next, name, parent_id)?;
+                "目录已创建".into()
+            }
+            Command::RenameFolder { folder_id, name } => {
+                crate::folders::rename(&mut next, &folder_id, name)?;
+                "目录已重命名".into()
+            }
+            Command::MoveFolder {
+                folder_id,
+                parent_id,
+            } => {
+                crate::folders::move_folder(&mut next, &folder_id, parent_id)?;
+                "目录已移动".into()
+            }
+            Command::DeleteFolder { folder_id } => {
+                crate::folders::delete(&mut next, &folder_id)?;
+                "空目录已删除；笔记文件未改动".into()
+            }
+            Command::MoveNote { note_id, folder_id } => {
+                crate::folders::move_note(&mut next, &note_id, folder_id, now)?;
+                "笔记所属目录已更新".into()
+            }
             Command::SaveSettings(settings) => {
                 settings.validate()?;
                 if next.timer.active_seconds == 0 {
@@ -419,6 +452,7 @@ impl Engine {
             Command::Backup(_)
             | Command::Restore(_)
             | Command::CreateNote { .. }
+            | Command::CreateNoteInFolder { .. }
             | Command::SaveNote { .. }
             | Command::ReceiveSyncedNote { .. }
             | Command::ReceiveSyncedCopy { .. }

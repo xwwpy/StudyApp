@@ -10,6 +10,8 @@ use std::{
 pub struct NoteDraft {
     pub note_id: Option<String>,
     pub expected_hash: Option<String>,
+    #[serde(default)]
+    pub folder_id: Option<String>,
     pub title: String,
     pub content: String,
 }
@@ -232,6 +234,7 @@ mod tests {
         let draft = NoteDraft {
             note_id: None,
             expected_hash: None,
+            folder_id: None,
             title: "转义字符".into(),
             content: "\\".repeat(7 * 1024 * 1024),
         };
@@ -257,6 +260,7 @@ mod tests {
         let draft = NoteDraft {
             note_id: Some("note-id".into()),
             expected_hash: Some("version-hash".into()),
+            folder_id: None,
             title: "未保存的中文标题".into(),
             content: "# 草稿\n不能丢失的内容".into(),
         };
@@ -283,6 +287,7 @@ mod tests {
         let draft = |content: &str| NoteDraft {
             note_id: None,
             expected_hash: None,
+            folder_id: None,
             title: "草稿".into(),
             content: content.into(),
         };
@@ -315,6 +320,7 @@ mod tests {
             Some(NoteDraft {
                 note_id: None,
                 expected_hash: None,
+                folder_id: None,
                 title: "旧草稿".into(),
                 content: "已保存".into(),
             }),
@@ -350,6 +356,7 @@ mod tests {
         NoteDraft {
             note_id: None,
             expected_hash: None,
+            folder_id: None,
             title: "草稿".into(),
             content: content.into(),
         }

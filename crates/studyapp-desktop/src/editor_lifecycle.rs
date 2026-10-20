@@ -6,7 +6,7 @@ use crate::{
 };
 use gpui_kit::{
     component::{
-        Sizable,
+        Disableable, Sizable,
         button::{Button, ButtonVariants},
     },
     *,
@@ -20,6 +20,7 @@ pub enum NoteIntent {
     Keep,
     Discard,
     SwitchLibrary,
+    PrepareMigration,
     Close,
 }
 
@@ -55,6 +56,7 @@ impl StudyApp {
         cx: &mut Context<Self>,
     ) {
         if self.note_editor.is_none()
+            || self.storage_busy
             || self.note_saving
             || self.draft_discard.is_some()
             || (self.confirmation.is_some()
@@ -116,7 +118,10 @@ impl StudyApp {
                         self.note_saving = false;
                         self.begin_discard(window, cx);
                     }
-                    NoteIntent::Keep | NoteIntent::SwitchLibrary | NoteIntent::Close => {
+                    NoteIntent::Keep
+                    | NoteIntent::SwitchLibrary
+                    | NoteIntent::Close
+                    | NoteIntent::PrepareMigration => {
                         static NEXT_PERSIST: AtomicU64 = AtomicU64::new(1);
                         let token = NEXT_PERSIST.fetch_add(1, Ordering::Relaxed);
                         self.draft_persist = Some(PersistPending {
@@ -153,6 +158,11 @@ impl StudyApp {
                 self.recoverable_draft = None;
                 self.finish_library_transition(window, cx);
             }
+            NoteIntent::PrepareMigration => {
+                self.recoverable_draft = self.note_editor.take();
+                self.reader_key.clear();
+                self.pick_migration(window, cx);
+            }
             NoteIntent::Close => {
                 self.close_allowed = true;
                 window.remove_window();
@@ -176,6 +186,7 @@ impl StudyApp {
             return true;
         }
         if !self.note_content.read(cx).creating()
+            && !self.storage_busy
             && self.note_editor.is_none()
             && self.draft_discard.is_none()
         {
@@ -192,6 +203,7 @@ impl StudyApp {
             || self.note_saving
             || self.draft_discard.is_some()
             || self.note_content.read(cx).creating()
+            || self.storage_busy
         {
             return;
         }
@@ -204,7 +216,11 @@ impl StudyApp {
     }
 
     pub fn begin_discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.note_saving || self.draft_loading || self.draft_discard.is_some() {
+        if self.storage_busy
+            || self.note_saving
+            || self.draft_loading
+            || self.draft_discard.is_some()
+        {
             return;
         }
         static NEXT_DISCARD: AtomicU64 = AtomicU64::new(1);
@@ -248,6 +264,7 @@ impl StudyApp {
             row()
                 .child(
                     Button::new("confirm-note-action")
+                        .disabled(self.storage_busy)
                         .small()
                         .primary()
                         .label("确认")
@@ -294,6 +311,10 @@ impl StudyApp {
                         && self.selected_version.as_ref().is_none_or(|id| id == &v.id)
                 })
             });
+            if self.history {
+                self.history_preview
+                    .prepare(version, f32::from(window.viewport_size().width));
+            }
             show &= version.is_some() && !self.history;
             if show
                 && let Some(version) = version

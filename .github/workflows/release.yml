@@ -87,6 +87,8 @@ jobs:
           path: |
             ${{ env.SMOKE_DIR }}/*.png
             ${{ env.SMOKE_DIR }}/smoke-result.txt
+            ${{ env.SMOKE_DIR }}/library-smoke-result.txt
+            ${{ env.SMOKE_DIR }}/*.log
           if-no-files-found: warn
           retention-days: 30
       - run: cargo build --locked --release -p studyapp-desktop

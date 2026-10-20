@@ -214,6 +214,33 @@ mod windows_host {
         /// Captures the actual native child WebView, which GPUI render_to_image
         /// cannot include. Poll/await the receiver while the message loop runs.
         #[cfg(feature = "ui-test")]
+        pub fn insert_text(
+            &self,
+            text: &str,
+        ) -> Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>> {
+            use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+            use windows::core::{HSTRING, w};
+            self.evaluate("document.querySelector('.cm-content').focus();")?;
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let callback =
+                CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |status, _| {
+                    let _ = sender.send(status.map_err(|error| error.to_string()));
+                    Ok(())
+                }));
+            let parameters = HSTRING::from(serde_json::json!({"text": text}).to_string());
+            // SAFETY: called on the creating STA; WebView retains the callback.
+            unsafe {
+                self.webview.webview().CallDevToolsProtocolMethod(
+                    w!("Input.insertText"),
+                    &parameters,
+                    &callback,
+                )
+            }
+            .context("无法发送原生浏览器输入")?;
+            Ok(receiver)
+        }
+
+        #[cfg(feature = "ui-test")]
         pub fn capture_png(
             &self,
             path: PathBuf,

@@ -100,7 +100,20 @@ impl StudyApp {
         changed
     }
 
-    fn start_note_draft(&mut self, draft: NoteDraft, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_note_draft(
+        &mut self,
+        mut draft: NoteDraft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if draft.folder_id.as_ref().is_some_and(|id| {
+            self.snapshot
+                .as_ref()
+                .is_none_or(|s| !s.folders.iter().any(|f| &f.id == id))
+        }) {
+            draft.folder_id = None;
+            self.notice = Some(Ok("草稿原目录已不存在，已转为未分类。".into()));
+        }
         self.confirmation = None;
         self.note_title
             .update(cx, |s, cx| s.set_value(draft.title.clone(), window, cx));
@@ -115,12 +128,21 @@ impl StudyApp {
     }
 
     pub fn open_note_editor(&mut self, copy: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.confirmation.is_some() {
+        if self.confirmation.is_some() || self.storage_busy {
             return;
         }
         self.page = Page::Notes;
         if self.note_editor.is_some() {
             cx.notify();
+            return;
+        }
+        if !copy
+            && self
+                .recoverable_draft
+                .as_ref()
+                .is_some_and(|d| d.note_id.is_some() && d.note_id == self.selected_note)
+        {
+            self.recover_note(window, cx);
             return;
         }
         if self.draft_loading
@@ -146,6 +168,7 @@ impl StudyApp {
             Some(NoteDraft {
                 note_id: (!copy).then(|| note.id.clone()),
                 expected_hash: (!copy).then(|| version.hash.clone()),
+                folder_id: note.folder_id.clone(),
                 title: if copy {
                     format!("{}（副本）", note.title)
                 } else {
@@ -160,7 +183,9 @@ impl StudyApp {
     }
 
     pub fn new_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.confirmation.is_some() {
+        #[cfg(feature = "ui-test")]
+        eprintln!("native new_note: requested");
+        if self.confirmation.is_some() || self.storage_busy {
             return;
         }
         self.page = Page::Notes;
@@ -178,16 +203,25 @@ impl StudyApp {
             NoteDraft {
                 note_id: None,
                 expected_hash: None,
+                folder_id: self
+                    .folders
+                    .read(cx)
+                    .filter()
+                    .folder_id()
+                    .map(str::to_owned),
                 title: "新笔记".into(),
                 content: String::new(),
             },
             window,
             cx,
         );
+        #[cfg(feature = "ui-test")]
+        eprintln!("native new_note: draft activated");
     }
 
     pub fn recover_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.note_editor.is_none()
+        if !self.storage_busy
+            && self.note_editor.is_none()
             && self.confirmation.is_none()
             && self.draft_discard.is_none()
             && let Some(draft) = self.recoverable_draft.take()
@@ -215,7 +249,8 @@ impl StudyApp {
                 content: draft.content,
             }
         } else {
-            Command::CreateNote {
+            Command::CreateNoteInFolder {
+                folder_id: draft.folder_id,
                 title: draft.title,
                 content: draft.content,
             }
@@ -247,7 +282,7 @@ impl StudyApp {
                         Button::new("save-note")
                             .small()
                             .primary()
-                            .disabled(self.note_saving)
+                            .disabled(self.note_saving || self.storage_busy)
                             .label(if self.note_saving {
                                 "保存中…"
                             } else {
@@ -262,7 +297,7 @@ impl StudyApp {
                             Button::new("save-note-copy")
                                 .small()
                                 .ghost()
-                                .disabled(self.note_saving)
+                                .disabled(self.note_saving || self.storage_busy)
                                 .label("另存新笔记")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.request_note_action(
@@ -277,7 +312,7 @@ impl StudyApp {
                         Button::new("keep-note-draft")
                             .small()
                             .ghost()
-                            .disabled(self.note_saving)
+                            .disabled(self.note_saving || self.storage_busy)
                             .label("保留草稿并返回")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.request_note_action(
@@ -291,7 +326,11 @@ impl StudyApp {
                         Button::new("discard-note-draft")
                             .small()
                             .ghost()
-                            .disabled(self.note_saving || self.draft_discard.is_some())
+                            .disabled(
+                                self.note_saving
+                                    || self.storage_busy
+                                    || self.draft_discard.is_some(),
+                            )
                             .label("删除草稿")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.confirmation =

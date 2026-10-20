@@ -168,6 +168,7 @@ pub(crate) fn create(
             title.trim().into()
         },
         managed: true,
+        folder_id: None,
         detached: false,
         missing: false,
         error: None,

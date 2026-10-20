@@ -181,7 +181,7 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
                 window.dispatch_event(PlatformInput::FileDrop(FileDropEvent::Submit { position }), cx);
             }).expect("native file drop");
             cx.background_executor().timer(Duration::from_secs(1)).await;
-            let managed_id = crate::smoke_editor::exercise(window, &view, &database, cx).await;
+            let managed_id = Box::pin(crate::smoke_editor::exercise(window, &view, &database, cx)).await;
             let sync_folder = database.with_file_name("sync-target");
             std::fs::create_dir(&sync_folder).unwrap();
             window.update(cx, |_, window, cx| {
@@ -189,7 +189,7 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
                 assert_eq!(snapshot.versions.iter().filter(|v| v.note_id == managed_id).count(), 2);
                 window.click(("nav", 4_usize), cx);
                 // Scroll the actual settings surface to expose the sync card.
-                window.dispatch_event(ScrollWheelEvent { position: point(px(800.), px(450.)), delta: ScrollDelta::Pixels(point(px(0.), px(-520.))), ..Default::default() }.to_platform_input(), cx);
+                window.dispatch_event(ScrollWheelEvent { position: point(px(800.), px(450.)), delta: ScrollDelta::Pixels(point(px(0.), px(-760.))), ..Default::default() }.to_platform_input(), cx);
                 window.render_frame(cx);
                 window.click(("sync-target", 1_usize), cx);
                 let panel = view.read(cx).sync_panel.clone();
@@ -214,10 +214,12 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
                 window.render_frame(cx);
                 window.render_to_image().unwrap().save(database.with_file_name("sync-settings.png")).unwrap();
             }).expect("synced markdown verified");
+            #[cfg(windows)]
+            Box::pin(crate::smoke_library::exercise(window, &view, &database, cx)).await;
         }
         let report = database.with_file_name("smoke-result.txt");
         #[cfg(feature = "ui-test")]
-        let result = "PASS: five native pages rendered; screenshots captured; navigation, reviews, pause, settings, backup restore, learning versions, native file drop, continuous WebView Markdown editing, offline syntax highlighting, cross-paragraph undo/redo, source toggle, CRLF roundtrip, async save, draft recovery/deletion, unmanage/reimport, version history, folder connection and actual Markdown sync verified.\n";
+        let result = "PASS: five native pages rendered; screenshots captured; navigation, reviews, pause, settings, backup restore, learning versions, native file drop, continuous WebView Markdown editing, offline syntax highlighting, cross-paragraph undo/redo, source toggle, CRLF roundtrip, async save, draft recovery/deletion, unmanage/reimport, long version history scrolling and native input after history, logical folders, safe single-copy cleanup, library migration, folder connection and actual Markdown sync verified.\n";
         #[cfg(not(feature = "ui-test"))]
         let result = "PASS: release executable launched, five native pages rendered and offline WebView editor became ready; interactive assertions and screenshots require ui-test.\n";
         std::fs::write(report, result).expect("write smoke report");

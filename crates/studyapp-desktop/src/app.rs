@@ -51,6 +51,7 @@ pub struct StudyApp {
     pub selected_note: Option<String>,
     pub selected_version: Option<String>,
     pub history: bool,
+    pub show_detached: bool,
     pub stats_days: usize,
     pub record_filter: usize,
     pub record_limit: usize,
@@ -75,6 +76,11 @@ pub struct StudyApp {
     pub close_requested: bool,
     pub close_allowed: bool,
     pub sync_panel: Entity<crate::sync_ui::SyncPanel>,
+    pub folders: Entity<crate::folders_ui::FolderPanel>,
+    pub history_preview: crate::history_preview::HistoryPreview,
+    pub storage_report: Option<crate::storage_backend::StorageReport>,
+    pub storage_busy: bool,
+    pub storage_confirm: Option<String>,
     notified: HashSet<String>,
     _poll: Task<()>,
 }
@@ -144,8 +150,35 @@ impl StudyApp {
         });
         let sync_panel =
             cx.new(|cx| crate::sync_ui::SyncPanel::new(worker.sender.clone(), window, cx));
+        let folders = cx.new(|cx| crate::folders_ui::FolderPanel::new(window, cx));
+        cx.subscribe(
+            &folders,
+            |this, _, event: &crate::folders_ui::FolderEvent, cx| {
+                match event {
+                    crate::folders_ui::FolderEvent::Filter(filter) => {
+                        this.selected_note = this.snapshot.as_ref().and_then(|s| {
+                            s.notes
+                                .iter()
+                                .find(|n| n.detached == this.show_detached && filter.matches(n))
+                                .map(|n| n.id.clone())
+                        });
+                        this.selected_version = None;
+                    }
+                    crate::folders_ui::FolderEvent::Command(command) => {
+                        this.send(command.clone(), cx)
+                    }
+                }
+                cx.notify();
+            },
+        )
+        .detach();
         Self {
             sync_panel,
+            folders,
+            history_preview: Default::default(),
+            storage_report: None,
+            storage_busy: false,
+            storage_confirm: None,
             drafts: DraftStore::new(),
             note_title,
             note_content,
@@ -190,6 +223,7 @@ impl StudyApp {
             selected_note: None,
             selected_version: None,
             history: false,
+            show_detached: false,
             stats_days: 30,
             record_filter: 0,
             record_limit: 50,
@@ -211,6 +245,17 @@ impl StudyApp {
             self.capture_note_draft(cx);
         }
         while let Ok(update) = self.worker.receiver.try_recv() {
+            if let Some(crate::storage_backend::StorageEvent::Finished(result)) =
+                update.storage_event
+            {
+                self.storage_busy = false;
+                self.folders
+                    .update(cx, |panel, cx| panel.set_busy(false, cx));
+                match result {
+                    Ok(report) => self.storage_report = Some(report),
+                    Err(error) => self.notice = Some(Err(error)),
+                }
+            }
             if let Some(status) = update.sync_status {
                 self.sync_panel.update(cx, |panel, cx| {
                     panel.accept(status, update.library_replaced, window, cx)
@@ -221,6 +266,7 @@ impl StudyApp {
                 self.note_content
                     .update(cx, |editor, cx| editor.set_readonly(false, cx));
                 if let Ok(note_id) = result {
+                    self.show_detached = false;
                     self.selected_note = Some(note_id);
                     self.selected_version = None;
                     self.note_editor = None;
@@ -274,6 +320,9 @@ impl StudyApp {
         cx: &mut Context<Self>,
     ) {
         if library_replaced || self.last_library != snapshot.data_path {
+            self.show_detached = false;
+            self.storage_report = None;
+            self.storage_confirm = None;
             self.note_editor = None;
             self.recoverable_draft = None;
             self.note_saving = false;
@@ -338,10 +387,10 @@ impl StudyApp {
             }
         }
         if self.selected_note.as_ref().is_none_or(|id| {
-            !snapshot
-                .notes
-                .iter()
-                .any(|n| &n.id == id && (!n.detached || self.selected_version.is_some()))
+            !snapshot.notes.iter().any(|n| {
+                &n.id == id
+                    && (!n.detached || self.show_detached || self.selected_version.is_some())
+            })
         }) {
             self.selected_note = snapshot
                 .notes
@@ -350,10 +399,72 @@ impl StudyApp {
                 .map(|n| n.id.clone());
             self.selected_version = None;
         }
+        if self.note_editor.is_none()
+            && self.selected_version.is_none()
+            && self.selected_note.as_ref().is_none_or(|id| {
+                !snapshot.notes.iter().any(|n| {
+                    &n.id == id
+                        && n.detached == self.show_detached
+                        && self.folders.read(cx).filter().matches(n)
+                })
+            })
+        {
+            self.selected_note = snapshot
+                .notes
+                .iter()
+                .find(|n| {
+                    n.detached == self.show_detached && self.folders.read(cx).filter().matches(n)
+                })
+                .map(|n| n.id.clone());
+        }
+        self.folders
+            .update(cx, |panel, cx| panel.accept(snapshot.clone(), window, cx));
+        let mut draft_folder_changed = false;
+        for draft in [&mut self.note_editor, &mut self.recoverable_draft]
+            .into_iter()
+            .flatten()
+        {
+            let folder = if let Some(note) = snapshot
+                .notes
+                .iter()
+                .find(|n| Some(&n.id) == draft.note_id.as_ref())
+            {
+                note.folder_id.clone()
+            } else {
+                draft
+                    .folder_id
+                    .clone()
+                    .filter(|id| snapshot.folders.iter().any(|f| &f.id == id))
+            };
+            if draft.folder_id != folder {
+                draft.folder_id = folder;
+                draft_folder_changed = true;
+            }
+        }
+        if draft_folder_changed {
+            if self.note_editor.is_some() {
+                self.capture_note_draft(cx);
+            } else {
+                self.drafts
+                    .save(&self.last_library, self.recoverable_draft.clone());
+            }
+            self.notice = Some(Ok("草稿目录已随笔记更新；已删除的目录会转为未分类。".into()));
+        }
         self.snapshot = Some(snapshot);
     }
 
     pub fn send(&mut self, command: Command, cx: &mut Context<Self>) {
+        if self.storage_busy {
+            self.saving = false;
+            self.note_saving = false;
+            if self.note_editor.is_some() {
+                self.note_content
+                    .update(cx, |editor, cx| editor.set_readonly(false, cx));
+            }
+            self.notice = Some(Err("资料库维护进行中，请完成后重试。".into()));
+            cx.notify();
+            return;
+        }
         if self
             .worker
             .sender
@@ -373,7 +484,7 @@ impl StudyApp {
     }
 
     pub fn picker(&self, action: &'static str, note: Option<String>) {
-        if self.note_saving || self.draft_discard.is_some() {
+        if self.note_saving || self.draft_discard.is_some() || self.storage_busy {
             return;
         }
         let sender = self.worker.sender.clone();
@@ -625,7 +736,7 @@ impl StudyApp {
 impl Render for StudyApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.prepare_document_view(window, cx);
-        let continuous = self.page == Page::Notes && (self.note_editor.is_some() || !self.history);
+        let continuous = self.page == Page::Notes;
         let title = match self.page {
             Page::Today => "今天，学到了什么？",
             Page::Notes => "你的知识，持续生长",
@@ -651,11 +762,21 @@ impl Render for StudyApp {
             };
             row()
                 .w_full()
+                .flex_shrink_0()
                 .rounded_lg()
                 .bg(rgb(color))
                 .px_4()
                 .py_3()
-                .child(div().flex_1().text_sm().child(message))
+                .child(
+                    div()
+                        .id("notice-message-scroll")
+                        .flex_1()
+                        .min_w_0()
+                        .max_h(px(64.))
+                        .overflow_y_scroll()
+                        .text_sm()
+                        .child(message),
+                )
                 .child(
                     Button::new("dismiss-notice")
                         .ghost()
@@ -669,6 +790,9 @@ impl Render for StudyApp {
         });
         row()
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                if this.storage_busy {
+                    return;
+                }
                 if this
                     .worker
                     .sender
@@ -744,6 +868,7 @@ impl Render for StudyApp {
                     .child(
                         column()
                             .id("page-scroll")
+                            .test_support()
                             .flex_1()
                             .min_h_0()
                             .when(!continuous, |c| c.overflow_y_scroll())

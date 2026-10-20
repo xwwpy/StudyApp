@@ -19,6 +19,8 @@ pub(crate) struct Undo {
 pub(crate) struct State {
     pub settings: Settings,
     pub notes: Vec<Note>,
+    #[serde(default)]
+    pub folders: Vec<NoteFolder>,
     pub sessions: Vec<Session>,
     pub reviews: Vec<Review>,
     pub review_events: Vec<ReviewEvent>,
@@ -71,6 +73,7 @@ impl State {
         Self {
             settings: Settings::default(),
             notes: vec![],
+            folders: vec![],
             sessions: vec![],
             reviews: vec![],
             review_events: vec![],
@@ -94,6 +97,7 @@ impl State {
         Snapshot {
             settings: self.settings.clone(),
             notes: self.notes.clone(),
+            folders: self.folders.clone(),
             versions: self.versions.clone(),
             sessions: self.sessions.clone(),
             reviews: self.reviews.clone(),
@@ -113,6 +117,7 @@ impl State {
     }
     pub fn validate(&self) -> Result<()> {
         self.settings.validate()?;
+        crate::folders::validate(self)?;
         ensure!(
             (300..=14400).contains(&self.timer.target_seconds)
                 && self.timer.active_seconds < self.timer.target_seconds,

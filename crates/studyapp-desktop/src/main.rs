@@ -6,6 +6,8 @@ mod components;
 mod credentials;
 mod drafts;
 mod editor_lifecycle;
+mod folders_ui;
+mod history_preview;
 mod imports;
 mod markdown_editor;
 mod note_editor;
@@ -13,6 +15,10 @@ mod notes_view;
 mod smoke;
 #[cfg(feature = "ui-test")]
 mod smoke_editor;
+#[cfg(all(windows, feature = "ui-test"))]
+mod smoke_library;
+mod storage_backend;
+mod storage_ui;
 mod sync_runtime;
 mod sync_ui;
 mod views;

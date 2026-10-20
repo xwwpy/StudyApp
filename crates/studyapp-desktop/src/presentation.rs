@@ -1,5 +1,88 @@
 use chrono::{Local, NaiveDateTime, TimeZone};
 
+/// Presentation only; canonical paths must remain unchanged for IO and identity.
+pub fn display_path(path: &str) -> String {
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{unc}");
+    }
+    if let Some(drive) = path.strip_prefix(r"\\?\")
+        && drive.as_bytes().get(1) == Some(&b':')
+        && drive
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+    {
+        return drive.to_owned();
+    }
+    path.to_owned()
+}
+
+/// Bound each visual diff row without dropping any content. CJK/emoji receive
+/// two columns, and tabs become four spaces. Cached by the view, not each frame.
+pub fn diff_rows(diff: &str, columns: usize) -> Vec<(String, char)> {
+    let columns = columns.max(4);
+    let mut rows = Vec::new();
+    for line in diff.lines() {
+        let marker = line.chars().next().unwrap_or(' ');
+        let mut row = String::new();
+        let mut width = 0;
+        for ch in line.chars() {
+            let size = if ch == '\t' {
+                4
+            } else if ch.is_ascii() {
+                1
+            } else {
+                2
+            };
+            if width + size > columns && !row.is_empty() {
+                rows.push((std::mem::take(&mut row), marker));
+                width = 0;
+            }
+            if ch == '\t' {
+                row.push_str("    ");
+            } else {
+                row.push(ch);
+            }
+            width += size;
+        }
+        rows.push((row, marker));
+    }
+    rows
+}
+
+#[cfg(test)]
+mod path_and_diff_tests {
+    use super::*;
+    #[test]
+    fn windows_paths_are_displayed_without_changing_other_paths() {
+        assert_eq!(display_path(r"\\?\C:\学习\笔记.md"), r"C:\学习\笔记.md");
+        assert_eq!(
+            display_path(r"\\?\UNC\nas\share\笔记.md"),
+            r"\\nas\share\笔记.md"
+        );
+        for path in [
+            r"\\nas\share",
+            r"C:\notes",
+            "/home/notes",
+            r"\\?\Volume{abc}\",
+        ] {
+            assert_eq!(display_path(path), path);
+        }
+    }
+    #[test]
+    fn long_diffs_keep_all_rows_and_unicode_without_truncation() {
+        let text = format!("+{}\n-{}\n", "中文🧠a".repeat(5000), "tail\n".repeat(1600));
+        let rows = diff_rows(&text, 28);
+        assert!(rows.len() > 1500);
+        assert_eq!(
+            rows.iter().map(|r| r.0.as_str()).collect::<String>(),
+            text.replace('\n', "")
+        );
+        assert!(rows.iter().take(100).all(|r| r.1 == '+'));
+        assert!(rows.iter().all(|r| r.0.chars().count() <= 28));
+    }
+}
+
 pub fn safe_markdown_html(source: &str) -> String {
     use pulldown_cmark::Parser;
     safe_markdown_events(Parser::new_ext(source, crate::markdown::markdown_options()))

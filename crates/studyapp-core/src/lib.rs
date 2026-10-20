@@ -1,5 +1,6 @@
 //! Persistent learning rules, independent of the desktop interface.
 mod engine;
+mod folders;
 pub mod integration;
 mod managed;
 mod models;

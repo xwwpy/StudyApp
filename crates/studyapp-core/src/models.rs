@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+/// Maximum number of logical folders from a root folder to a leaf.
+pub const MAX_FOLDER_DEPTH: usize = 8;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Settings {
     pub interval_minutes: u32,
@@ -18,6 +20,8 @@ pub struct Note {
     pub path: String,
     pub title: String,
     #[serde(default)]
+    pub folder_id: Option<String>,
+    #[serde(default)]
     pub managed: bool,
     #[serde(default)]
     pub detached: bool,
@@ -26,6 +30,13 @@ pub struct Note {
     pub created_at: i64,
     pub updated_at: i64,
     pub revision: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoteFolder {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NoteVersion {
@@ -91,6 +102,8 @@ pub struct TimerState {
 pub struct Snapshot {
     pub settings: Settings,
     pub notes: Vec<Note>,
+    #[serde(default)]
+    pub folders: Vec<NoteFolder>,
     pub versions: std::sync::Arc<Vec<NoteVersion>>,
     pub sessions: Vec<Session>,
     pub reviews: Vec<Review>,
@@ -103,6 +116,30 @@ pub enum Command {
     CreateNote {
         title: String,
         content: String,
+    },
+    CreateNoteInFolder {
+        title: String,
+        content: String,
+        folder_id: Option<String>,
+    },
+    CreateFolder {
+        name: String,
+        parent_id: Option<String>,
+    },
+    RenameFolder {
+        folder_id: String,
+        name: String,
+    },
+    MoveFolder {
+        folder_id: String,
+        parent_id: Option<String>,
+    },
+    DeleteFolder {
+        folder_id: String,
+    },
+    MoveNote {
+        note_id: String,
+        folder_id: Option<String>,
     },
     SaveNote {
         note_id: String,

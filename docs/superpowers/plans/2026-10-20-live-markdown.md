@@ -30,10 +30,10 @@ pub struct MarkdownBuffer { /* private raw text and bounded history */ }
 // checkpoint(), undo()->bool, redo()->bool, can_undo()->bool, can_redo()->bool.
 ```
 
-- [ ] Write failing tests for exact concatenation of block source slices (CRLF, Unicode, fences, nested lists, tables, definitions), sanitized block HTML, replace validation and undo/redo across checkpoints.
-- [ ] Run `cargo test -p studyapp-desktop --lib markdown --locked`; verify failures before implementation.
-- [ ] Implement full-document parser offset grouping and bounded undo/redo. Active edit ranges are owned by UI, not automatically reparsed on every keystroke.
-- [ ] Run focused tests, inspect output, review buffer contract before integration.
+- [x] Write failing tests for exact concatenation of block source slices (CRLF, Unicode, fences, nested lists, tables, definitions), sanitized block HTML, replace validation and undo/redo across checkpoints.
+- [x] Run `cargo test -p studyapp-desktop --lib markdown --locked`; verify failures before implementation.
+- [x] Implement full-document parser offset grouping and bounded undo/redo. Active edit ranges are owned by UI, not automatically reparsed on every keystroke.
+- [x] Run focused tests, inspect output, review buffer contract before integration.
 
 ## Task 2: Native live editor and integration
 
@@ -41,17 +41,17 @@ Files: create `crates/studyapp-desktop/src/markdown_editor.rs`; update `main.rs`
 
 Interfaces: `MarkdownEditor::new(window,cx)`, `set_value(String,window,cx)`, `value()->&str`, `set_readonly(bool,cx)`; emits `MarkdownChanged`. Native smoke may inspect public(crate) input/model state.
 
-- [ ] Extend native smoke to require default live mode and live preview after a real block input edit; demonstrate old editor fails this requirement.
-- [ ] Render a persistent toolbar, bounded scroll area and cached clickable blocks. Active block uses Textarea plus immediate sanitized preview; source mode uses whole text with preview.
-- [ ] Implement toolbar insertion using selected byte range; keyboard completion and shared undo/redo; flush current input before mode changes/save.
-- [ ] Replace StudyApp's `note_content`/`note_preview` with this entity. Draft capture reads canonical Markdown directly. Saving freezes the entity; failure unlocks it.
-- [ ] Test editing, recovery, version persistence, source round trips, Unicode and undo using `cargo build -p studyapp-desktop --features ui-test --locked` and `scripts/smoke.ps1` in a new isolated directory.
+- [x] Extend native smoke to require default live mode and live preview after a real block input edit; demonstrate old editor fails this requirement.
+- [x] Render a persistent toolbar, bounded scroll area and cached clickable blocks. Active block uses Textarea plus immediate sanitized preview; source mode uses whole text with preview.
+- [x] Implement toolbar insertion using selected byte range; keyboard completion and shared undo/redo; flush current input before mode changes/save.
+- [x] Replace StudyApp's `note_content`/`note_preview` with this entity. Draft capture reads canonical Markdown directly. Saving freezes the entity; failure unlocks it.
+- [x] Test editing, recovery, version persistence, source round trips, Unicode and undo using `cargo build -p studyapp-desktop --features ui-test --locked` and `scripts/smoke.ps1` in a new isolated directory.
 
 ## Task 3: Review and delivery
 
 Files: README, release notes, verification evidence, editor screenshot, workspace version/lockfile.
 
-- [ ] Independent code review against the spec; fix correctness issues and add regression coverage.
-- [ ] Run fmt, workspace tests, all-feature clippy, native smoke and inspect screenshots.
-- [ ] Document actual interaction and limitations. Commit and push authorized changes to the existing GitHub repository.
+- [x] Independent code review against the spec; fix correctness issues and add regression coverage.
+- [x] Run fmt, workspace tests, all-feature clippy, native smoke and inspect screenshots.
+- [x] Document actual interaction and limitations. Commit and push authorized changes to the existing GitHub repository.
 - [ ] Verify main CI; package/publish a feature release only after gates pass. Report links and evidence accurately.

@@ -13,8 +13,8 @@ path = "src/main.rs"
 ui-test = ["gpui-kit/test-support"]
 
 [dependencies]
-studyapp-core = { version = "0.2.2", path = "../studyapp-core" }
-studyapp-sync = { version = "0.2.2", path = "../studyapp-sync" }
+studyapp-core = { version = "0.3.0", path = "../studyapp-core" }
+studyapp-sync = { version = "0.3.0", path = "../studyapp-sync" }
 anyhow = "1"
 chrono = "0.4"
 directories = "6"

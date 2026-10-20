@@ -5,16 +5,14 @@ use crate::{
 };
 use gpui_kit::{
     component::{
-        Disableable, Selectable, Sizable,
+        Disableable, Sizable,
         button::{Button, ButtonVariants},
-        input::{Input, Textarea},
-        text::TextView,
+        input::Input,
     },
     prelude::FluentBuilder,
     *,
 };
 use studyapp_core::Command;
-use studyapp_desktop::presentation::safe_markdown_html;
 
 impl StudyApp {
     pub fn capture_note_draft(&mut self, cx: &mut Context<Self>) {
@@ -59,7 +57,6 @@ impl StudyApp {
             .update(cx, |s, cx| s.set_value(draft.content.clone(), window, cx));
         self.note_editor = Some(draft);
         self.note_saving = false;
-        self.note_preview = false;
         self.page = Page::Notes;
         self.capture_note_draft(cx);
     }
@@ -130,10 +127,12 @@ impl StudyApp {
         }
     }
 
-    pub fn save_note(&mut self, cx: &mut Context<Self>) {
+    pub fn save_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.note_saving {
             return;
         }
+        self.note_content
+            .update(cx, |editor, cx| editor.flush(window, cx));
         self.capture_note_draft(cx);
         let Some(draft) = self.note_editor.clone() else {
             return;
@@ -151,12 +150,14 @@ impl StudyApp {
             }
         };
         self.note_saving = true;
+        self.note_content
+            .update(cx, |editor, cx| editor.set_readonly(true, cx));
         self.send(command, cx);
     }
 
     pub fn note_editor_view(&self, cx: &mut Context<Self>) -> Div {
         let draft = self.note_editor.as_ref().expect("visible note editor");
-        let mut view = card()
+        let view = card()
             .id("note-editor")
             .flex_1()
             .min_w_0()
@@ -170,21 +171,6 @@ impl StudyApp {
                     }))
                     .child(div().flex_1())
                     .child(
-                        Button::new("note-preview-toggle")
-                            .small()
-                            .ghost()
-                            .selected(self.note_preview)
-                            .label(if self.note_preview {
-                                "继续编辑"
-                            } else {
-                                "预览"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.note_preview = !this.note_preview;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
                         Button::new("save-note")
                             .small()
                             .primary()
@@ -194,7 +180,9 @@ impl StudyApp {
                             } else {
                                 "保存版本 · Ctrl+S"
                             })
-                            .on_click(cx.listener(|this, _, _, cx| this.save_note(cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.save_note(window, cx)),
+                            ),
                     )
                     .when(draft.note_id.is_some(), |r| {
                         r.child(
@@ -203,13 +191,13 @@ impl StudyApp {
                                 .ghost()
                                 .disabled(self.note_saving)
                                 .label("另存新笔记")
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(cx.listener(|this, _, window, cx| {
                                     this.capture_note_draft(cx);
                                     if let Some(draft) = this.note_editor.as_mut() {
                                         draft.note_id = None;
                                         draft.expected_hash = None;
                                     }
-                                    this.save_note(cx);
+                                    this.save_note(window, cx);
                                 })),
                         )
                     })
@@ -219,7 +207,9 @@ impl StudyApp {
                             .ghost()
                             .disabled(self.note_saving)
                             .label("保留草稿并返回")
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.note_content
+                                    .update(cx, |editor, cx| editor.flush(window, cx));
                                 this.capture_note_draft(cx);
                                 this.recoverable_draft = this.note_editor.take();
                                 cx.notify();
@@ -231,28 +221,8 @@ impl StudyApp {
             ))
             .child(div().id("note-title").child(
                 Input::new(&self.note_title).disabled(self.note_saving || draft.note_id.is_some()),
-            ));
-        if self.note_preview {
-            let content: String = self
-                .note_content
-                .read(cx)
-                .value()
-                .chars()
-                .take(120_000)
-                .collect();
-            view = view.child(TextView::html(
-                "draft-markdown-preview",
-                safe_markdown_html(&content),
-            ));
-        } else {
-            view = view.child(
-                div().id("note-content").child(
-                    Textarea::new(&self.note_content)
-                        .readonly(self.note_saving)
-                        .h(px(390.)),
-                ),
-            );
-        }
+            ))
+            .child(self.note_content.clone());
         column().flex_1().min_w_0().child(view)
     }
 

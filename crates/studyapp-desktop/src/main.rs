@@ -6,6 +6,7 @@ mod components;
 mod credentials;
 mod drafts;
 mod imports;
+mod markdown_editor;
 mod note_editor;
 mod notes_view;
 mod smoke;

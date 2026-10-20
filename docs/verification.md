@@ -1,5 +1,19 @@
 # 验证记录
 
+## 0.3.0 Markdown 即时编辑验收
+
+2026-10-20，Windows x64 / Rust 1.98.0 / GPUI Kit 0.7.3：
+
+- `cargo test --workspace --all-features --locked`：107 项通过（核心 53、桌面 40、同步 14）。新增覆盖无损 Markdown 分块、Unicode / CRLF、嵌套列表 / 围栏 / 表格 / 引用定义、格式化选区、撤销预算与预览限制。
+- `cargo fmt --all -- --check` 和全目标、全特性 Clippy `-D warnings` 通过。
+- 原生窗口回归通过，证据目录 `.scratch/live-editor-28a9f45089be4730bda23dee417ba882`：实际键盘输入、点击排版段落、即时粗体预览、格式按钮、跨模式撤销重做、CRLF 模式切换不变、文末引用定义、输入法组合文字直接保存和切换后续段落、长文档源码回退与缩短后恢复、草稿恢复、历史版本以及原有学习 / 备份 / 文件夹同步流程。
+- 用户正在使用的 `target/debug/studyapp.exe` 保持运行；最终原生测试通过 `cargo rustc -p studyapp-desktop --features ui-test --bin studyapp --locked -- -o .scratch/studyapp-live-test.exe` 生成独立程序。`-o` 与 Cargo 输出目录有关的提示已保留，未绕过编译错误或测试断言。
+- 先复现旧编辑器需要切换预览、输入法可见文字未落入保存、组合输入后点击后续段落定位错误，以及局部解析无法识别文末引用定义的问题，再实现修复并观察回归通过。独立审查复核后无剩余 P1/P2。
+- 人工检查 [编辑器截图](images/note-editor.png)：工具栏、排版段落、当前输入区域与实时效果均可见。产品使用原生段落即时编辑，并不宣称完整复刻 Typora 富文本交互。
+- 本次无新增第三方依赖；版本号同步为 0.3.0，原有 Windows/Linux CI、安全检查和发布门禁继续执行。远端执行状态以对应 GitHub Actions 和 Release 为准，本节记录实际完成的本地验证。
+
+预览采用 64 KiB / 约 400 行上限，即时块布局最多 256 KiB / 500 块，超大单块也进入源码模式。原文仍可完整编辑与保存；会话撤销最多 100 个快照、合计 4 MiB，超过预算的正文不提供会话撤销。Markdown 资源和活动内容继续过滤，已有版本保存与同步冲突机制未改变。
+
 ## 0.2.x 本地验收
 
 2026-10-19，Windows x64 / Rust 1.98.0 / GPUI Kit 0.7.3，使用提交的 Cargo.lock：

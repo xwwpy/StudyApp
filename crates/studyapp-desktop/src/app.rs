@@ -59,14 +59,13 @@ pub struct StudyApp {
     pub last_library: String,
     pub drafts: DraftStore,
     pub note_title: Entity<InputState>,
-    pub note_content: Entity<TextareaState>,
+    pub note_content: Entity<crate::markdown_editor::MarkdownEditor>,
     pub note_editor: Option<NoteDraft>,
     pub recoverable_draft: Option<NoteDraft>,
     pub draft_loading: bool,
     pub draft_failed: bool,
     pub record_date: Entity<InputState>,
     pub note_saving: bool,
-    pub note_preview: bool,
     pub sync_panel: Entity<crate::sync_ui::SyncPanel>,
     notified: HashSet<String>,
     _poll: Task<()>,
@@ -111,8 +110,7 @@ impl StudyApp {
         )
         .detach();
         let note_title = input("笔记标题", "", window, cx);
-        let note_content =
-            cx.new(|cx| TextareaState::new(window, cx).placeholder("使用标准 Markdown 记录知识…"));
+        let note_content = cx.new(|cx| crate::markdown_editor::MarkdownEditor::new(window, cx));
         cx.subscribe(
             &note_title,
             |this, _, _: &gpui_kit::component::input::InputEvent, cx| this.capture_note_draft(cx),
@@ -120,7 +118,7 @@ impl StudyApp {
         .detach();
         cx.subscribe(
             &note_content,
-            |this, _, _: &gpui_kit::component::input::InputEvent, cx| this.capture_note_draft(cx),
+            |this, _, _: &crate::markdown_editor::MarkdownChanged, cx| this.capture_note_draft(cx),
         )
         .detach();
         let sync_panel =
@@ -136,7 +134,6 @@ impl StudyApp {
             recoverable_draft: None,
             draft_loading: true,
             note_saving: false,
-            note_preview: false,
             worker,
             snapshot: None,
             page: Page::Today,
@@ -187,6 +184,8 @@ impl StudyApp {
             }
             if let Some(result) = update.note_result {
                 self.note_saving = false;
+                self.note_content
+                    .update(cx, |editor, cx| editor.set_readonly(false, cx));
                 if let Ok(note_id) = result {
                     self.selected_note = Some(note_id);
                     self.selected_version = None;
@@ -207,10 +206,14 @@ impl StudyApp {
             }
             if let Some(snapshot) = update.snapshot {
                 if update.library_replaced || self.last_library != snapshot.data_path {
+                    self.note_content
+                        .update(cx, |editor, cx| editor.flush(window, cx));
                     self.capture_note_draft(cx);
                     self.note_editor = None;
                     self.recoverable_draft = None;
                     self.note_saving = false;
+                    self.note_content
+                        .update(cx, |editor, cx| editor.set_readonly(false, cx));
                     self.draft_loading = true;
                     self.draft_failed = false;
                     self.last_library = snapshot.data_path.clone();
@@ -300,6 +303,8 @@ impl StudyApp {
             self.notice = Some(Err("后台服务已停止，请重新打开应用".into()));
             self.saving = false;
             self.note_saving = false;
+            self.note_content
+                .update(cx, |editor, cx| editor.set_readonly(false, cx));
         }
         cx.notify();
     }
@@ -636,13 +641,13 @@ impl Render for StudyApp {
                 }
                 cx.notify();
             }))
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.modifiers.control
                     && event.keystroke.key.eq_ignore_ascii_case("s")
                     && this.page == Page::Notes
                     && this.note_editor.is_some()
                 {
-                    this.save_note(cx);
+                    this.save_note(window, cx);
                     cx.stop_propagation();
                 }
             }))

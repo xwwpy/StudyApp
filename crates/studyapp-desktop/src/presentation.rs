@@ -1,14 +1,15 @@
 use chrono::{Local, NaiveDateTime, TimeZone};
 
 pub fn safe_markdown_html(source: &str) -> String {
-    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, html};
-    // Imported text is data. Strip all active resource/link tags before handing
-    // the generated, escaped HTML to the native rich-text renderer.
-    let events = Parser::new_ext(
-        source,
-        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
-    )
-    .filter_map(|event| match event {
+    use pulldown_cmark::Parser;
+    safe_markdown_events(Parser::new_ext(source, crate::markdown::markdown_options()))
+}
+
+pub(crate) fn safe_markdown_events<'a>(
+    events: impl IntoIterator<Item = pulldown_cmark::Event<'a>>,
+) -> String {
+    use pulldown_cmark::{Event, Tag, TagEnd, html};
+    let events = events.into_iter().filter_map(|event| match event {
         Event::Html(_) | Event::InlineHtml(_) => None,
         Event::Start(Tag::Image { .. }) => Some(Event::Text("[图片：".into())),
         Event::End(TagEnd::Image) => Some(Event::Text("]".into())),

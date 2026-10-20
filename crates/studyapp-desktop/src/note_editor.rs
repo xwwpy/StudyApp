@@ -1,14 +1,11 @@
+use crate::controls::Button;
 use crate::{
     app::{Page, StudyApp},
     components::*,
     drafts::{DraftStore, DraftUpdate, NoteDraft},
 };
 use gpui_kit::{
-    component::{
-        Disableable, Sizable,
-        button::{Button, ButtonVariants},
-        input::Input,
-    },
+    component::{Disableable, Sizable, button::ButtonVariants, input::Input},
     prelude::FluentBuilder,
     *,
 };
@@ -280,6 +277,7 @@ impl StudyApp {
                     .child(div().flex_1())
                     .child(
                         Button::new("save-note")
+                            .loading(self.note_saving)
                             .small()
                             .primary()
                             .disabled(self.note_saving || self.storage_busy)

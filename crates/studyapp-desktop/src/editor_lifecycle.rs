@@ -1,3 +1,4 @@
+use crate::controls::Button;
 use crate::{
     app::{Page, StudyApp},
     components::*,
@@ -5,10 +6,7 @@ use crate::{
     markdown_editor::MarkdownEvent,
 };
 use gpui_kit::{
-    component::{
-        Disableable, Sizable,
-        button::{Button, ButtonVariants},
-    },
+    component::{Disableable, Sizable, button::ButtonVariants},
     *,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -250,6 +248,24 @@ impl StudyApp {
         cx.notify();
     }
 
+    pub fn confirm_note_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.storage_busy || self.note_saving {
+            return;
+        }
+        match self.confirmation.take() {
+            Some(NoteConfirmation::DiscardDraft) if self.note_editor.is_some() => {
+                self.request_note_action(NoteIntent::Discard, window, cx)
+            }
+            Some(NoteConfirmation::DiscardDraft) => self.begin_discard(window, cx),
+            Some(NoteConfirmation::Unmanage(note_id)) => {
+                self.send(Command::UnmanageNote { note_id }, cx);
+            }
+            None => {}
+        }
+        cx.notify();
+    }
+
+    /// Dialog content only; the window-level shell owns blocking and focus.
     pub fn confirmation_view(&self, cx: &mut Context<Self>) -> Div {
         let message = match self.confirmation.as_ref() {
             Some(NoteConfirmation::DiscardDraft) => {
@@ -260,43 +276,32 @@ impl StudyApp {
             }
             None => return div(),
         };
-        card().bg(rgb(0xFFF5E8)).child(div().child(message)).child(
-            row()
-                .child(
-                    Button::new("confirm-note-action")
-                        .disabled(self.storage_busy)
-                        .small()
-                        .primary()
-                        .label("确认")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            match this.confirmation.take() {
-                                Some(NoteConfirmation::DiscardDraft)
-                                    if this.note_editor.is_some() =>
-                                {
-                                    this.request_note_action(NoteIntent::Discard, window, cx)
-                                }
-                                Some(NoteConfirmation::DiscardDraft) => {
-                                    this.begin_discard(window, cx)
-                                }
-                                Some(NoteConfirmation::Unmanage(note_id)) => {
-                                    this.send(Command::UnmanageNote { note_id }, cx);
-                                }
-                                None => {}
-                            }
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("cancel-note-action")
-                        .small()
-                        .ghost()
-                        .label("取消")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.confirmation = None;
-                            cx.notify();
-                        })),
-                ),
-        )
+        column()
+            .child(heading("确认操作"))
+            .child(div().child(message))
+            .child(
+                row()
+                    .child(
+                        Button::new("confirm-note-action")
+                            .disabled(self.storage_busy || self.note_saving)
+                            .small()
+                            .primary()
+                            .label("确认")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm_note_action(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("cancel-note-action")
+                            .small()
+                            .ghost()
+                            .label("取消")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirmation = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
     }
 
     /// Load a read-only document into the same persistent browser surface.
@@ -304,6 +309,10 @@ impl StudyApp {
     pub fn prepare_document_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut show = self.page == Page::Notes
             && self.confirmation.is_none()
+            && self.storage_confirm.is_none()
+            && !self.folders.read(cx).modal_open()
+            && !self.is_layout_resizing()
+            && !cx.has_active_drag()
             && self.draft_discard.is_none()
             && self.active_note_menu.is_none();
         if self.note_editor.is_none() {

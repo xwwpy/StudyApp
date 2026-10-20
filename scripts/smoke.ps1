@@ -22,6 +22,8 @@ if ($process.ExitCode -ne 0) {
     Get-Content -LiteralPath $stderr -Tail 50
     throw "Native smoke exit code: $($process.ExitCode)"
 }
+$inputMode = (Get-Content -LiteralPath (Join-Path $data 'smoke-input-mode.txt') -Raw).Trim()
+if ($env:GITHUB_ACTIONS -eq 'true' -and $inputMode -ne 'WIN32_SENDINPUT') { throw 'CI must verify actual Windows keyboard input' }
 $report = Join-Path $data 'smoke-result.txt'
 if (-not (Test-Path -LiteralPath $report)) { throw 'Smoke report missing' }
 if ((Get-Content -LiteralPath $report -Raw) -notmatch '^PASS:') { throw 'Smoke report did not pass' }
@@ -29,6 +31,8 @@ $libraryReport = Join-Path $data 'library-smoke-result.txt'
 if ((Get-Content -LiteralPath $libraryReport -Raw) -notmatch '^PASS:') { throw 'Library and history smoke report did not pass' }
 $interactionsReport = Join-Path $data 'interactions-smoke-result.txt'
 if ((Get-Content -LiteralPath $interactionsReport -Raw) -notmatch '^PASS:') { throw 'Note interactions and scroll smoke report did not pass' }
+$workspaceReport = Join-Path $data 'workspace-smoke-result.txt'
+if ((Get-Content -LiteralPath $workspaceReport -Raw) -notmatch '^PASS:') { throw 'Adjustable workspace smoke report did not pass' }
 foreach ($nativeImage in @('native-first-reader.bmp', 'native-first-editor.bmp', 'native-after-history.bmp', 'native-after-menu.bmp', 'native-after-settings.bmp', 'native-after-resize.bmp')) {
     $nativePath = Join-Path $data $nativeImage
     if (-not (Test-Path -LiteralPath $nativePath) -or (Get-Item -LiteralPath $nativePath).Length -lt 1000) {

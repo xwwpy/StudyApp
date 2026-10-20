@@ -1,3 +1,4 @@
+use crate::controls::Button;
 use crate::{
     components::*,
     drafts::{DraftStore, NoteDraft},
@@ -6,8 +7,8 @@ use crate::{
 use chrono::{Local, Utc};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    Selectable, Sizable,
-    button::{Button, ButtonVariants},
+    Disableable, Selectable, Sizable,
+    button::ButtonVariants,
     input::{InputState, TextareaState},
 };
 use gpui_kit::prelude::FluentBuilder;
@@ -84,6 +85,12 @@ pub struct StudyApp {
     pub storage_copy_scroll: ScrollHandle,
     pub active_note_menu: Option<u64>,
     pub note_menu_sequence: u64,
+    pub layout: studyapp_core::LayoutSettings,
+    pub resizing: Option<crate::workspace_layout::ResizeState>,
+    pub layout_dirty: bool,
+    pub modal_focus: crate::feedback::ModalFocus,
+    notice_seen: Option<Result<String, String>>,
+    notice_started: Option<std::time::Instant>,
     notified: HashSet<String>,
     _poll: Task<()>,
 }
@@ -153,7 +160,18 @@ impl StudyApp {
         });
         let sync_panel =
             cx.new(|cx| crate::sync_ui::SyncPanel::new(worker.sender.clone(), window, cx));
+        cx.subscribe(
+            &sync_panel,
+            |this, _, event: &crate::sync_ui::SyncEvent, cx| {
+                let crate::sync_ui::SyncEvent::Feedback(message) = event;
+                this.notice = Some(message.clone());
+                this.notice_seen = None;
+                cx.notify();
+            },
+        )
+        .detach();
         let folders = cx.new(|cx| crate::folders_ui::FolderPanel::new(window, cx));
+        cx.observe(&folders, |_, _, cx| cx.notify()).detach();
         cx.subscribe(
             &folders,
             |this, _, event: &crate::folders_ui::FolderEvent, cx| {
@@ -170,6 +188,12 @@ impl StudyApp {
                     crate::folders_ui::FolderEvent::Command(command) => {
                         this.send(command.clone(), cx)
                     }
+                    crate::folders_ui::FolderEvent::OverlayChanged(open) => {
+                        if *open {
+                            this.note_content
+                                .update(cx, |editor, cx| editor.set_visible(false, cx));
+                        }
+                    }
                 }
                 cx.notify();
             },
@@ -185,6 +209,12 @@ impl StudyApp {
             storage_copy_scroll: ScrollHandle::new(),
             active_note_menu: None,
             note_menu_sequence: 0,
+            layout: Default::default(),
+            resizing: None,
+            layout_dirty: false,
+            modal_focus: crate::feedback::ModalFocus::new(cx),
+            notice_seen: None,
+            notice_started: None,
             drafts: DraftStore::new(),
             note_title,
             note_content,
@@ -244,6 +274,15 @@ impl StudyApp {
         self.sync_panel
             .update(cx, |panel, cx| panel.poll(window, cx));
         let mut changed = self.poll_drafts(window, cx);
+        if self.notice.as_ref().is_some_and(Result::is_ok)
+            && self
+                .notice_started
+                .is_some_and(|at| at.elapsed() >= Duration::from_secs(4))
+        {
+            self.notice = None;
+            self.notice_started = None;
+            changed = true;
+        }
         if self
             .draft_dirty_since
             .is_some_and(|at| at.elapsed() >= Duration::from_millis(200))
@@ -291,6 +330,7 @@ impl StudyApp {
             }
             if let Some(notice) = update.notice {
                 self.notice = Some(notice);
+                self.notice_seen = None;
             }
             if let Some(snapshot) = update.snapshot {
                 if (update.library_replaced || self.last_library != snapshot.data_path)
@@ -326,6 +366,9 @@ impl StudyApp {
         cx: &mut Context<Self>,
     ) {
         if library_replaced || self.last_library != snapshot.data_path {
+            self.layout = snapshot.settings.layout.clone();
+            self.layout_dirty = false;
+            self.resizing = None;
             self.show_detached = false;
             self.storage_report = None;
             self.storage_confirm = None;
@@ -368,6 +411,11 @@ impl StudyApp {
                     cx,
                 )
             });
+        }
+        if !self.is_layout_resizing() && !self.layout_dirty {
+            self.layout = snapshot.settings.layout.clone();
+        } else if self.layout == snapshot.settings.layout {
+            self.layout_dirty = false;
         }
         for session in &snapshot.sessions {
             if session.status == SessionStatus::Pending && self.notified.insert(session.id.clone())
@@ -673,7 +721,31 @@ impl StudyApp {
         cx.notify();
     }
 
-    fn navigation(&self, cx: &mut Context<Self>) -> Div {
+    pub fn has_modal(&self, cx: &App) -> bool {
+        self.confirmation.is_some()
+            || self.storage_confirm.is_some()
+            || self.folders.read(cx).modal_open()
+    }
+
+    fn cancel_modal(&mut self, cx: &mut Context<Self>) {
+        self.confirmation = None;
+        self.storage_confirm = None;
+        self.folders.update(cx, |panel, cx| panel.cancel_action(cx));
+        cx.notify();
+    }
+
+    fn accept_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirmation.is_some() {
+            self.confirm_note_action(window, cx);
+        } else if self.storage_confirm.is_some() {
+            self.confirm_storage_copy(cx);
+        } else {
+            self.folders
+                .update(cx, |panel, cx| panel.submit_action(window, cx));
+        }
+    }
+
+    fn navigation(&self, width: Pixels, cx: &mut Context<Self>) -> impl IntoElement {
         let items = [
             (Page::Today, "今日学习", IconName::House),
             (Page::Notes, "笔记库", IconName::BookOpen),
@@ -682,20 +754,23 @@ impl StudyApp {
             (Page::Settings, "设置", IconName::Settings),
         ];
         column()
-            .w(px(210.))
+            .id("navigation-pane")
+            .test_support()
+            .w(width)
             .h_full()
             .flex_shrink_0()
             .bg(rgb(0xFFFFFF))
             .border_r_1()
             .border_color(rgb(BORDER))
-            .p_5()
+            .p_3()
             .child(
                 column()
                     .gap_1()
                     .py_5()
                     .child(
                         div()
-                            .text_2xl()
+                            .text_lg()
+                            .truncate()
                             .font_weight(FontWeight::BOLD)
                             .text_color(rgb(GREEN))
                             .child("WW-StudyApp"),
@@ -743,7 +818,16 @@ impl StudyApp {
 
 impl Render for StudyApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let modal_open = self.has_modal(cx);
+        let initial_focus = self.folders.read(cx).modal_initial_focus(cx);
+        self.modal_focus
+            .sync_with_initial(modal_open, initial_focus, window, cx);
+        if self.notice != self.notice_seen {
+            self.notice_seen = self.notice.clone();
+            self.notice_started = self.notice.as_ref().map(|_| std::time::Instant::now());
+        }
         self.prepare_document_view(window, cx);
+        let layout = self.effective_layout(window);
         let continuous = self.page == Page::Notes;
         let title = match self.page {
             Page::Today => "今天，学到了什么？",
@@ -755,7 +839,7 @@ impl Render for StudyApp {
         let body = if let Some(snapshot) = self.snapshot.clone() {
             match self.page {
                 Page::Today => self.today(&snapshot, window, cx).into_any_element(),
-                Page::Notes => self.notes(&snapshot, cx).into_any_element(),
+                Page::Notes => self.notes(&snapshot, window, cx).into_any_element(),
                 Page::Reviews => self.reviews(&snapshot, cx).into_any_element(),
                 Page::Stats => self.statistics(&snapshot, cx).into_any_element(),
                 Page::Settings => self.settings(&snapshot, cx).into_any_element(),
@@ -763,42 +847,32 @@ impl Render for StudyApp {
         } else {
             empty("正在打开本地资料库", "所有学习内容保存在你选择的目录").into_any_element()
         };
-        let notice = self.notice.as_ref().map(|value| {
-            let (message, color) = match value {
-                Ok(s) => (s.clone(), LIGHT),
-                Err(s) => (s.clone(), 0xFFF0E9),
-            };
-            row()
-                .w_full()
-                .flex_shrink_0()
-                .rounded_lg()
-                .bg(rgb(color))
-                .px_4()
-                .py_3()
-                .child(
-                    div()
-                        .id("notice-message-scroll")
-                        .flex_1()
-                        .min_w_0()
-                        .max_h(px(64.))
-                        .overflow_y_scroll()
-                        .text_sm()
-                        .child(message),
-                )
-                .child(
-                    Button::new("dismiss-notice")
-                        .ghost()
-                        .small()
-                        .label("关闭")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.notice = None;
-                            cx.notify();
-                        })),
-                )
+        let notice = self.floating_notice_view(cx);
+        let modal_content = if self.confirmation.is_some() {
+            Some(self.confirmation_view(cx).into_any_element())
+        } else if self.storage_confirm.is_some() {
+            self.storage_confirmation_view(cx)
+                .map(IntoElement::into_any_element)
+        } else {
+            self.folders.update(cx, |panel, cx| panel.modal_content(cx))
+        };
+        let modal = modal_content.map(|content| {
+            let cancel_owner = cx.weak_entity();
+            let accept_owner = cx.weak_entity();
+            crate::feedback::modal_shell(content, self.modal_focus.handle(), window, cx)
+                .on_cancel(move |_, _, cx| {
+                    let _ = cancel_owner.update(cx, |this, cx| this.cancel_modal(cx));
+                    true
+                })
+                .on_ok(move |_, window, cx| {
+                    let _ = accept_owner.update(cx, |this, cx| this.accept_modal(window, cx));
+                    true
+                })
         });
         row()
+            .relative()
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                if this.storage_busy {
+                if this.storage_busy || this.has_modal(cx) {
                     return;
                 }
                 if this
@@ -822,7 +896,9 @@ impl Render for StudyApp {
                     && this.page == Page::Notes
                     && this.note_editor.is_some()
                 {
-                    this.save_note(window, cx);
+                    if !this.has_modal(cx) {
+                        this.save_note(window, cx);
+                    }
                     cx.stop_propagation();
                 }
             }))
@@ -832,7 +908,18 @@ impl Render for StudyApp {
             .text_color(rgb(INK))
             .font_family("Microsoft YaHei UI")
             .text_sm()
-            .child(self.navigation(cx))
+            .when(self.layout.navigation_visible, |view| {
+                view.child(self.navigation(layout.navigation, cx))
+            })
+            .when(
+                self.layout.navigation_visible
+                    || self.resizing.as_ref().is_some_and(|resize| {
+                        resize.pane == crate::workspace_layout::Pane::Navigation
+                    }),
+                |view| {
+                    view.child(self.resize_handle(crate::workspace_layout::Pane::Navigation, cx))
+                },
+            )
             .child(
                 column()
                     .gap_0()
@@ -843,17 +930,36 @@ impl Render for StudyApp {
                         row()
                             .h(px(86.))
                             .flex_shrink_0()
-                            .px_8()
+                            .px_4()
                             .border_b_1()
                             .border_color(rgb(BORDER))
+                            .child(
+                                Button::new("toggle-navigation")
+                                    .disabled(self.storage_busy)
+                                    .small()
+                                    .ghost()
+                                    .label(if self.layout.navigation_visible {
+                                        "收起导航"
+                                    } else {
+                                        "显示导航"
+                                    })
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.toggle_navigation(cx)),
+                                    ),
+                            )
                             .child(
                                 column()
                                     .gap_1()
                                     .flex_1()
+                                    .min_w_0()
                                     .child(
                                         div()
                                             .text_2xl()
                                             .font_weight(FontWeight::SEMIBOLD)
+                                            .truncate()
+                                            .when(self.notice.is_some(), |heading| {
+                                                heading.opacity(0.)
+                                            })
                                             .child(title),
                                     )
                                     .child(muted(
@@ -881,8 +987,8 @@ impl Render for StudyApp {
                             .min_h_0()
                             .when(!continuous, |c| c.overflow_y_scroll())
                             .when(continuous, |c| c.overflow_hidden())
-                            .p_8()
-                            .children(notice)
+                            .when(continuous, |c| c.p_4())
+                            .when(!continuous, |c| c.p_8())
                             .child(body),
                     )
                     .child(
@@ -899,5 +1005,21 @@ impl Render for StudyApp {
                             ))),
                     ),
             )
+            .when_some(notice, |view, notice| {
+                view.child(
+                    div()
+                        .id("floating-notice")
+                        .test_support()
+                        .occlude()
+                        .absolute()
+                        .top(px(8.))
+                        .left(layout.navigation + px(118.))
+                        .w(px(440.)
+                            .min(window.viewport_size().width - layout.navigation - px(360.)))
+                        .child(notice),
+                )
+            })
+            .child(self.resize_event_layer(cx))
+            .children(modal)
     }
 }

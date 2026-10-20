@@ -3,12 +3,34 @@ use std::path::PathBuf;
 /// Maximum number of logical folders from a root folder to a leaf.
 pub const MAX_FOLDER_DEPTH: usize = 8;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LayoutSettings {
+    pub navigation_width: u32,
+    pub folders_width: u32,
+    pub notes_width: u32,
+    pub navigation_visible: bool,
+}
+
+impl Default for LayoutSettings {
+    fn default() -> Self {
+        Self {
+            navigation_width: 184,
+            folders_width: 176,
+            notes_width: 240,
+            navigation_visible: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Settings {
     pub interval_minutes: u32,
     pub answer_minutes: u32,
     pub review_days: Vec<u32>,
     #[serde(default)]
     pub show_file_paths: bool,
+    #[serde(default)]
+    pub layout: LayoutSettings,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -178,6 +200,7 @@ pub enum Command {
         review_days: Vec<u32>,
     },
     SetShowFilePaths(bool),
+    SaveLayout(LayoutSettings),
     SetPaused(bool),
     Submit {
         session_id: String,

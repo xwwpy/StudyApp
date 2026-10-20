@@ -1,5 +1,103 @@
 use serde_json::{Value, json};
-use studyapp_core::{Command, Engine, Settings};
+use studyapp_core::{Command, Engine, LayoutSettings, Settings};
+
+#[test]
+fn legacy_settings_restore_default_workspace_layout() {
+    let settings: Settings = serde_json::from_value(json!({
+        "interval_minutes": 45, "answer_minutes": 3, "review_days": [1, 5]
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(settings).unwrap()["layout"],
+        json!({
+            "navigation_width": 184, "folders_width": 176, "notes_width": 240,
+            "navigation_visible": true
+        })
+    );
+}
+
+#[test]
+fn workspace_layout_persists_without_changing_learning_or_path_settings() {
+    let directory = tempfile::tempdir().unwrap().keep();
+    let database = directory.join("layout.sqlite");
+    let layout = LayoutSettings {
+        navigation_width: 256,
+        folders_width: 240,
+        notes_width: 320,
+        navigation_visible: false,
+    };
+    for layout_first in [false, true] {
+        let mut engine = Engine::open(&database, 1000).unwrap();
+        let commands = if layout_first {
+            vec![
+                Command::SaveLayout(layout.clone()),
+                learning_update(30, 8, vec![2, 6]),
+                Command::SetShowFilePaths(true),
+            ]
+        } else {
+            vec![
+                learning_update(30, 8, vec![2, 6]),
+                Command::SetShowFilePaths(true),
+                Command::SaveLayout(layout.clone()),
+            ]
+        };
+        for command in commands {
+            engine.apply(command, 1000).unwrap();
+        }
+        engine.tick(1001, 1).unwrap();
+        let timer = engine.snapshot().timer;
+        engine
+            .apply(Command::SaveLayout(layout.clone()), 1001)
+            .unwrap();
+        assert_eq!(engine.snapshot().timer.active_seconds, timer.active_seconds);
+        assert_eq!(engine.snapshot().timer.target_seconds, timer.target_seconds);
+        drop(engine);
+        let restored = Engine::open(&database, 1001).unwrap().snapshot();
+        assert_eq!(restored.settings.layout, layout);
+        assert_eq!(restored.settings.interval_minutes, 30);
+        assert_eq!(restored.settings.answer_minutes, 8);
+        assert_eq!(restored.settings.review_days, vec![2, 6]);
+        assert!(restored.settings.show_file_paths);
+    }
+}
+
+#[test]
+fn invalid_workspace_widths_are_rejected_without_persisting_changes() {
+    let directory = tempfile::tempdir().unwrap().keep();
+    let database = directory.join("invalid-layout.sqlite");
+    let mut engine = Engine::open(&database, 1000).unwrap();
+    let original = engine.snapshot().settings;
+    for (navigation_width, folders_width, notes_width) in [
+        (143, 176, 240),
+        (321, 176, 240),
+        (184, 143, 240),
+        (184, 361, 240),
+        (184, 176, 179),
+        (184, 176, 441),
+        (u32::MAX, 176, 240),
+    ] {
+        let layout = LayoutSettings {
+            navigation_width,
+            folders_width,
+            notes_width,
+            navigation_visible: false,
+        };
+        assert!(
+            engine
+                .apply(Command::SaveLayout(layout.clone()), 1001)
+                .is_err()
+        );
+        let mut full = original.clone();
+        full.layout = layout;
+        assert!(engine.apply(Command::SaveSettings(full), 1001).is_err());
+        assert_eq!(engine.snapshot().settings, original);
+    }
+    drop(engine);
+    assert_eq!(
+        Engine::open(&database, 1001).unwrap().snapshot().settings,
+        original
+    );
+}
 
 #[test]
 fn new_settings_hide_file_paths_by_default() {
@@ -104,6 +202,7 @@ fn rapid_updates(learning_first: bool) {
             answer_minutes: 8,
             review_days: vec![2, 6, 15],
             show_file_paths: !initially_visible,
+            layout: Default::default(),
         };
         assert_eq!(
             engine.snapshot().settings,

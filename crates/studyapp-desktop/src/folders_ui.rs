@@ -1,8 +1,10 @@
+use crate::controls::Button;
 use crate::{components::*, note_actions::NoteDrag};
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     component::{
-        Disableable, Placement, Selectable, Sizable,
-        button::{Button, ButtonVariants},
+        Disableable, Icon, IconName, Placement, Selectable, Sizable,
+        button::ButtonVariants,
         input::{Input, InputEvent, InputState},
     },
     *,
@@ -43,6 +45,7 @@ impl FolderFilter {
 pub enum FolderEvent {
     Filter(FolderFilter),
     Command(Command),
+    OverlayChanged(bool),
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +136,52 @@ impl FolderPanel {
         &self.filter
     }
 
+    pub fn selection_label(&self) -> String {
+        match &self.filter {
+            FolderFilter::All => "全部笔记".into(),
+            FolderFilter::Root => "未分类".into(),
+            FolderFilter::Folder(id) => self.destination_name(Some(id)),
+        }
+    }
+
+    pub fn modal_open(&self) -> bool {
+        self.action.is_some()
+    }
+
+    pub fn modal_initial_focus(&self, cx: &App) -> Option<FocusHandle> {
+        matches!(
+            self.action,
+            Some(FolderAction::Create { .. } | FolderAction::Rename { .. })
+        )
+        .then(|| self.name.focus_handle(cx))
+    }
+
+    pub fn cancel_action(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        if self.action.take().is_some() {
+            self.error = None;
+            cx.emit(FolderEvent::OverlayChanged(false));
+            cx.notify();
+        }
+    }
+
+    pub fn submit_action(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.submit(cx);
+    }
+
+    pub fn modal_content(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.action.as_ref()?;
+        Some(self.action_view(cx))
+    }
+
+    fn opened_action(&mut self, cx: &mut Context<Self>) {
+        self.error = None;
+        cx.emit(FolderEvent::OverlayChanged(true));
+        cx.notify();
+    }
+
     pub fn set_filter(&mut self, filter: FolderFilter, cx: &mut Context<Self>) {
         let filter = match filter {
             FolderFilter::Folder(id) if !self.rows.iter().any(|row| row.id == id) => {
@@ -147,8 +196,11 @@ impl FolderPanel {
                 self.collapsed.remove(ancestor);
             }
         }
-        self.action = None;
+        let had_action = self.action.take().is_some();
         self.error = None;
+        if had_action {
+            cx.emit(FolderEvent::OverlayChanged(false));
+        }
         if self.filter != filter {
             self.filter = filter;
             cx.emit(FolderEvent::Filter(self.filter.clone()));
@@ -164,6 +216,7 @@ impl FolderPanel {
     }
 
     pub fn accept(&mut self, snapshot: Arc<Snapshot>, window: &mut Window, cx: &mut Context<Self>) {
+        let had_action = self.action.is_some();
         let library_changed = self
             .snapshot
             .as_ref()
@@ -214,6 +267,9 @@ impl FolderPanel {
             self.error = None;
         }
         self.snapshot = Some(snapshot);
+        if had_action && self.action.is_none() {
+            cx.emit(FolderEvent::OverlayChanged(false));
+        }
         if library_changed
             || self
                 .filter
@@ -239,8 +295,7 @@ impl FolderPanel {
                 note_id,
                 destination: note.folder_id.clone(),
             });
-            self.error = None;
-            cx.notify();
+            self.opened_action(cx);
         }
     }
 
@@ -255,11 +310,9 @@ impl FolderPanel {
             return;
         }
         self.action = Some(action);
-        self.error = None;
         self.name
             .update(cx, |input, cx| input.set_value(name, window, cx));
-        self.name.focus_handle(cx).focus(window, cx);
-        cx.notify();
+        self.opened_action(cx);
     }
 
     fn folder_name(&self, id: &str) -> String {
@@ -439,6 +492,7 @@ impl FolderPanel {
             Ok(command) => {
                 self.action = None;
                 self.error = None;
+                cx.emit(FolderEvent::OverlayChanged(false));
                 cx.emit(FolderEvent::Command(command));
             }
             Err(message) => self.error = Some(message),
@@ -450,8 +504,7 @@ impl FolderPanel {
         let Some(action) = &self.action else {
             return div().into_any_element();
         };
-        // The form replaces the tree while open, so even a short sidebar retains
-        // one bounded scroll area and its submit/cancel controls remain reachable.
+        // Root presents this body in its shared modal layer, above every pane.
         let mut form = column()
             .id("folder-action-scroll")
             .test_support()
@@ -459,10 +512,20 @@ impl FolderPanel {
             .p_2()
             .rounded_lg()
             .bg(rgb(BG))
-            .flex_1()
+            .max_h(px(420.))
             .min_h_0()
             .min_w_0()
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .child(
+                heading(match action {
+                    FolderAction::Create { .. } => "新建目录",
+                    FolderAction::Rename { .. } => "重命名目录",
+                    FolderAction::MoveFolder { .. } => "移动目录",
+                    FolderAction::MoveNote { .. } => "移动笔记",
+                    FolderAction::Delete { .. } => "删除空目录",
+                })
+                .flex_shrink_0(),
+            );
         let mut submit_label = "保存";
         let mut can_submit = !self.busy;
         match action {
@@ -621,9 +684,7 @@ impl FolderPanel {
                         .label("取消")
                         .disabled(self.busy)
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.action = None;
-                            this.error = None;
-                            cx.notify();
+                            this.cancel_action(cx);
                         })),
                 ),
         )
@@ -645,14 +706,20 @@ impl Render for FolderPanel {
             });
         let mut panel = column()
             .id("note-folders")
-            .gap_2()
+            .gap_0()
             .w_full()
             .h_full()
             .min_h_0()
             .min_w_0()
             .child(
                 row()
+                    .h(px(46.))
+                    .px_2()
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
                     .gap_1()
+                    .child(Icon::new(IconName::Folder).small().text_color(rgb(GREEN)))
                     .child(
                         div()
                             .flex_1()
@@ -664,7 +731,8 @@ impl Render for FolderPanel {
                         Button::new("folder-create")
                             .small()
                             .ghost()
-                            .label("＋ 新建")
+                            .label("＋")
+                            .accessibility_label("新建目录")
                             .tooltip("在当前选中目录内创建，最多八层")
                             .tooltip_placement(Placement::Left)
                             .disabled(!can_create)
@@ -679,13 +747,11 @@ impl Render for FolderPanel {
                             })),
                     ),
             );
-        if self.action.is_some() {
-            return panel.child(self.action_view(cx));
-        }
         let mut tree = column()
             .id("folder-tree-scroll")
             .test_support()
             .gap_1()
+            .p_2()
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -694,6 +760,7 @@ impl Render for FolderPanel {
                     .small()
                     .ghost()
                     .w_full()
+                    .icon(IconName::FileText)
                     .label(format!("全部笔记  {}", self.all_count))
                     .selected(self.filter == FolderFilter::All)
                     .disabled(self.busy)
@@ -707,6 +774,7 @@ impl Render for FolderPanel {
                             .small()
                             .ghost()
                             .w_full()
+                            .icon(IconName::Inbox)
                             .label(format!("未分类  {}", self.root_count))
                             .selected(self.filter == FolderFilter::Root)
                             .disabled(self.busy)
@@ -723,20 +791,31 @@ impl Render for FolderPanel {
             let id = folder.id.clone();
             let expanded = !self.collapsed.contains(&id);
             let count = self.counts.get(&id).copied().unwrap_or(0);
-            let mut entry = row().gap_0().min_w_0().flex_shrink_0().pl(px((folder
-                .depth
-                .min(MAX_FOLDER_DEPTH)
-                * 12)
-                as f32));
+            let chosen = selected_id.as_ref() == Some(&id);
+            let mut entry = row().gap_0().min_w_0().flex_shrink_0().children(
+                (0..folder.depth.min(MAX_FOLDER_DEPTH)).map(|_| {
+                    div()
+                        .w(px(10.))
+                        .h(px(28.))
+                        .flex_shrink_0()
+                        .border_l_1()
+                        .border_color(rgb(0xDCE5DC))
+                }),
+            );
             if folder.has_children {
                 let collapse_id = id.clone();
                 entry = entry.child(
                     Button::new(SharedString::from(format!("folder-expand-{id}")))
                         .small()
                         .ghost()
-                        .w(px(24.))
+                        .w(px(20.))
                         .flex_shrink_0()
-                        .label(if expanded { "▾" } else { "▸" })
+                        .px_0()
+                        .icon(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
                         .disabled(self.busy)
                         .accessibility_label(format!(
                             "{}{}",
@@ -751,12 +830,15 @@ impl Render for FolderPanel {
                         })),
                 );
             } else {
-                entry = entry.child(div().w(px(24.)).flex_shrink_0());
+                entry = entry.child(div().w(px(20.)).flex_shrink_0());
             }
             let tip = format!("{} · 直接包含 {count} 份笔记", folder.path);
             tree = tree.child(
                 self.note_drop_target(format!("folder-drop-{id}").into(), Some(id.clone()), cx)
                     .test_support()
+                    .when(chosen, |style| {
+                        style.bg(rgb(LIGHT)).border_color(rgb(0xBDD7C8))
+                    })
                     .tooltip(move |window, cx| sidebar_tooltip(tip.clone(), window, cx))
                     .child(
                         entry.child(
@@ -765,8 +847,39 @@ impl Render for FolderPanel {
                                 .ghost()
                                 .flex_1()
                                 .min_w_0()
-                                .label(format!("{}  {count}", folder.name))
-                                .selected(selected_id.as_ref() == Some(&id))
+                                .px_1()
+                                .accessibility_label(format!("{}，{count} 份笔记", folder.name))
+                                .child(
+                                    row()
+                                        .w_full()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .child(
+                                            Icon::new(if expanded {
+                                                IconName::FolderOpen
+                                            } else {
+                                                IconName::FolderClosed
+                                            })
+                                            .small()
+                                            .text_color(rgb(GREEN)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_left()
+                                                .child(folder.name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_xs()
+                                                .text_color(rgb(MUTED))
+                                                .child(count.to_string()),
+                                        ),
+                                )
+                                .selected(chosen)
                                 .disabled(self.busy)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.set_filter(FolderFilter::Folder(id.clone()), cx)
@@ -789,7 +902,12 @@ impl Render for FolderPanel {
                     .is_some_and(|snapshot| empty_folder(snapshot, &folder_id));
             panel = panel.child(
                 row()
+                    .p_2()
                     .gap_1()
+                    .flex_wrap()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
                     .child(
                         Button::new("folder-rename")
                             .small()
@@ -826,8 +944,7 @@ impl Render for FolderPanel {
                                     folder_id: move_id.clone(),
                                     destination,
                                 });
-                                this.error = None;
-                                cx.notify();
+                                this.opened_action(cx);
                             })),
                     )
                     .child(
@@ -846,8 +963,7 @@ impl Render for FolderPanel {
                                 this.action = Some(FolderAction::Delete {
                                     folder_id: folder_id.clone(),
                                 });
-                                this.error = None;
-                                cx.notify();
+                                this.opened_action(cx);
                             })),
                     ),
             );
@@ -1162,9 +1278,53 @@ mod tests {
 #[cfg(all(test, feature = "ui-test"))]
 mod ui_tests {
     use super::{FolderAction, FolderEvent, FolderPanel};
-    use gpui_kit::{Focusable, TestAppContext, VisualTestContext};
+    use gpui_kit::{
+        AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Render, TestAppContext,
+        VisualTestContext, Window,
+    };
     use std::sync::Arc;
     use studyapp_core::{Command, NoteFolder, Snapshot};
+
+    /// The production host mounts folder forms in its global modal layer.
+    /// Keep the input mounted here too so Enter exercises actual input events.
+    struct TestHost {
+        panel: Entity<FolderPanel>,
+    }
+
+    impl TestHost {
+        fn new(name: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
+            let panel = cx.new(|cx| {
+                let mut panel = FolderPanel::new(window, cx);
+                panel.accept(panel_snapshot(), window, cx);
+                panel.edit_name(
+                    FolderAction::Create { parent_id: None },
+                    name.into(),
+                    window,
+                    cx,
+                );
+                panel
+            });
+            cx.observe(&panel, |_, _, cx| cx.notify()).detach();
+            Self { panel }
+        }
+    }
+
+    impl Render for TestHost {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let body = self.panel.update(cx, |panel, cx| panel.modal_content(cx));
+            crate::components::column()
+                .child(self.panel.clone())
+                .children(body)
+        }
+    }
+
+    fn focus_form(panel: &Entity<FolderPanel>, cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            if let Some(focus) = panel.read(cx).modal_initial_focus(cx) {
+                focus.focus(window, cx);
+            }
+        });
+    }
 
     fn panel_snapshot() -> Arc<Snapshot> {
         Arc::new(Snapshot {
@@ -1203,17 +1363,9 @@ mod ui_tests {
     fn enter_creates_and_renames_each_folder_exactly_once(cx: &mut TestAppContext) {
         use std::{cell::RefCell, rc::Rc};
         cx.update(gpui_kit::init);
-        let (panel, cx) = cx.add_window_view(|window, cx| {
-            let mut panel = FolderPanel::new(window, cx);
-            panel.accept(panel_snapshot(), window, cx);
-            panel.edit_name(
-                FolderAction::Create { parent_id: None },
-                "New".into(),
-                window,
-                cx,
-            );
-            panel
-        });
+        let (host, cx) = cx.add_window_view(|window, cx| TestHost::new("New", window, cx));
+        let panel = cx.read(|cx| host.read(cx).panel.clone());
+        focus_form(&panel, cx);
         let commands = Rc::new(RefCell::new(Vec::new()));
         let observed = commands.clone();
         cx.update(|_, cx| {
@@ -1246,6 +1398,7 @@ mod ui_tests {
                 );
             })
         });
+        focus_form(&panel, cx);
         draw(cx);
         cx.simulate_keystrokes("enter enter");
         assert_eq!(
@@ -1263,17 +1416,9 @@ mod ui_tests {
     fn enter_keeps_invalid_or_busy_name_form_open(cx: &mut TestAppContext) {
         use std::{cell::RefCell, rc::Rc};
         cx.update(gpui_kit::init);
-        let (panel, cx) = cx.add_window_view(|window, cx| {
-            let mut panel = FolderPanel::new(window, cx);
-            panel.accept(panel_snapshot(), window, cx);
-            panel.edit_name(
-                FolderAction::Create { parent_id: None },
-                "Existing".into(),
-                window,
-                cx,
-            );
-            panel
-        });
+        let (host, cx) = cx.add_window_view(|window, cx| TestHost::new("Existing", window, cx));
+        let panel = cx.read(|cx| host.read(cx).panel.clone());
+        focus_form(&panel, cx);
         let commands = Rc::new(RefCell::new(Vec::new()));
         let observed = commands.clone();
         cx.update(|_, cx| {
@@ -1315,5 +1460,45 @@ mod ui_tests {
         draw(cx);
         cx.simulate_keystrokes("enter");
         assert_eq!(commands.borrow().len(), 1);
+    }
+
+    #[gpui_kit::test]
+    fn modal_cancel_and_library_switch_release_the_native_overlay(cx: &mut TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let (host, cx) = cx.add_window_view(|window, cx| TestHost::new("New", window, cx));
+        let panel = cx.read(|cx| host.read(cx).panel.clone());
+        let overlays = Rc::new(RefCell::new(Vec::new()));
+        let observed = overlays.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&panel, move |_, event: &FolderEvent, _| {
+                if let FolderEvent::OverlayChanged(open) = event {
+                    observed.borrow_mut().push(*open);
+                }
+            })
+            .detach();
+        });
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.cancel_action(cx);
+                assert!(!panel.modal_open());
+                panel.edit_name(
+                    FolderAction::Rename {
+                        folder_id: "existing".into(),
+                    },
+                    "Renamed".into(),
+                    window,
+                    cx,
+                );
+                assert!(panel.modal_open());
+                let mut changed = (*panel_snapshot()).clone();
+                changed.data_path = "C:/other-library".into();
+                panel.accept(Arc::new(changed), window, cx);
+                assert!(!panel.modal_open());
+                assert!(panel.modal_content(cx).is_none());
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(*overlays.borrow(), vec![false, true, false]);
     }
 }

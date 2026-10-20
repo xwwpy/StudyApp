@@ -610,6 +610,26 @@ test("a valid 10 MiB CRLF note can shrink and edit without exceeding its raw byt
   await page.close();
 });
 
+test("narrow document pane keeps every toolbar action reachable", async () => {
+  const { page } = await setup("# Narrow pane\n\nEditable content");
+  await page.setViewportSize({ width: 280, height: 480 });
+  const layout = await page.evaluate(() => {
+    const toolbar = document.querySelector("#toolbar").getBoundingClientRect();
+    return {
+      clipped: [...document.querySelectorAll("#toolbar button")].filter(button => {
+        const rect = button.getBoundingClientRect();
+        return rect.left < 0 || rect.right > 280 || rect.bottom > toolbar.bottom;
+      }).map(button => button.getAttribute("aria-label")),
+      editorHeight: document.querySelector("#editor").getBoundingClientRect().height
+    };
+  });
+  assert.deepEqual(layout.clipped, []);
+  assert.ok(layout.editorHeight > 300);
+  await page.locator("#source-toggle").click();
+  assert.equal((await state(page)).source, true);
+  await page.close();
+});
+
 test("250 KiB document keeps viewport DOM bounded during 200 edits", async () => {
   const text = Array.from({ length: 3500 }, (_, i) => `## 标题 ${i}\n\nContinuous Markdown paragraph ${i} has **strong text**, a [link](https://example.com), 中文与 😀.\n\n`).join("");
   assert.ok(Buffer.byteLength(text) > 250 * 1024);

@@ -2,13 +2,14 @@
 * { box-sizing: border-box; }
 html, body, main { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 main { display: flex; flex-direction: column; }
-#toolbar { display: flex; align-items: center; gap: 3px; flex: 0 0 43px; padding: 5px 14px; border-bottom: 1px solid #e8edf2; background: #fafbfd; user-select: none; }
+#toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 3px; flex: 0 0 auto; min-height: 43px; padding: 5px 14px; border-bottom: 1px solid #e8edf2; background: #fafbfd; user-select: none; }
+#toolbar > * { flex-shrink: 0; }
 #toolbar button { border: 0; border-radius: 5px; background: transparent; color: #526378; min-width: 29px; height: 29px; padding: 3px 7px; font: 14px "Segoe UI", sans-serif; cursor: pointer; }
 #toolbar button:hover, #toolbar button[aria-pressed="true"] { color: #166a6c; background: #e2f0ee; }
 #toolbar button:focus-visible { outline: 2px solid #4c9193; outline-offset: 1px; }
 #toolbar button:disabled { opacity: .35; cursor: default; }
 #toolbar .separator { width: 1px; height: 17px; background: #dfe6ec; margin: 0 5px; }
-#editor-status { font-size: 12px; color: #7b8898; margin-left: auto; white-space: nowrap; }
+#editor-status { font-size: 12px; color: #7b8898; margin-left: auto; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #editor-status.error { color: #ac3a36; }
 #editor-status.warning { color: #91631d; }
 #toolbar #source-toggle { font-size: 12px; margin-left: 8px; }
@@ -40,6 +41,7 @@ main { display: flex; flex-direction: column; }
 .md-code-language { color: #7a8f9f; font-size: 11px; text-transform: lowercase; }
 .md-link { color: #187d92; text-decoration: underline; text-decoration-color: #8fbcc6; text-underline-offset: 3px; }
 .md-task { display: inline-flex; width: 15px; height: 15px; align-items: center; justify-content: center; padding: 0; margin: 0 5px 0 0; border: 1px solid #9eb2bc; border-radius: 3px; background: #fff; color: #fff; font: 12px/1 sans-serif; vertical-align: -1px; cursor: pointer; }
+.md-task:disabled { cursor: default; }
 .md-task[aria-checked="true"] { background: #388c88; border-color: #388c88; }
 #editor .md-table-row { white-space: pre; border-bottom: 1px solid #dfe7ec; padding: 6px 10px; }
 .md-table-header { background: #f0f5f7; color: #385466; font-weight: 650; border-top: 1px solid #dfe7ec; }

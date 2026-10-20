@@ -2649,8 +2649,6 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "465a363235cd4062ef5f0953fc096fc764ed6f53dfbd9f409f669f93ea3b1ff9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7600,7 +7598,7 @@ dependencies = [
 
 [[package]]
 name = "studyapp-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7615,7 +7613,7 @@ dependencies = [
 
 [[package]]
 name = "studyapp-desktop"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7639,7 +7637,7 @@ dependencies = [
 
 [[package]]
 name = "studyapp-sync"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "percent-encoding",
  "quick-xml",

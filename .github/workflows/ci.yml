@@ -79,8 +79,11 @@ jobs:
             ${{ env.SMOKE_DIR }}/*.bmp
             ${{ env.SMOKE_DIR }}/native-*.json
             ${{ env.SMOKE_DIR }}/smoke-result.txt
+            ${{ env.SMOKE_DIR }}/smoke-input-mode.txt
             ${{ env.SMOKE_DIR }}/library-smoke-result.txt
             ${{ env.SMOKE_DIR }}/interactions-smoke-result.txt
+            ${{ env.SMOKE_DIR }}/workspace-smoke-result.txt
+            ${{ env.SMOKE_DIR }}/workspace-saved-layout.json
             ${{ env.SMOKE_DIR }}/*.log
           if-no-files-found: warn
           retention-days: 14

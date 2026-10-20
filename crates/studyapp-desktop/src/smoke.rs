@@ -224,6 +224,8 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
             Box::pin(crate::smoke_library::exercise(window, &view, &database, cx)).await;
             #[cfg(windows)]
             Box::pin(crate::smoke_interactions::exercise(window, &view, &database, cx)).await;
+            #[cfg(windows)]
+            Box::pin(crate::smoke_workspace::exercise(window, &view, &database, cx)).await;
         }
         let report = database.with_file_name("smoke-result.txt");
         #[cfg(feature = "ui-test")]

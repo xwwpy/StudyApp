@@ -164,6 +164,43 @@ pub async fn hover(
     pause(cx).await;
 }
 
+/// Verify the OS cursor, not only a style value in the GPUI tree.
+pub async fn assert_cursor(
+    window: AnyWindowHandle,
+    editor: &Entity<MarkdownEditor>,
+    id: SharedString,
+    expected: CursorStyle,
+    cx: &mut AsyncApp,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CURSORINFO, GetCursorInfo, IDC_ARROW, IDC_HAND, IDC_SIZEWE, LoadCursorW,
+    };
+    hover(window, editor, id.clone(), cx).await;
+    let resource = match expected {
+        CursorStyle::PointingHand => IDC_HAND,
+        CursorStyle::Arrow => IDC_ARROW,
+        CursorStyle::ResizeLeftRight | CursorStyle::ResizeColumn => IDC_SIZEWE,
+        _ => panic!("unsupported smoke cursor expectation"),
+    };
+    let expected = unsafe { LoadCursorW(None, resource).unwrap() };
+    for attempt in 0..20 {
+        pause(cx).await;
+        let mut cursor = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe { GetCursorInfo(&mut cursor).unwrap() };
+        if cursor.hCursor == expected {
+            return;
+        }
+        assert!(
+            attempt < 19,
+            "unexpected OS cursor over {id}: {:?}",
+            cursor.hCursor
+        );
+    }
+}
+
 fn send(state: &Value, inputs: &[INPUT]) {
     // Never deliver input to an unrelated foreground application.
     assert_eq!(unsafe { GetForegroundWindow() }, parent(state));
@@ -228,6 +265,45 @@ fn type_text(state: &Value, text: &str) {
         })
         .collect();
     send(state, &inputs);
+}
+
+fn cdp_character_input() -> bool {
+    std::env::var("WW_STUDYAPP_SMOKE_CDP_INPUT").as_deref() == Ok("1")
+}
+
+/// The alternate mode is explicit, test-only, and never a SendInput fallback.
+async fn enter_characters(
+    window: AnyWindowHandle,
+    editor: &Entity<MarkdownEditor>,
+    state: &Value,
+    text: &str,
+    cx: &mut AsyncApp,
+) {
+    if !cdp_character_input() {
+        eprintln!("smoke character input mode: strict Windows SendInput");
+        type_text(state, text);
+        return;
+    }
+    eprintln!(
+        "smoke character input mode: explicit CDP Input.insertText; OS character keyboard input is NOT verified"
+    );
+    let result = window
+        .update(cx, |_, _, cx| editor.read(cx).insert_text(text).unwrap())
+        .unwrap();
+    for _ in 0..100 {
+        pause(cx).await;
+        match result.try_recv() {
+            Ok(result) => {
+                result.expect("explicit smoke CDP character input failed");
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("explicit smoke CDP character input callback disconnected")
+            }
+        }
+    }
+    panic!("explicit smoke CDP character input timed out");
 }
 
 /// Capture screen pixels of this foreground editor. Unlike CDP or GPUI GPU
@@ -328,6 +404,19 @@ pub async fn capture(
     capture_visible(&state, path, cx).await;
 }
 
+/// Actual desktop pixels for the full client area, including native children.
+pub async fn capture_window(
+    window: AnyWindowHandle,
+    editor: &Entity<MarkdownEditor>,
+    path: &Path,
+    cx: &mut AsyncApp,
+) {
+    let mut state = visible(window, editor, cx).await;
+    state["bounds"] = state["parentBounds"].clone();
+    state["hwnd"] = state["parentHwnd"].clone();
+    capture_visible(&state, path, cx).await;
+}
+
 pub async fn type_into(
     window: AnyWindowHandle,
     editor: &Entity<MarkdownEditor>,
@@ -342,7 +431,14 @@ pub async fn type_into(
     let state = visible(window, editor, cx).await;
     click_body(&state);
     pause(cx).await;
-    type_text(&state, text);
+    let focus = window
+        .update(cx, |_, _, cx| editor.read(cx).native_state().unwrap())
+        .unwrap();
+    assert_eq!(
+        focus["focused"], true,
+        "click did not focus editor: {focus}"
+    );
+    enter_characters(window, editor, &state, text, cx).await;
     for attempt in 0..80 {
         pause(cx).await;
         if window
@@ -357,7 +453,7 @@ pub async fn type_into(
         }
         assert!(
             attempt < 79,
-            "native keyboard text did not reach persistence: {text:?}"
+            "smoke character input did not reach persistence: {text:?}"
         );
     }
 }
@@ -368,6 +464,15 @@ pub async fn first_open(
     database: &Path,
     cx: &mut AsyncApp,
 ) {
+    std::fs::write(
+        database.with_file_name("smoke-input-mode.txt"),
+        if cdp_character_input() {
+            "WEBVIEW2_CDP_INPUT\n"
+        } else {
+            "WIN32_SENDINPUT\n"
+        },
+    )
+    .unwrap();
     let (editor, original) = window
         .update(cx, |_, window, cx| {
             view.update(cx, |app, cx| {
@@ -420,7 +525,7 @@ pub async fn first_open(
         focus["focused"], true,
         "click did not focus editor: {focus}"
     );
-    type_text(&state, "native_keyboard_🧠");
+    enter_characters(window, &editor, &state, "native_keyboard_🧠", cx).await;
     for attempt in 0..80 {
         pause(cx).await;
         let content = window
@@ -432,8 +537,21 @@ pub async fn first_open(
         if attempt == 79 {
             capture_screen(&state, &database.with_file_name("native-input-failure.bmp"));
             let browser = snapshot(window, &editor, cx).await;
+            let after = window
+                .update(cx, |_, _, cx| editor.read(cx).native_state().unwrap())
+                .unwrap();
+            let keyboard = unsafe {
+                (
+                    GetKeyboardLayout(0),
+                    GetAsyncKeyState(VK_CONTROL.0 as i32),
+                    GetAsyncKeyState(VK_SHIFT.0 as i32),
+                    GetAsyncKeyState(VK_MENU.0 as i32),
+                    GetAsyncKeyState(VK_LWIN.0 as i32),
+                )
+            };
             panic!(
-                "Windows keyboard input did not reach editable content; native={content:?}, browser={browser}"
+                "smoke character input did not reach editable content; cdp_mode={}, native={content:?}, browser={browser}, after={after}, keyboard={keyboard:?}",
+                cdp_character_input()
             );
         }
     }
@@ -464,15 +582,28 @@ pub async fn first_open(
             attempt < 31,
             "native undo did not restore original Markdown: expected={original:?}, history={undo_states:?}"
         );
-        send(
-            &state,
-            &[
-                key(VK_CONTROL, KEYBD_EVENT_FLAGS::default()),
-                key(VK_Z, KEYBD_EVENT_FLAGS::default()),
-                key(VK_Z, KEYEVENTF_KEYUP),
-                key(VK_CONTROL, KEYEVENTF_KEYUP),
-            ],
-        );
+        if cdp_character_input() {
+            window
+                .update(cx, |_, _, cx| {
+                    editor
+                        .read(cx)
+                        .test(serde_json::json!({
+                            "type": "command", "name": "undo", "request": "explicit-smoke-undo"
+                        }))
+                        .unwrap();
+                })
+                .unwrap();
+        } else {
+            send(
+                &state,
+                &[
+                    key(VK_CONTROL, KEYBD_EVENT_FLAGS::default()),
+                    key(VK_Z, KEYBD_EVENT_FLAGS::default()),
+                    key(VK_Z, KEYEVENTF_KEYUP),
+                    key(VK_CONTROL, KEYEVENTF_KEYUP),
+                ],
+            );
+        }
         pause(cx).await;
         pause(cx).await;
     }
@@ -511,5 +642,11 @@ pub async fn first_open(
         )
         .unwrap();
     }
-    eprintln!("native first-open reading, click focus, keyboard input and undo passed");
+    if cdp_character_input() {
+        eprintln!(
+            "native first-open reading, click focus and undo passed; characters explicitly used CDP, OS character keyboard input was NOT verified"
+        );
+    } else {
+        eprintln!("native first-open reading, click focus, keyboard input and undo passed");
+    }
 }

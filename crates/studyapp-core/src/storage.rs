@@ -48,11 +48,13 @@ impl Default for Settings {
             answer_minutes: 5,
             review_days: vec![1, 3, 7, 14, 30],
             show_file_paths: false,
+            layout: Default::default(),
         }
     }
 }
 impl Settings {
     pub(crate) fn validate(&self) -> Result<()> {
+        self.layout.validate()?;
         ensure!(
             (5..=240).contains(&self.interval_minutes),
             "询问间隔应为 5–240 分钟"
@@ -65,6 +67,17 @@ impl Settings {
             (1..=20).contains(&self.review_days.len())
                 && self.review_days.iter().all(|d| (1..=3650).contains(d)),
             "复习间隔须为 1–3650 天，共 1–20 阶段"
+        );
+        Ok(())
+    }
+}
+impl crate::LayoutSettings {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            (144..=320).contains(&self.navigation_width)
+                && (144..=360).contains(&self.folders_width)
+                && (180..=440).contains(&self.notes_width),
+            "面板宽度超出允许范围"
         );
         Ok(())
     }

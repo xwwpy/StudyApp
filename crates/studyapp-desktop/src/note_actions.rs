@@ -32,20 +32,54 @@ impl NoteDrag {
     }
 }
 
-impl Render for NoteDrag {
+/// GPUI places a drag view at `pointer - source_offset`, even when the view is
+/// smaller than the source. Restore that offset inside the view, then leave a
+/// fixed gap so a lower-right grab stays just as close as a top-left grab.
+pub struct NoteDragPreview {
+    title: String,
+    source_offset: Point<Pixels>,
+}
+
+impl NoteDragPreview {
+    pub fn new(drag: &NoteDrag, source_offset: Point<Pixels>) -> Self {
+        Self {
+            title: drag.title.clone(),
+            source_offset,
+        }
+    }
+
+    fn content_offset(source_offset: Point<Pixels>) -> Point<Pixels> {
+        source_offset + point(px(12.), px(12.))
+    }
+}
+
+impl Render for NoteDragPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px_3()
-            .py_2()
-            .max_w(px(280.))
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(GREEN))
-            .bg(rgb(LIGHT))
-            .text_color(rgb(INK))
-            .text_sm()
-            .shadow_md()
-            .child(format!("移动笔记 · {}", self.title))
+        let offset = Self::content_offset(self.source_offset);
+        anchored()
+            .position_mode(AnchoredPositionMode::Local)
+            .position(offset)
+            .snap_to_window()
+            .child(
+                div()
+                    .id("note-drag-preview")
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .w(px(220.))
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(GREEN))
+                    .bg(rgb(LIGHT))
+                    .text_color(rgb(INK))
+                    .text_sm()
+                    .shadow_md()
+                    .child(div().flex_shrink_0().text_color(rgb(GREEN)).child("MD"))
+                    .child(div().min_w_0().truncate().child(self.title.clone())),
+            )
     }
 }
 
@@ -161,6 +195,21 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use studyapp_core::{NoteFolder, Settings, TimerState};
+
+    #[::core::prelude::v1::test]
+    fn bottom_right_grab_keeps_compact_preview_near_pointer() {
+        let pointer = point(px(720.), px(390.));
+        // Includes the long/tall source row which exposed the old compact ghost.
+        for source_offset in [
+            point(px(3.), px(3.)),
+            point(px(429.), px(137.)),
+            point(px(-19.), px(-15.)),
+        ] {
+            let gpui_origin = pointer - source_offset;
+            let preview_origin = gpui_origin + NoteDragPreview::content_offset(source_offset);
+            assert_eq!(preview_origin - pointer, point(px(12.), px(12.)));
+        }
+    }
 
     fn snapshot() -> Snapshot {
         Snapshot {

@@ -1,3 +1,5 @@
+use crate::controls::Button;
+use crate::controls::Checkbox;
 use crate::{
     components::*,
     sync_runtime::{SyncSettings, SyncStatus, SyncTarget},
@@ -6,13 +8,17 @@ use crate::{
 use gpui_kit::{
     component::{
         Disableable, Selectable,
-        button::{Button, ButtonVariants},
-        checkbox::Checkbox,
+        button::ButtonVariants,
         input::{Input, InputState},
     },
     *,
 };
 use std::sync::mpsc;
+
+#[derive(Clone, Debug)]
+pub enum SyncEvent {
+    Feedback(Result<String, String>),
+}
 
 pub struct SyncPanel {
     sender: mpsc::Sender<Work>,
@@ -25,10 +31,11 @@ pub struct SyncPanel {
     interval: Entity<InputState>,
     automatic: bool,
     initialized: bool,
-    error: Option<String>,
     picked_sender: mpsc::Sender<(String, std::path::PathBuf)>,
     picked: mpsc::Receiver<(String, std::path::PathBuf)>,
 }
+
+impl EventEmitter<SyncEvent> for SyncPanel {}
 
 impl SyncPanel {
     fn has_unsaved_changes(&self, cx: &App) -> bool {
@@ -66,7 +73,6 @@ impl SyncPanel {
             interval: input("5–1440 分钟", window, cx),
             automatic: false,
             initialized: false,
-            error: None,
             picked_sender,
             picked,
         };
@@ -93,11 +99,13 @@ impl SyncPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if reset
-            || !self.initialized
-            || status.library != self.status.library
-            || status.settings != self.status.settings
-        {
+        let opening_library = reset || !self.initialized || status.library != self.status.library;
+        // Loading has no worker result notice; surface its warning once for
+        // this library. Routine status polls must not recreate a dismissed toast.
+        if opening_library && status.message.starts_with("同步配置无法读取") {
+            cx.emit(SyncEvent::Feedback(Err(status.message.clone())));
+        }
+        if opening_library || status.settings != self.status.settings {
             self.target = match &status.settings.target {
                 SyncTarget::Disabled => 0,
                 SyncTarget::Folder { path } => {
@@ -183,24 +191,30 @@ impl SyncPanel {
                 .update(cx, |s, cx| s.set_value("", window, cx));
             Ok(())
         })();
-        self.error = result.err().map(|e| e.to_string());
+        if let Err(error) = result {
+            cx.emit(SyncEvent::Feedback(Err(error.to_string())));
+        }
         cx.notify();
     }
 
     fn start(&mut self, test_only: bool, cx: &mut Context<Self>) {
         if self.has_unsaved_changes(cx) {
-            self.error = Some("同步设置有未保存的修改，请先保存。".into());
+            cx.emit(SyncEvent::Feedback(Err(
+                "同步设置有未保存的修改，请先保存。".into(),
+            )));
             cx.notify();
             return;
         }
-        self.error = self
+        if self
             .sender
             .send(Work::Scoped {
                 library: self.status.library.clone(),
                 work: Box::new(Work::StartSync { test_only }),
             })
-            .err()
-            .map(|_| "后台服务已停止".into());
+            .is_err()
+        {
+            cx.emit(SyncEvent::Feedback(Err("后台服务已停止".into())));
+        }
         cx.notify();
     }
 }
@@ -258,8 +272,73 @@ impl Render for SyncPanel {
                 .child(Button::new("test-sync").label("测试连接").disabled(busy || unsaved || matches!(self.status.settings.target, SyncTarget::Disabled)).on_click(cx.listener(|this, _, _, cx| this.start(true, cx))))
                 .child(Button::new("sync-now").label(if busy { "正在同步…" } else { "立即同步" }).disabled(busy || unsaved || matches!(self.status.settings.target, SyncTarget::Disabled)).on_click(cx.listener(|this, _, _, cx| this.start(false, cx)))))
             .child(muted(if unsaved { "同步设置有未保存的修改，请先保存。" } else { "使用已保存的同步设置" }))
-            .child(muted(self.error.as_ref().unwrap_or(&self.status.message).clone()))
+            .child(muted(if busy { "正在处理同步任务…" }
+                else if matches!(self.status.settings.target, SyncTarget::Disabled) { "同步已关闭" }
+                else { "同步已就绪" }))
             .child(muted(format!("最近成功：{}", self.status.last_success.map(studyapp_desktop::presentation::stamp).unwrap_or_else(|| "尚未完成".into()))))
             .child(muted("远端专用目录：StudyApp/notes；不同修改会保留冲突副本。不传播删除，导入的外部原文件不会被同步改写。"))
+    }
+}
+
+#[cfg(all(test, feature = "ui-test"))]
+mod feedback_tests {
+    use super::{SyncEvent, SyncPanel};
+    use crate::sync_runtime::SyncStatus;
+    use gpui_kit::TestAppContext;
+    use std::sync::mpsc;
+
+    #[gpui_kit::test]
+    fn stopped_worker_emits_one_floating_error_instead_of_inline_state(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let (panel, cx) = cx.add_window_view(|window, cx| SyncPanel::new(sender, window, cx));
+        let feedback = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let received = feedback.clone();
+        let subscription = cx.update(|_, cx| {
+            cx.subscribe(&panel, move |_, event: &SyncEvent, _| {
+                received.borrow_mut().push(event.clone());
+            })
+        });
+        panel.update(cx, |panel, cx| panel.start(false, cx));
+        cx.run_until_parked();
+        assert!(
+            matches!(feedback.borrow().as_slice(), [SyncEvent::Feedback(Err(error))] if error == "后台服务已停止")
+        );
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.poll(window, cx)));
+        cx.run_until_parked();
+        assert_eq!(feedback.borrow().len(), 1, "poll repeated the same error");
+        drop(subscription);
+    }
+
+    #[gpui_kit::test]
+    fn unreadable_sync_configuration_is_reported_once_when_library_opens(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (sender, _receiver) = mpsc::channel();
+        let (panel, cx) = cx.add_window_view(|window, cx| SyncPanel::new(sender, window, cx));
+        let feedback = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let received = feedback.clone();
+        let subscription = cx.update(|_, cx| {
+            cx.subscribe(&panel, move |_, event: &SyncEvent, _| {
+                received.borrow_mut().push(event.clone())
+            })
+        });
+        let status = SyncStatus {
+            library: "isolated-test-library".into(),
+            message: "同步配置无法读取，请重新配置；原配置文件保留".into(),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.accept(status.clone(), false, window, cx)
+                })
+            });
+            cx.run_until_parked();
+        }
+        assert!(
+            matches!(feedback.borrow().as_slice(), [SyncEvent::Feedback(Err(error))] if error.contains("同步配置无法读取"))
+        );
+        drop(subscription);
     }
 }

@@ -1,10 +1,8 @@
+use crate::controls::Button;
 use crate::{app::StudyApp, components::*, editor_lifecycle::NoteIntent, worker::Work};
 use gpui_kit::{
     base::{Scrollbar, ScrollbarMode},
-    component::{
-        Disableable, Sizable,
-        button::{Button, ButtonVariants},
-    },
+    component::{Disableable, Sizable, button::ButtonVariants},
     prelude::FluentBuilder,
     *,
 };
@@ -140,7 +138,6 @@ impl StudyApp {
                     .when(report.copies.is_empty(), |v| v.child(muted("没有可清理的托管副本。")))
                     .children(report.copies.iter().map(|copy| {
                         let id = copy.note_id.clone();
-                        let confirm_id = id.clone();
                         let history_id = id.clone();
                         let path_id = SharedString::from(format!("storage-copy-path-{id}"));
                         let in_draft = self.note_editor.as_ref().or(self.recoverable_draft.as_ref())
@@ -169,19 +166,102 @@ impl StudyApp {
                             .when(copy.detached, |v| v.child(muted("已取消管理")))
                             .when(in_draft, |v| v.child(muted("请先保存或删除该笔记的草稿，再清理副本。")))
                             .when_some(copy.reason.as_ref(), |v, reason| v.child(muted(reason.clone())))
-                            .when(self.storage_confirm.as_ref() == Some(&confirm_id), |v| {
-                                v.child(muted("将删除上方这一份文件并停止管理。历史快照保留，可通过“历史与恢复”导出或复制。"))
-                                    .child(row().child(Button::new("confirm-delete-copy").small()
-                                        .disabled(blocked || in_draft || !copy.deletable).label("确认删除这一份")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.storage_confirm = None;
-                                            this.storage_work(Work::DeleteManagedCopy { note_id: confirm_id.clone() }, cx);
-                                        })))
-                                        .child(Button::new("cancel-delete-copy").small().ghost().label("取消")
-                                            .on_click(cx.listener(|this, _, _, cx| { this.storage_confirm = None; cx.notify(); }))))
-                            })
                     })))
         })
+    }
+
+    fn copy_confirmation_allowed(&self, note_id: &str, cx: &App) -> bool {
+        !self.storage_busy
+            && !self.note_saving
+            && !self.sync_panel.read(cx).status.busy
+            && self.draft_discard.is_none()
+            && self.draft_persist.is_none()
+            && !self
+                .note_editor
+                .as_ref()
+                .or(self.recoverable_draft.as_ref())
+                .is_some_and(|draft| draft.note_id.as_deref() == Some(note_id))
+            && self
+                .storage_report
+                .as_ref()
+                .filter(|report| report.data_path == self.last_library)
+                .is_some_and(|report| {
+                    report
+                        .copies
+                        .iter()
+                        .any(|copy| copy.note_id == note_id && copy.deletable)
+                })
+    }
+
+    pub fn confirm_storage_copy(&mut self, cx: &mut Context<Self>) {
+        let Some(note_id) = self.storage_confirm.clone() else {
+            return;
+        };
+        if !self.copy_confirmation_allowed(&note_id, cx) {
+            self.notice = Some(Err(
+                "这份副本当前无法删除，请等待任务结束后重新统计空间。".into()
+            ));
+            cx.notify();
+            return;
+        }
+        self.storage_confirm = None;
+        self.storage_work(Work::DeleteManagedCopy { note_id }, cx);
+    }
+
+    /// A confirmation for exactly one managed copy, mounted in the root dialog.
+    pub fn storage_confirmation_view(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let note_id = self.storage_confirm.as_ref()?;
+        let copy = self
+            .storage_report
+            .as_ref()
+            .filter(|report| report.data_path == self.last_library)
+            .and_then(|report| report.copies.iter().find(|copy| &copy.note_id == note_id));
+        let allowed = self.copy_confirmation_allowed(note_id, cx);
+        let mut content = column().child(heading("删除这一份托管副本？")).child(muted(
+            "将删除所选文件并停止管理。历史快照和学习记录保留，可通过“历史与恢复”导出或复制。",
+        ));
+        if let Some(copy) = copy {
+            content = content.child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(copy.title.clone()),
+            );
+            if self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.settings.show_file_paths)
+            {
+                content = content.child(muted(display_path(&copy.path)));
+            }
+        }
+        if !allowed {
+            content = content.child(muted(
+                "目标或资料库状态已改变，当前无法删除。请取消后重新统计空间。",
+            ));
+        }
+        Some(
+            content.child(
+                row()
+                    .child(
+                        Button::new("confirm-delete-copy")
+                            .small()
+                            .primary()
+                            .disabled(!allowed)
+                            .label("确认删除这一份")
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm_storage_copy(cx))),
+                    )
+                    .child(
+                        Button::new("cancel-delete-copy")
+                            .small()
+                            .ghost()
+                            .label("取消")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.storage_confirm = None;
+                                cx.notify();
+                            })),
+                    ),
+            ),
+        )
     }
 }
 

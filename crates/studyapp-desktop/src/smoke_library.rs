@@ -730,12 +730,9 @@ pub async fn exercise(
                 cx,
             );
             assert_eq!(view.read(cx).storage_confirm.as_ref(), Some(&disposable.id));
-            click_scrolled(
-                window,
-                "confirm-delete-copy".into(),
-                "storage-copy-list",
-                cx,
-            );
+            window.render_frame(cx);
+            assert!(window.find("modal-content-scroll").visible());
+            window.click("confirm-delete-copy", cx);
         })
         .unwrap();
     until(

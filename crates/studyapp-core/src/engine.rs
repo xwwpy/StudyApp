@@ -228,6 +228,11 @@ impl Engine {
                 next.settings.show_file_paths = visible;
                 "显示设置已保存".into()
             }
+            Command::SaveLayout(layout) => {
+                layout.validate()?;
+                next.settings.layout = layout;
+                "布局已保存".into()
+            }
             Command::SetPaused(paused) => {
                 if next.timer.paused && !paused {
                     // Reconcile every source before admitting new activity. Candidates may

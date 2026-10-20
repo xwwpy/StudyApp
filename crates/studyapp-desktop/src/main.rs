@@ -3,9 +3,11 @@
 mod app;
 mod assets;
 mod components;
+mod controls;
 mod credentials;
 mod drafts;
 mod editor_lifecycle;
+mod feedback;
 mod folders_ui;
 mod history_preview;
 mod imports;
@@ -23,6 +25,8 @@ mod smoke_interactions;
 mod smoke_library;
 #[cfg(all(windows, feature = "ui-test"))]
 mod smoke_visibility;
+#[cfg(all(windows, feature = "ui-test"))]
+mod smoke_workspace;
 mod storage_backend;
 mod storage_ui;
 mod sync_runtime;
@@ -31,6 +35,7 @@ mod views;
 #[cfg(windows)]
 mod web_editor_host;
 mod worker;
+mod workspace_layout;
 
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;

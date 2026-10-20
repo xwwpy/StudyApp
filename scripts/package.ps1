@@ -47,7 +47,7 @@ try {
     if (Test-Path -LiteralPath (Join-Path $repoRoot 'docs/verification.md') -PathType Leaf) {
         Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/verification.md') -Destination (Join-Path $staging 'docs/verification.md')
     }
-    foreach ($image in @('dashboard.png', 'note-editor.png')) {
+    foreach ($image in @('dashboard.png', 'note-editor.png', 'workspace.png')) {
         if (Test-Path -LiteralPath (Join-Path $repoRoot "docs/images/$image") -PathType Leaf) {
             [IO.Directory]::CreateDirectory((Join-Path $staging 'docs/images')) | Out-Null
             Copy-Item -LiteralPath (Join-Path $repoRoot "docs/images/$image") -Destination (Join-Path $staging "docs/images/$image")
@@ -59,7 +59,7 @@ try {
     $apacheLicense = Join-Path (Split-Path -Parent $anyhow.manifest_path) 'LICENSE-APACHE'
     Copy-Item -LiteralPath $apacheLicense -Destination (Join-Path $staging 'LICENSE-APACHE-2.0.txt')
     $notices = [Collections.Generic.List[string]]::new()
-    $notices.Add("# Third-party notices`n`nDependencies below are conservatively collected from the locked Windows graph, including development/test features. Each dependency retains its own license. Registry dependencies are unmodified. The patched GPUI Windows renderer is explicitly identified below, with its complete modified source and upstream license included. Exact source archives are linked for source availability, including MPL-2.0 components. Shared Apache-2.0 license text is in LICENSE-APACHE-2.0.txt; crate-specific notices are copied where supplied in source archives.`n")
+    $notices.Add("# Third-party notices`n`nDependencies below are conservatively collected from the locked Windows graph, including development/test features. Each dependency retains its own license. Registry dependencies are unmodified. The patched GPUI Windows renderer and component menu cursor policy are explicitly identified below, with their complete modified runtime source and upstream licenses included. Exact source archives are linked for source availability, including MPL-2.0 components. Shared Apache-2.0 license text is in LICENSE-APACHE-2.0.txt; crate-specific notices are copied where supplied in source archives.`n")
     $dependencies = @($metadata.packages | Where-Object { $_.id -notin $metadata.workspace_members } | Sort-Object name,version)
     foreach ($package in $dependencies) {
         $root = Split-Path -Parent $package.manifest_path
@@ -70,6 +70,14 @@ try {
             foreach ($sourceFile in (Get-ChildItem -LiteralPath $root -File -Recurse)) {
                 $relativeSource = [IO.Path]::GetRelativePath($root, $sourceFile.FullName)
                 $sourceDestination = Join-Path $staging "third-party/gpui-pre-windows-0.3.9/$relativeSource"
+                [IO.Directory]::CreateDirectory((Split-Path -Parent $sourceDestination)) | Out-Null
+                Copy-Item -LiteralPath $sourceFile.FullName -Destination $sourceDestination
+            }
+        } elseif (-not $package.source -and $package.name -eq 'gpui-component' -and $package.version -eq '0.7.3' -and [IO.Path]::GetFullPath($root) -eq [IO.Path]::GetFullPath((Join-Path $repoRoot 'vendor/gpui-component'))) {
+            $notices.Add("## gpui-component 0.7.3 (modified)`n`nLicense: Apache-2.0. WW-StudyApp applies a pointing-hand cursor to enabled popup menu rows and an arrow to disabled rows, labels and separators, including nested submenus. Full patched runtime source, original license and provenance are included in third-party/gpui-component-0.7.3/. See STUDYAPP-PATCH.md there.`n`nSource: https://github.com/xwwpy/StudyApp/tree/v$Version/vendor/gpui-component`n")
+            foreach ($sourceFile in (Get-ChildItem -LiteralPath $root -File -Recurse)) {
+                $relativeSource = [IO.Path]::GetRelativePath($root, $sourceFile.FullName)
+                $sourceDestination = Join-Path $staging "third-party/gpui-component-0.7.3/$relativeSource"
                 [IO.Directory]::CreateDirectory((Split-Path -Parent $sourceDestination)) | Out-Null
                 Copy-Item -LiteralPath $sourceFile.FullName -Destination $sourceDestination
             }

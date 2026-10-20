@@ -433,6 +433,7 @@ fn synced_content_is_excluded_from_active_learning_and_history_exports_are_exact
                 answer_minutes: 1,
                 review_days: vec![1],
                 show_file_paths: false,
+                layout: Default::default(),
             }),
             1000,
         )
@@ -609,6 +610,7 @@ fn synced_copy_keeps_its_title_is_offline_and_never_overwrites() {
                 answer_minutes: 1,
                 review_days: vec![1],
                 show_file_paths: false,
+                layout: Default::default(),
             }),
             1002,
         )

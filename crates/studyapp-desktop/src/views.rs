@@ -1,3 +1,5 @@
+use crate::controls::Button;
+use crate::controls::Checkbox;
 use crate::{
     app::{EditorMode, Page, StudyApp},
     components::*,
@@ -5,8 +7,7 @@ use crate::{
 use chrono::{Local, TimeZone, Utc};
 use gpui_kit::component::{
     Disableable, IconName, Selectable, Sizable,
-    button::{Button, ButtonVariants},
-    checkbox::Checkbox,
+    button::ButtonVariants,
     input::{Input, Textarea},
     tooltip::Tooltip,
 };

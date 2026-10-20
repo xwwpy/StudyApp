@@ -1,5 +1,6 @@
 use crate::components::*;
-use gpui_kit::component::button::{Button, ButtonVariants};
+use crate::controls::Button;
+use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use serde::Deserialize;

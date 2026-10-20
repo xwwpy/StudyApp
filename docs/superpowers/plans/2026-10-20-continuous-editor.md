@@ -49,7 +49,7 @@ Files: replace markdown_editor.rs; add editor protocol/host modules; app.rs, not
 Files: workflows, package script, README, release notes, verification, screenshots and version metadata.
 
 - [x] Review the complete implementation independently; resolve correctness/security/performance findings.
-- [ ] Run frontend build/tests, Rust fmt/tests/clippy, native smoke and release-package smoke. Report measured typing latency and test boundaries.
+- [x] Run frontend build/tests, Rust fmt/tests/clippy, native smoke and release-package smoke. Report measured typing latency and test boundaries.
 - [x] Add frontend tests/bundle reproducibility/license validation to CI and release gates, and include editor license notices.
 - [x] Document continuous editing behavior, WebView2 runtime requirement, supported highlighting and lifecycle actions; bump to 0.4.0.
 - [ ] Commit/push, verify CI, publish and verify a release without rewriting the existing v0.3.0 tag.

@@ -14,7 +14,9 @@
 - 独立代码审查发现并修复维护期间布局未保存、静止单击覆盖拟合前宽度、通知点击穿透三个问题；最终复查无剩余阻断项。`cargo-deny` 许可证/依赖/来源检查通过；当前 RustSec 公告库审计为 0 个已知漏洞，保留 9 项停止维护及非 Windows glib 的 unsound 警告。
 - 随源码维护的 gpui-component 0.7.3 补丁只修改菜单行的启用/禁用光标。上游归档 SHA256、修改说明、全部运行时源码及 Apache 许可证均保存，发布脚本包含完整修改源码；原 Windows 绘制补丁继续保留。
 
-本机最终构建已通过上述完整回归；远端 CI 与下载包验证将在本节后续条目中记录。
+首轮远端 CI 的全量测试、Clippy、真实 Windows SendInput 字符及撤销均通过，新增光标断言因虚拟桌面 `GetCursorInfo` 返回空全局句柄失败。测试改为严格核对 UI 线程的实际 Win32 `GetCursor` 句柄，非空全局句柄仍须一致；不设置预期光标，也不以 GPUI 声明样式替代 OS 检查。全局句柄为空仅能证明线程光标设置，不能据此声称桌面已绘出光标。API 范围参见微软 [GetCursor 文档](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getcursor)。
+
+本机最终构建已通过上述完整回归；最终远端 CI 与下载包验证将在本节后续条目中记录。
 
 ## 0.5.0 原生编辑修复与笔记交互验收
 

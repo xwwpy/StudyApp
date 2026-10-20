@@ -173,7 +173,7 @@ pub async fn assert_cursor(
     cx: &mut AsyncApp,
 ) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        CURSORINFO, GetCursorInfo, IDC_ARROW, IDC_HAND, IDC_SIZEWE, LoadCursorW,
+        CURSORINFO, GetCursor, GetCursorInfo, IDC_ARROW, IDC_HAND, IDC_SIZEWE, LoadCursorW,
     };
     hover(window, editor, id.clone(), cx).await;
     let resource = match expected {
@@ -190,13 +190,24 @@ pub async fn assert_cursor(
             ..Default::default()
         };
         unsafe { GetCursorInfo(&mut cursor).unwrap() };
-        if cursor.hCursor == expected {
+        // GetCursor reads the current UI thread's actual Win32 cursor. A
+        // disconnected runner desktop can return a null global cursor even
+        // after WM_MOUSEMOVE and SetCursor have updated this thread. Never
+        // replace the OS check with the declared GPUI style or set the expected
+        // cursor from the test; a wrong or null thread cursor must still fail.
+        let thread_cursor = unsafe { GetCursor() };
+        if thread_cursor == expected && (cursor.hCursor.0.is_null() || cursor.hCursor == expected) {
+            eprintln!(
+                "native cursor verified over {id}: thread={thread_cursor:?}, global={:?}, flags={:?}",
+                cursor.hCursor, cursor.flags
+            );
             return;
         }
         assert!(
             attempt < 19,
-            "unexpected OS cursor over {id}: {:?}",
-            cursor.hCursor
+            "unexpected OS cursor over {id}: thread={thread_cursor:?}, global={:?}, flags={:?}, expected={expected:?}",
+            cursor.hCursor,
+            cursor.flags
         );
     }
 }

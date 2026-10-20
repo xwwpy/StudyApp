@@ -10,10 +10,11 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     input::{InputState, TextareaState},
 };
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use studyapp_core::{Command, SessionStatus, Snapshot};
-use studyapp_desktop::presentation::{parse_local_time, safe_markdown_html};
+use studyapp_desktop::presentation::parse_local_time;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
@@ -49,8 +50,6 @@ pub struct StudyApp {
     pub saving: bool,
     pub selected_note: Option<String>,
     pub selected_version: Option<String>,
-    pub preview_key: String,
-    pub preview_html: String,
     pub history: bool,
     pub stats_days: usize,
     pub record_filter: usize,
@@ -66,6 +65,15 @@ pub struct StudyApp {
     pub draft_failed: bool,
     pub record_date: Entity<InputState>,
     pub note_saving: bool,
+    pub note_intent: Option<(u64, crate::editor_lifecycle::NoteIntent)>,
+    pub pending_library: Option<(Arc<Snapshot>, bool)>,
+    pub draft_persist: Option<crate::editor_lifecycle::PersistPending>,
+    pub draft_discard: Option<crate::editor_lifecycle::DiscardPending>,
+    pub confirmation: Option<crate::editor_lifecycle::NoteConfirmation>,
+    pub reader_key: String,
+    pub draft_dirty_since: Option<std::time::Instant>,
+    pub close_requested: bool,
+    pub close_allowed: bool,
     pub sync_panel: Entity<crate::sync_ui::SyncPanel>,
     notified: HashSet<String>,
     _poll: Task<()>,
@@ -113,14 +121,27 @@ impl StudyApp {
         let note_content = cx.new(|cx| crate::markdown_editor::MarkdownEditor::new(window, cx));
         cx.subscribe(
             &note_title,
-            |this, _, _: &gpui_kit::component::input::InputEvent, cx| this.capture_note_draft(cx),
+            |this, _, _: &gpui_kit::component::input::InputEvent, _| this.mark_note_dirty(),
         )
         .detach();
         cx.subscribe(
             &note_content,
-            |this, _, _: &crate::markdown_editor::MarkdownChanged, cx| this.capture_note_draft(cx),
+            |this, _, _: &crate::markdown_editor::MarkdownChanged, _| this.mark_note_dirty(),
         )
         .detach();
+        cx.subscribe_in(
+            &note_content,
+            window,
+            |this, _, event: &crate::markdown_editor::MarkdownEvent, window, cx| {
+                this.editor_event(event.clone(), window, cx);
+            },
+        )
+        .detach();
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            weak.update(cx, |this, cx| this.handle_close(window, cx))
+                .unwrap_or(true)
+        });
         let sync_panel =
             cx.new(|cx| crate::sync_ui::SyncPanel::new(worker.sender.clone(), window, cx));
         Self {
@@ -134,6 +155,15 @@ impl StudyApp {
             recoverable_draft: None,
             draft_loading: true,
             note_saving: false,
+            note_intent: None,
+            pending_library: None,
+            draft_persist: None,
+            draft_discard: None,
+            confirmation: None,
+            reader_key: String::new(),
+            draft_dirty_since: None,
+            close_requested: false,
+            close_allowed: false,
             worker,
             snapshot: None,
             page: Page::Today,
@@ -159,8 +189,6 @@ impl StudyApp {
             saving: false,
             selected_note: None,
             selected_version: None,
-            preview_key: String::new(),
-            preview_html: String::new(),
             history: false,
             stats_days: 30,
             record_filter: 0,
@@ -175,7 +203,13 @@ impl StudyApp {
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_panel
             .update(cx, |panel, cx| panel.poll(window, cx));
-        let mut changed = self.poll_drafts(cx);
+        let mut changed = self.poll_drafts(window, cx);
+        if self
+            .draft_dirty_since
+            .is_some_and(|at| at.elapsed() >= Duration::from_millis(200))
+        {
+            self.capture_note_draft(cx);
+        }
         while let Ok(update) = self.worker.receiver.try_recv() {
             if let Some(status) = update.sync_status {
                 self.sync_panel.update(cx, |panel, cx| {
@@ -192,7 +226,9 @@ impl StudyApp {
                     self.note_editor = None;
                     self.recoverable_draft = None;
                     self.drafts.save(&self.last_library, None);
+                    self.reader_key.clear();
                     self.page = Page::Notes;
+                    self.finish_library_transition(window, cx);
                 }
             }
             if update.editor_result {
@@ -205,89 +241,116 @@ impl StudyApp {
                 self.notice = Some(notice);
             }
             if let Some(snapshot) = update.snapshot {
-                if update.library_replaced || self.last_library != snapshot.data_path {
-                    self.note_content
-                        .update(cx, |editor, cx| editor.flush(window, cx));
-                    self.capture_note_draft(cx);
-                    self.note_editor = None;
-                    self.recoverable_draft = None;
-                    self.note_saving = false;
-                    self.note_content
-                        .update(cx, |editor, cx| editor.set_readonly(false, cx));
-                    self.draft_loading = true;
-                    self.draft_failed = false;
-                    self.last_library = snapshot.data_path.clone();
-                    self.drafts.load(&self.last_library);
-                    self.selected_note = None;
-                    self.selected_version = None;
-                    self.preview_key.clear();
-                    self.editor = None;
-                    self.saving = false;
-                    self.chosen_notes.clear();
-                    self.chosen_versions.clear();
-                    self.notified.clear();
-                    self.interval.update(cx, |s, cx| {
-                        s.set_value(snapshot.settings.interval_minutes.to_string(), window, cx)
-                    });
-                    self.deadline.update(cx, |s, cx| {
-                        s.set_value(snapshot.settings.answer_minutes.to_string(), window, cx)
-                    });
-                    self.review_days.update(cx, |s, cx| {
-                        s.set_value(
-                            snapshot
-                                .settings
-                                .review_days
-                                .iter()
-                                .map(u32::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", "),
+                if (update.library_replaced || self.last_library != snapshot.data_path)
+                    && (self.note_editor.is_some()
+                        || self.draft_discard.is_some()
+                        || self.draft_persist.is_some())
+                {
+                    self.pending_library = Some((snapshot, update.library_replaced));
+                    if !self.draft_failed {
+                        self.request_note_action(
+                            crate::editor_lifecycle::NoteIntent::SwitchLibrary,
                             window,
                             cx,
-                        )
-                    });
-                }
-                for session in &snapshot.sessions {
-                    if session.status == SessionStatus::Pending
-                        && self.notified.insert(session.id.clone())
-                    {
-                        cx.show_system_notification(SystemNotification {
-                            tag: session.id.clone().into(),
-                            title: "该回顾刚才的学习了".into(),
-                            body: format!(
-                                "请在 {} 分钟内记录学到了什么，未回答将记为未学习。",
-                                snapshot.settings.answer_minutes
-                            )
-                            .into(),
-                            actions: vec![],
-                        });
-                        if self.editor.is_none() {
-                            self.editor = Some(EditorMode::Pending(session.id.clone()));
-                            self.summary.update(cx, |s, cx| {
-                                s.set_value(session.suggested_summary.clone(), window, cx)
-                            });
-                            self.chosen_notes = session.note_ids.iter().cloned().collect();
-                            self.chosen_versions = session.version_ids.iter().cloned().collect();
-                            self.seed_versions(&snapshot, session.ended_at);
-                            self.page = Page::Today;
-                        }
+                        );
                     }
+                } else {
+                    self.accept_snapshot(snapshot, update.library_replaced, window, cx);
                 }
-                if self
-                    .selected_note
-                    .as_ref()
-                    .is_none_or(|id| !snapshot.notes.iter().any(|n| &n.id == id))
-                {
-                    self.selected_note = snapshot.notes.first().map(|n| n.id.clone());
-                    self.selected_version = None;
-                }
-                self.snapshot = Some(snapshot);
             }
             changed = true;
         }
+        self.continue_close(window, cx);
         if changed {
-            self.refresh_preview();
             cx.notify();
         }
+    }
+
+    pub fn accept_snapshot(
+        &mut self,
+        snapshot: Arc<Snapshot>,
+        library_replaced: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if library_replaced || self.last_library != snapshot.data_path {
+            self.note_editor = None;
+            self.recoverable_draft = None;
+            self.note_saving = false;
+            self.note_content
+                .update(cx, |editor, cx| editor.set_readonly(false, cx));
+            self.draft_loading = true;
+            self.draft_failed = false;
+            self.last_library = snapshot.data_path.clone();
+            self.drafts.load(&self.last_library);
+            self.selected_note = None;
+            self.selected_version = None;
+            self.reader_key.clear();
+            self.confirmation = None;
+            self.editor = None;
+            self.saving = false;
+            self.chosen_notes.clear();
+            self.chosen_versions.clear();
+            self.notified.clear();
+            self.interval.update(cx, |s, cx| {
+                s.set_value(snapshot.settings.interval_minutes.to_string(), window, cx)
+            });
+            self.deadline.update(cx, |s, cx| {
+                s.set_value(snapshot.settings.answer_minutes.to_string(), window, cx)
+            });
+            self.review_days.update(cx, |s, cx| {
+                s.set_value(
+                    snapshot
+                        .settings
+                        .review_days
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    window,
+                    cx,
+                )
+            });
+        }
+        for session in &snapshot.sessions {
+            if session.status == SessionStatus::Pending && self.notified.insert(session.id.clone())
+            {
+                cx.show_system_notification(SystemNotification {
+                    tag: session.id.clone().into(),
+                    title: "该回顾刚才的学习了".into(),
+                    body: format!(
+                        "请在 {} 分钟内记录学到了什么，未回答将记为未学习。",
+                        snapshot.settings.answer_minutes
+                    )
+                    .into(),
+                    actions: vec![],
+                });
+                if self.editor.is_none() {
+                    self.editor = Some(EditorMode::Pending(session.id.clone()));
+                    self.summary.update(cx, |s, cx| {
+                        s.set_value(session.suggested_summary.clone(), window, cx)
+                    });
+                    self.chosen_notes = session.note_ids.iter().cloned().collect();
+                    self.chosen_versions = session.version_ids.iter().cloned().collect();
+                    self.seed_versions(&snapshot, session.ended_at);
+                    self.page = Page::Today;
+                }
+            }
+        }
+        if self.selected_note.as_ref().is_none_or(|id| {
+            !snapshot
+                .notes
+                .iter()
+                .any(|n| &n.id == id && (!n.detached || self.selected_version.is_some()))
+        }) {
+            self.selected_note = snapshot
+                .notes
+                .iter()
+                .find(|n| !n.detached)
+                .map(|n| n.id.clone());
+            self.selected_version = None;
+        }
+        self.snapshot = Some(snapshot);
     }
 
     pub fn send(&mut self, command: Command, cx: &mut Context<Self>) {
@@ -310,6 +373,9 @@ impl StudyApp {
     }
 
     pub fn picker(&self, action: &'static str, note: Option<String>) {
+        if self.note_saving || self.draft_discard.is_some() {
+            return;
+        }
         let sender = self.worker.sender.clone();
         let library = self.last_library.clone();
         std::thread::spawn(move || {
@@ -485,32 +551,7 @@ impl StudyApp {
         self.selected_version = Some(version);
         self.history = false;
         self.page = Page::Notes;
-        self.refresh_preview();
         cx.notify();
-    }
-
-    pub fn refresh_preview(&mut self) {
-        let Some(snapshot) = &self.snapshot else {
-            return;
-        };
-        let version = snapshot.versions.iter().rev().find(|v| {
-            self.selected_note.as_ref() == Some(&v.note_id)
-                && self.selected_version.as_ref().is_none_or(|id| id == &v.id)
-        });
-        if let Some(version) = version {
-            if self.preview_key != version.id {
-                let text: String = version.content.chars().take(120_000).collect();
-                self.preview_html = safe_markdown_html(&text);
-                if text.len() < version.content.len() {
-                    self.preview_html
-                        .push_str("<p>预览显示前 120,000 字符，完整内容已保存在历史快照中。</p>");
-                }
-                self.preview_key = version.id.clone();
-            }
-        } else {
-            self.preview_html.clear();
-            self.preview_key.clear();
-        }
     }
 
     fn navigation(&self, cx: &mut Context<Self>) -> Div {
@@ -583,6 +624,8 @@ impl StudyApp {
 
 impl Render for StudyApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.prepare_document_view(window, cx);
+        let continuous = self.page == Page::Notes && (self.note_editor.is_some() || !self.history);
         let title = match self.page {
             Page::Today => "今天，学到了什么？",
             Page::Notes => "你的知识，持续生长",
@@ -703,7 +746,8 @@ impl Render for StudyApp {
                             .id("page-scroll")
                             .flex_1()
                             .min_h_0()
-                            .overflow_y_scroll()
+                            .when(!continuous, |c| c.overflow_y_scroll())
+                            .when(continuous, |c| c.overflow_hidden())
                             .p_8()
                             .children(notice)
                             .child(body),

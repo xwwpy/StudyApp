@@ -5,14 +5,19 @@ mod assets;
 mod components;
 mod credentials;
 mod drafts;
+mod editor_lifecycle;
 mod imports;
 mod markdown_editor;
 mod note_editor;
 mod notes_view;
 mod smoke;
+#[cfg(feature = "ui-test")]
+mod smoke_editor;
 mod sync_runtime;
 mod sync_ui;
 mod views;
+#[cfg(windows)]
+mod web_editor_host;
 mod worker;
 
 use gpui_kit::component::{Theme, ThemeMode};

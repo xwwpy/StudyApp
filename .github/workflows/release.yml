@@ -12,6 +12,8 @@ env:
   RUST_BACKTRACE: '1'
 
 jobs:
+  editor:
+    uses: ./.github/workflows/editor.yml
   core-sync:
     name: Core and sync (${{ matrix.os }})
     strategy:
@@ -33,7 +35,7 @@ jobs:
       - run: cargo test --locked -p studyapp-core -p studyapp-sync
 
   build:
-    needs: core-sync
+    needs: [core-sync, editor]
     runs-on: windows-latest
     timeout-minutes: 90
     defaults:

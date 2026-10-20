@@ -95,7 +95,10 @@ impl StudyApp {
                     ))
                     .child(metric(
                         "我的笔记",
-                        format!("{} 份", snapshot.notes.len()),
+                        format!(
+                            "{} 份",
+                            snapshot.notes.iter().filter(|n| !n.detached).count()
+                        ),
                         "导入后自动追踪文件更改",
                     )),
             )
@@ -200,7 +203,7 @@ impl StudyApp {
                 }),
             ));
         }
-        if snapshot.notes.is_empty() {
+        if snapshot.notes.iter().all(|n| n.detached) {
             content = content.child(card().child(heading("从一份笔记开始")).child(muted("导入正在学习的 Markdown 文件。文件改动会形成版本历史，并在回顾时提供学习摘要。"))
                 .child(Button::new("first-import").primary().label("选择 Markdown 笔记").on_click(cx.listener(|this, _, _, _| this.picker("import", None)))));
         }
@@ -281,19 +284,23 @@ impl StudyApp {
                 "关联学习笔记（可多选；摘要可以修改，只有提交后才算已学习）",
             ))
             .child(
-                row()
-                    .flex_wrap()
-                    .children(snapshot.notes.iter().map(|note| {
-                        let id = note.id.clone();
-                        let selected = self.chosen_notes.contains(&id);
-                        Checkbox::new(SharedString::from(format!("associate-{id}")))
-                            .label(note.title.clone())
-                            .checked(selected)
-                            .on_click(cx.listener(move |this, checked, _, cx| {
-                                this.toggle_note(&id, *checked);
-                                cx.notify();
-                            }))
-                    })),
+                row().flex_wrap().children(
+                    snapshot
+                        .notes
+                        .iter()
+                        .filter(|note| !note.detached || self.chosen_notes.contains(&note.id))
+                        .map(|note| {
+                            let id = note.id.clone();
+                            let selected = self.chosen_notes.contains(&id);
+                            Checkbox::new(SharedString::from(format!("associate-{id}")))
+                                .label(note.title.clone())
+                                .checked(selected)
+                                .on_click(cx.listener(move |this, checked, _, cx| {
+                                    this.toggle_note(&id, *checked);
+                                    cx.notify();
+                                }))
+                        }),
+                ),
             );
         if !self.chosen_notes.is_empty() {
             view = view

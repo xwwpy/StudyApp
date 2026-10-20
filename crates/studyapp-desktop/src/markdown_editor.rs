@@ -1,698 +1,451 @@
 use crate::components::*;
-use gpui_kit::{
-    component::{
-        Disableable, Selectable, Sizable,
-        button::{Button, ButtonVariants},
-        input::{Enter, Escape, InputEvent, Redo, Textarea, TextareaState, Undo},
-        text::TextView,
-    },
-    prelude::FluentBuilder,
-    *,
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
+use serde::Deserialize;
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
 };
-use std::{ops::Range, time::Instant};
-use studyapp_desktop::{
-    markdown::{MarkdownBlock, MarkdownBuffer, markdown_blocks},
-    markdown_format::{MarkdownFormat, format_markdown},
-};
-
-const LIVE_BYTES: usize = 256 * 1024;
-const LIVE_BLOCKS: usize = 500;
-const PREVIEW_BYTES: usize = 64 * 1024;
-const PREVIEW_LINES: usize = 400;
+use studyapp_desktop::editor_protocol::{EditPatch, EditorDocument};
 
 pub struct MarkdownChanged;
-
-/// Native inputs own caret, selection and IME. Only raw Markdown enters the
-/// buffer; rendered HTML is a disposable view, never a serialization format.
-pub struct MarkdownEditor {
-    buffer: MarkdownBuffer,
-    pub(crate) source_input: Entity<TextareaState>,
-    pub(crate) block_input: Entity<TextareaState>,
-    pub(crate) source_mode: bool,
-    blocks: Vec<MarkdownBlock>,
-    active: Option<(usize, Range<usize>)>,
-    pub(crate) live_html: String,
-    source_html: String,
-    readonly: bool,
-    limited: bool,
-    last_edit: Instant,
-    focus: FocusHandle,
+#[derive(Clone)]
+pub enum MarkdownEvent {
+    Save,
+    Flushed(u64),
+    Error(String),
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum Message {
+    Ready,
+    Change {
+        generation: u64,
+        #[serde(rename = "baseRevision")]
+        base: u64,
+        revision: u64,
+        changes: Vec<EditPatch>,
+    },
+    Flush {
+        generation: u64,
+        request: u64,
+        revision: u64,
+        #[serde(rename = "normalizedText")]
+        normalized_text: String,
+    },
+    Save {
+        generation: u64,
+    },
+    Error {
+        generation: Option<u64>,
+        message: String,
+    },
+    #[cfg(feature = "ui-test")]
+    Test {
+        request: serde_json::Value,
+        result: serde_json::Value,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// One continuous document lives in CodeMirror. Native persistence receives only
+/// revisioned text transactions; no Markdown/HTML parsing runs while typing.
+pub struct MarkdownEditor {
+    document: EditorDocument,
+    sender: mpsc::Sender<String>,
+    receiver: mpsc::Receiver<String>,
+    #[cfg(windows)]
+    host: Option<crate::web_editor_host::HostedEditor>,
+    creating: bool,
+    ready: bool,
+    visible: bool,
+    readonly: bool,
+    resume_readonly: bool,
+    error: Option<String>,
+    pending: Option<(u64, Instant)>,
+    recovering: bool,
+    request: u64,
+    #[cfg(feature = "ui-test")]
+    pub(crate) test_results: std::collections::HashMap<String, serde_json::Value>,
+    _poll: Task<()>,
+}
 impl EventEmitter<MarkdownChanged> for MarkdownEditor {}
+impl EventEmitter<MarkdownEvent> for MarkdownEditor {}
 
 impl MarkdownEditor {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let source_input =
-            cx.new(|cx| TextareaState::new(window, cx).placeholder("在这里输入完整 Markdown…"));
-        let block_input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(2, 16)
-                .placeholder("开始写作，支持 Markdown…")
-        });
-        for (input, source) in [(&source_input, true), (&block_input, false)] {
-            cx.subscribe_in(input, window, move |this, _, event, _, cx| {
-                if matches!(event, InputEvent::Change | InputEvent::Blur) {
-                    this.accept_input(source, cx);
+        let (sender, receiver) = mpsc::channel();
+        let poll = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(25))
+                    .await;
+                if this.update_in(cx, |this, _, cx| this.poll(cx)).is_err() {
+                    break;
                 }
-            })
-            .detach();
-        }
+            }
+        });
         Self {
-            buffer: MarkdownBuffer::new(String::new()),
-            source_input,
-            block_input,
-            source_mode: false,
-            blocks: Vec::new(),
-            active: None,
-            live_html: String::new(),
-            source_html: String::new(),
+            document: EditorDocument::new(String::new()),
+            sender,
+            receiver,
+            #[cfg(windows)]
+            host: None,
+            creating: false,
+            ready: false,
+            visible: false,
             readonly: false,
-            limited: false,
-            last_edit: Instant::now(),
-            focus: cx.focus_handle(),
+            resume_readonly: false,
+            error: None,
+            pending: None,
+            recovering: false,
+            request: 0,
+            #[cfg(feature = "ui-test")]
+            test_results: Default::default(),
+            _poll: poll,
         }
     }
 
     pub fn value(&self) -> &str {
-        self.buffer.text()
+        self.document.text()
+    }
+    pub fn ready(&self) -> bool {
+        self.ready && self.error.is_none()
+    }
+    pub fn creating(&self) -> bool {
+        self.creating
+    }
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
-    pub fn set_value(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.buffer = MarkdownBuffer::new(value);
-        self.active = None;
-        self.source_mode = false;
+    pub fn set_value(&mut self, value: String, _window: &mut Window, cx: &mut Context<Self>) {
+        self.document.reset(value);
         self.readonly = false;
-        self.set_readonly(false, cx);
-        self.rebuild();
-        self.source_input.update(cx, |s, cx| {
-            s.set_value(self.buffer.text().to_owned(), window, cx)
-        });
-        if self.limited {
-            self.source_mode = true;
-        } else if self.buffer.text().is_empty() {
-            self.activate(0, 0..0, window, cx);
+        self.resume_readonly = false;
+        self.pending = None;
+        self.recovering = false;
+        // A protocol failure can be recovered only by explicitly loading a
+        // document again. A runtime creation failure remains visible.
+        if self.ready {
+            self.error = None;
+            self.load(cx);
         }
         cx.notify();
+    }
+
+    fn evaluate(&self, script: &str) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        if let Some(host) = &self.host {
+            return host.evaluate(script);
+        }
+        anyhow::bail!("编辑器尚未准备好")
+    }
+
+    fn load(&mut self, cx: &mut Context<Self>) {
+        let payload = serde_json::json!({"generation": self.document.generation(), "text": self.document.text(), "readonly": self.readonly});
+        if let Err(error) = self.evaluate(&format!("window.studyappEditor.load({payload});")) {
+            self.fail(format!("无法载入编辑器：{error:#}"), cx);
+        }
     }
 
     pub fn set_readonly(&mut self, readonly: bool, cx: &mut Context<Self>) {
         self.readonly = readonly;
-        // Apply immediately as well as in render, so pending key events cannot
-        // change the document after a version has been submitted.
-        for input in [&self.source_input, &self.block_input] {
-            input.update(cx, |s, cx| s.set_readonly(readonly, cx));
+        self.resume_readonly = readonly;
+        if self.ready
+            && self.error.is_none()
+            && let Err(error) =
+                self.evaluate(&format!("window.studyappEditor.setReadonly({readonly});"))
+        {
+            self.fail(format!("无法更新编辑状态：{error:#}"), cx);
         }
         cx.notify();
     }
 
-    /// An explicit save/mode change commits the visible native composition
-    /// before reading the canonical buffer. GPUI's unmark-only IME path does
-    /// not emit Change, so event subscriptions alone are insufficient.
-    pub fn flush(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.readonly {
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible == visible {
             return;
         }
-        let input = if self.source_mode {
-            &self.source_input
-        } else {
-            &self.block_input
-        };
-        input.update(cx, |s, cx| s.unmark_text(window, cx));
-        self.accept_input(self.source_mode, cx);
+        self.visible = visible;
+        #[cfg(windows)]
+        if let Some(host) = &self.host
+            && let Err(error) = host.set_visible(visible && self.ready)
+        {
+            self.fail(format!("无法显示编辑区：{error:#}"), cx);
+        }
+        cx.notify();
     }
 
-    fn accept_input(&mut self, source: bool, cx: &mut Context<Self>) {
-        if self.readonly || source != self.source_mode {
-            return;
-        }
-        let (range, text) = if source {
-            (
-                0..self.buffer.text().len(),
-                self.source_input.read(cx).value().to_string(),
-            )
-        } else if let Some((_, range)) = &self.active {
-            (range.clone(), self.block_input.read(cx).value().to_string())
+    /// The caller records its intent before this acknowledgement is dispatched.
+    /// Saving, navigation and close must wait for MarkdownEvent::Flushed.
+    pub fn request_flush(&mut self, cx: &mut Context<Self>) -> anyhow::Result<u64> {
+        anyhow::ensure!(self.pending.is_none(), "正在确认最后的输入，请稍候");
+        anyhow::ensure!(
+            self.error.is_none() || !self.ready,
+            "编辑状态异常，当前内容已保留，请先恢复编辑器"
+        );
+        self.request = self.request.wrapping_add(1).max(1);
+        let request = self.request;
+        if !self.ready {
+            // The HWND stays hidden until ready. No browser input can exist yet.
+            self.readonly = true;
+            cx.emit(MarkdownEvent::Flushed(request));
         } else {
-            return;
-        };
-        if self.last_edit.elapsed().as_millis() > 750 {
-            self.buffer.checkpoint();
-        }
-        self.last_edit = Instant::now();
-        if !self.buffer.replace(range.clone(), &text) {
-            return;
-        }
-        if source {
-            // Re-evaluate the limit after edits so shortening a large document
-            // enables live mode again without reopening the note.
-            self.rebuild();
-        } else {
-            if let Some((_, active)) = &mut self.active {
-                active.end = active.start + text.len();
+            self.pending = Some((request, Instant::now()));
+            if let Err(error) = self.evaluate(&format!(
+                "window.studyappEditor.flush({{request:{request}}});"
+            )) {
+                self.pending = None;
+                return Err(error);
             }
-            // Keep the active input entity and range stable until the user
-            // leaves it; an unfinished fence must not steal the IME/caret.
-            self.live_html =
-                active_preview(self.buffer.text(), &(range.start..range.start + text.len()));
         }
-        cx.emit(MarkdownChanged);
+        Ok(request)
+    }
+
+    fn fail(&mut self, message: String, cx: &mut Context<Self>) {
+        self.pending = None;
+        self.recovering = false;
+        self.error = Some(message.clone());
+        self.readonly = true;
+        if self.ready {
+            let _ = self.evaluate("window.studyappEditor.setReadonly(true);");
+        }
+        cx.emit(MarkdownEvent::Error(message));
         cx.notify();
     }
 
-    fn rebuild(&mut self) {
-        self.limited = self.buffer.text().len() > LIVE_BYTES;
-        self.blocks = if self.limited {
-            Vec::new()
-        } else {
-            markdown_blocks(self.buffer.text())
-        };
-        if self.blocks.len() > LIVE_BLOCKS
-            || self
-                .blocks
-                .iter()
-                .any(|b| preview_end(&self.buffer.text()[b.range.clone()]) < b.range.len())
-        {
-            self.limited = true;
-            self.blocks.clear();
-        }
-        self.source_html =
-            if self.limited || preview_end(self.buffer.text()) < self.buffer.text().len() {
-                preview(self.buffer.text())
-            } else {
-                self.blocks.iter().map(|b| b.html.as_str()).collect()
+    fn poll(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for _ in 0..256 {
+            let Ok(json) = self.receiver.try_recv() else {
+                break;
             };
-    }
-
-    fn activate(
-        &mut self,
-        index: usize,
-        range: Range<usize>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.readonly {
-            return;
+            let result = (|| -> anyhow::Result<()> {
+                match serde_json::from_str::<Message>(&json)? {
+                    Message::Ready => {
+                        if self.ready {
+                            return Ok(());
+                        }
+                        self.ready = true;
+                        self.load(cx);
+                        cx.notify();
+                    }
+                    Message::Change {
+                        generation,
+                        base,
+                        revision,
+                        changes,
+                    } => {
+                        if self.error.is_some() || self.recovering {
+                            return Ok(());
+                        }
+                        changed |= self.document.apply(generation, base, revision, &changes)?;
+                    }
+                    Message::Flush {
+                        generation,
+                        request,
+                        revision,
+                        normalized_text,
+                    } => {
+                        if generation != self.document.generation()
+                            || self.pending.as_ref().is_none_or(|(id, _)| *id != request)
+                        {
+                            return Ok(());
+                        }
+                        if self.recovering {
+                            self.document.recover(&normalized_text)?;
+                            self.pending = None;
+                            self.recovering = false;
+                            self.readonly = self.resume_readonly;
+                            self.error = None;
+                            self.load(cx);
+                            changed = true;
+                            cx.notify();
+                            return Ok(());
+                        }
+                        self.document
+                            .verify_flush(generation, revision, &normalized_text)?;
+                        self.pending = None;
+                        self.readonly = true;
+                        cx.emit(MarkdownEvent::Flushed(request));
+                    }
+                    Message::Save { generation } => {
+                        if generation == self.document.generation() && !self.readonly {
+                            cx.emit(MarkdownEvent::Save);
+                        }
+                    }
+                    Message::Error {
+                        generation,
+                        message,
+                    } => {
+                        if generation.is_none_or(|g| g == self.document.generation()) {
+                            anyhow::bail!("{message}");
+                        }
+                    }
+                    #[cfg(feature = "ui-test")]
+                    Message::Test { request, result } => {
+                        self.test_results.insert(
+                            request
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| request.to_string()),
+                            result,
+                        );
+                    }
+                    Message::Other => {}
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.fail(
+                    format!("编辑器同步失败：{error:#}。已保存的版本未被覆盖。"),
+                    cx,
+                );
+            }
         }
-        self.buffer.checkpoint();
-        let text = self.buffer.text()[range.clone()].to_owned();
-        self.live_html = active_preview(self.buffer.text(), &range);
-        self.active = Some((index, range));
-        self.block_input.update(cx, |s, cx| {
-            s.set_value(text, window, cx);
-            s.focus(window, cx);
-        });
-        cx.notify();
-    }
-
-    fn finish(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.flush(window, cx);
-        self.active = None;
-        self.buffer.checkpoint();
-        self.rebuild();
-        if self.limited {
-            self.source_mode = true;
-            self.source_input.update(cx, |s, cx| {
-                s.set_value(self.buffer.text().to_owned(), window, cx);
-                s.focus(window, cx);
-            });
-        } else {
-            window.focus(&self.focus, cx);
-        }
-        cx.notify();
-    }
-
-    fn switch_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.finish(window, cx);
-        if self.limited {
-            return;
-        }
-        self.source_mode = !self.source_mode;
-        if self.source_mode {
-            self.source_input.update(cx, |s, cx| {
-                s.set_value(self.buffer.text().to_owned(), window, cx);
-                s.focus(window, cx);
-            });
-        }
-        cx.notify();
-    }
-
-    fn edit_block(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active.as_ref().is_some_and(|(i, _)| *i == index) {
-            return;
-        }
-        // Composition can change the active length without a Change event.
-        // Commit it while the old block partition is still available.
-        self.flush(window, cx);
-        // Map the clicked, still-visible block through the active edit before
-        // rebuilding. Its old byte offset may have moved or merged.
-        let Some(block) = self.blocks.get(index) else {
-            return;
-        };
-        let mut offset = block.range.start;
-        if let Some((active_index, active_range)) = &self.active
-            && index > *active_index
-        {
-            let old_length = self.blocks[*active_index].range.len();
-            offset = offset - old_length + active_range.len();
-        }
-        self.finish(window, cx);
-        if !self.source_mode
-            && let Some((index, block)) = self
-                .blocks
-                .iter()
-                .enumerate()
-                .find(|(_, b)| b.range.contains(&offset))
-        {
-            self.activate(index, block.range.clone(), window, cx);
-        }
-    }
-
-    fn append(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.readonly {
-            return;
-        }
-        self.finish(window, cx);
-        if self.source_mode {
-            return;
-        }
-        let end = self.buffer.text().len();
-        // The separator is editable and undoable with the new paragraph.
-        let separator = if end == 0 || self.buffer.text().ends_with("\n\n") {
-            ""
-        } else if self.buffer.text().ends_with('\n') {
-            "\n"
-        } else {
-            "\n\n"
-        };
-        self.activate(self.blocks.len(), end..end, window, cx);
-        self.block_input.update(cx, |s, cx| {
-            s.replace_all(separator, window, cx);
-            let end = s.value().len();
-            s.set_selected_range(end..end, cx);
-        });
-        self.accept_input(false, cx);
-    }
-
-    fn history(&mut self, redo: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.readonly {
-            return;
-        }
-        self.accept_input(self.source_mode, cx);
-        let changed = if redo {
-            self.buffer.redo()
-        } else {
-            self.buffer.undo()
-        };
         if changed {
-            self.active = None;
-            self.rebuild();
-            self.source_mode |= self.limited;
-            self.source_input.update(cx, |s, cx| {
-                s.set_value(self.buffer.text().to_owned(), window, cx);
-                if self.source_mode {
-                    s.focus(window, cx);
+            cx.emit(MarkdownChanged);
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(12))
+        {
+            self.fail(
+                "等待输入法完成超时，内容仍保留；请结束组合输入后重新打开草稿。".into(),
+                cx,
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    fn ensure_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.host.is_some() || self.creating || self.error.is_some() || !self.visible {
+            return;
+        }
+        let parent = match crate::web_editor_host::ParentWindow::capture(window) {
+            Ok(parent) => parent,
+            Err(error) => {
+                self.fail(format!("无法创建编辑窗口：{error:#}"), cx);
+                return;
+            }
+        };
+        let profile = if cfg!(feature = "ui-test") {
+            std::env::temp_dir().join(format!("studyapp-editor-test-{}", std::process::id()))
+        } else {
+            directories::ProjectDirs::from("io", "StudyApp", "StudyApp")
+                .map(|p| p.cache_dir().join("editor"))
+                .unwrap_or_else(|| std::env::temp_dir().join("studyapp-editor"))
+        };
+        let sender = self.sender.clone();
+        self.creating = true;
+        cx.spawn(async move |this, cx| {
+            // Wry pumps Windows messages. Absolutely no GPUI App/entity borrow
+            // may be held during the constructor (including a render callback).
+            cx.background_executor().timer(Duration::from_millis(1)).await;
+            #[cfg(feature = "ui-test")]
+            eprintln!("native editor: creating WebView");
+            let result = crate::web_editor_host::HostedEditor::new(parent, sender, profile);
+            #[cfg(feature = "ui-test")]
+            eprintln!("native editor: constructor finished");
+            let _ = this.update(cx, |this, cx| {
+                this.creating = false;
+                match result {
+                    Ok(host) => { this.host = Some(host); cx.notify(); }
+                    Err(error) => this.fail(format!("连续编辑器启动失败：{error:#}。请确认 Microsoft Edge WebView2 Runtime 已安装。"), cx),
                 }
             });
-            if !self.source_mode {
-                window.focus(&self.focus, cx);
-            }
-            cx.emit(MarkdownChanged);
-            cx.notify();
-        }
+        }).detach();
     }
 
-    fn format(&mut self, kind: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.readonly {
-            return;
-        }
-        if !self.source_mode && self.active.is_none() {
-            self.append(window, cx);
-        }
-        self.flush(window, cx);
-        self.buffer.checkpoint();
-        let input = if self.source_mode {
-            self.source_input.clone()
-        } else {
-            self.block_input.clone()
-        };
-        input.update(cx, |s, cx| {
-            let kind = match kind {
-                "bold" => MarkdownFormat::Bold,
-                "italic" => MarkdownFormat::Italic,
-                "heading" => MarkdownFormat::Heading,
-                "list" => MarkdownFormat::List,
-                "quote" => MarkdownFormat::Quote,
-                "code" => MarkdownFormat::Code,
-                "table" => MarkdownFormat::Table,
-                _ => return,
-            };
-            if let Some(edit) = format_markdown(&s.value(), s.selected_range(), kind) {
-                s.set_selected_range(edit.range, cx);
-                s.replace(edit.replacement, window, cx);
-                s.set_selected_range(edit.selection, cx);
-                s.focus(window, cx);
-            }
-        });
-        self.accept_input(self.source_mode, cx);
-        self.buffer.checkpoint();
+    #[cfg(feature = "ui-test")]
+    pub(crate) fn test(&self, action: serde_json::Value) -> anyhow::Result<()> {
+        self.evaluate(&format!("window.studyappEditor.test({action});"))
+    }
+    #[cfg(feature = "ui-test")]
+    pub(crate) fn inject_test_error(&self, stale: bool) {
+        let generation = self.document.generation() + u64::from(stale);
+        self.sender
+            .send(
+                serde_json::json!({
+                    "type":"error", "generation":generation, "message":"模拟可恢复的输入确认失败"
+                })
+                .to_string(),
+            )
+            .unwrap();
     }
 
-    fn composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let input = if self.source_mode {
-            &self.source_input
-        } else {
-            &self.block_input
-        };
-        input.update(cx, |s, cx| s.marked_text_range(window, cx).is_some())
+    #[cfg(all(windows, feature = "ui-test"))]
+    pub(crate) fn capture_png(
+        &self,
+        path: std::path::PathBuf,
+    ) -> anyhow::Result<mpsc::Receiver<Result<(), String>>> {
+        self.host
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WebView 尚未创建"))?
+            .capture_png(path)
     }
-}
-
-fn preview(text: &str) -> String {
-    let end = preview_end(text);
-    markdown_blocks(&text[..end])
-        .into_iter()
-        .take(LIVE_BLOCKS)
-        .map(|b| b.html)
-        .collect()
-}
-
-fn preview_end(text: &str) -> usize {
-    let mut end = text.len().min(PREVIEW_BYTES);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    if let Some((offset, _)) = text[..end].match_indices('\n').nth(PREVIEW_LINES) {
-        end = offset;
-    }
-    end
-}
-
-fn active_preview(text: &str, range: &Range<usize>) -> String {
-    if text.len() > LIVE_BYTES || preview_end(&text[range.clone()]) < range.len() {
-        return preview(&text[range.clone()]);
-    }
-    markdown_blocks(text)
-        .into_iter()
-        .filter(|b| b.range.start < range.end && b.range.end > range.start)
-        .take(LIVE_BLOCKS)
-        .map(|b| b.html)
-        .collect()
 }
 
 impl Render for MarkdownEditor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let toolbar = row()
-            .gap_1()
-            .flex_wrap()
-            .pb_2()
-            .border_b_1()
-            .border_color(rgb(BORDER))
-            .children(
-                [
-                    ("heading", "标题"),
-                    ("bold", "粗体"),
-                    ("italic", "斜体"),
-                    ("list", "列表"),
-                    ("quote", "引用"),
-                    ("code", "代码"),
-                    ("table", "表格"),
-                ]
-                .into_iter()
-                .map(|(kind, label)| {
-                    Button::new(SharedString::from(format!("md-{kind}")))
-                        .small()
-                        .ghost()
-                        .disabled(self.readonly)
-                        .label(label)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.format(kind, window, cx);
-                        }))
-                }),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("md-undo")
-                    .small()
-                    .ghost()
-                    .label("撤销")
-                    .disabled(self.readonly || !self.buffer.can_undo())
-                    .on_click(cx.listener(|this, _, window, cx| this.history(false, window, cx))),
-            )
-            .child(
-                Button::new("md-redo")
-                    .small()
-                    .ghost()
-                    .label("重做")
-                    .disabled(self.readonly || !self.buffer.can_redo())
-                    .on_click(cx.listener(|this, _, window, cx| this.history(true, window, cx))),
-            )
-            .child(
-                Button::new("md-source-toggle")
-                    .small()
-                    .ghost()
-                    .selected(self.source_mode)
-                    .disabled(self.readonly || self.limited)
-                    .label(if self.source_mode {
-                        "即时编辑"
-                    } else {
-                        "</> 源码"
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| this.switch_mode(window, cx))),
-            );
-        let mut body = column()
-            .id("md-scroll")
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(windows)]
+        self.ensure_host(window, cx);
+        let weak = cx.weak_entity();
+        column()
+            .id("continuous-markdown-editor")
             .flex_1()
             .min_h_0()
-            .gap_2()
-            .overflow_y_scroll()
-            .px_3()
-            .py_2();
-        if self.source_mode {
-            body = body
-                .when(
-                    self.limited || preview_end(self.buffer.text()) < self.buffer.text().len(),
-                    |v| {
-                        v.child(muted(
-                            "长文档预览仅显示开头；源码可完整编辑，保存包含全部内容。",
-                        ))
-                    },
-                )
-                .child(
-                    div()
-                        .id("md-source-input")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.source_input.update(cx, |s, cx| s.focus(window, cx));
-                        }))
-                        .child(
-                            Textarea::new(&self.source_input)
-                                .aria_label("Markdown 全文源码")
-                                .readonly(self.readonly)
-                                .h(px(260.)),
-                        )
-                        .test_support(),
-                )
-                .child(muted("实时预览"))
-                .child(
-                    TextView::html("md-source-preview", self.source_html.clone()).scrollable(false),
-                );
-        } else {
-            for (index, block) in self.blocks.iter().enumerate() {
-                if self.active.as_ref().is_some_and(|(i, _)| *i == index) {
-                    body = body.child(self.active_view(cx));
-                } else {
-                    body = body.child(
-                        div()
-                            .id(("md-block", index))
-                            .rounded_md()
-                            .p_2()
-                            .min_h(px(30.))
-                            .cursor_text()
-                            .hover(|s| s.bg(rgb(0xF4F8F4)))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.edit_block(index, window, cx);
-                            }))
-                            .when(block.html.trim().is_empty(), |v| {
-                                v.child(muted("空行 / Markdown 定义 · 点击编辑"))
-                            })
-                            .when(!block.html.trim().is_empty(), |v| {
-                                v.child(
-                                    TextView::html(("md-rendered", index), block.html.clone())
-                                        .selectable(false)
-                                        .scrollable(false),
-                                )
-                            })
-                            .test_support(),
-                    );
-                }
-            }
-            if self
-                .active
-                .as_ref()
-                .is_some_and(|(i, _)| *i >= self.blocks.len())
-            {
-                body = body.child(self.active_view(cx));
-            }
-            body = body.child(
-                Button::new("md-append")
-                    .ghost()
-                    .disabled(self.readonly)
-                    .label("+ 继续写作")
-                    .on_click(cx.listener(|this, _, window, cx| this.append(window, cx))),
-            );
-        }
-        column()
-            .id("live-markdown-editor")
-            .track_focus(&self.focus)
-            .tab_index(0)
-            .gap_2()
-            .h(px(480.))
             .min_w_0()
-            // GPUI resolves native input actions before raw key listeners.
-            // Capture them here so undo spans blocks and source mode alike.
-            .capture_action(cx.listener(|this, _: &Undo, window, cx| {
-                if !this.composing(window, cx) {
-                    this.history(false, window, cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .capture_action(cx.listener(|this, _: &Redo, window, cx| {
-                if !this.composing(window, cx) {
-                    this.history(true, window, cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                if !this.source_mode && !this.composing(window, cx) {
-                    this.finish(window, cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .capture_action(cx.listener(|this, action: &Enter, window, cx| {
-                if action.secondary && !this.source_mode && !this.composing(window, cx) {
-                    this.finish(window, cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                let key = event.keystroke.key.as_str();
-                let control =
-                    event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
-                if this.composing(window, cx) {
-                    return;
-                }
-                if control && key.eq_ignore_ascii_case("z") {
-                    this.history(event.keystroke.modifiers.shift, window, cx);
-                } else if control && key.eq_ignore_ascii_case("y") {
-                    this.history(true, window, cx);
-                } else if control && key.eq_ignore_ascii_case("b") {
-                    this.format("bold", window, cx);
-                } else if control && key.eq_ignore_ascii_case("i") {
-                    this.format("italic", window, cx);
-                } else if !this.source_mode && (key == "escape" || (control && key == "enter")) {
-                    this.finish(window, cx);
-                } else {
-                    return;
-                }
-                cx.stop_propagation();
-            }))
-            .child(toolbar)
-            .child(body)
-            .child(
-                row()
-                    .justify_between()
-                    .child(muted(if self.source_mode {
-                        "全文源码 · 预览随输入更新"
-                    } else {
-                        "点击段落编辑 · Esc / Ctrl+Enter 收起 · Ctrl+B 粗体"
-                    }))
-                    .child(muted(format!(
-                        "{} 字符",
-                        self.buffer.text().chars().count()
-                    ))),
-            )
-    }
-}
-
-impl MarkdownEditor {
-    fn active_view(&self, cx: &mut Context<Self>) -> Div {
-        let truncated = self.active.as_ref().is_some_and(|(_, range)| {
-            preview_end(&self.buffer.text()[range.clone()]) < range.len()
-        });
-        column()
-            .gap_2()
-            .border_l_2()
-            .border_color(rgb(GREEN))
-            .pl_3()
-            .py_2()
-            .child(
-                row().child(muted("正在编辑")).child(div().flex_1()).child(
-                    Button::new("md-finish")
-                        .small()
-                        .ghost()
-                        .label("完成本段")
-                        .disabled(self.readonly)
-                        .on_click(cx.listener(|this, _, window, cx| this.finish(window, cx))),
-                ),
-            )
-            .when(self.buffer.text().len() > LIVE_BYTES, |v| {
-                v.child(muted(
-                    "预览已限制长度；完成本段后进入完整源码模式，原文不会截断。",
-                ))
+            .when(self.error.is_some(), |c| {
+                c.child(muted(self.error.clone().unwrap_or_default()))
+                    .when(self.ready, |c| {
+                        c.child(
+                            Button::new("recover-editor-bridge")
+                                .primary()
+                                .label("重试同步并恢复输入")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.error = None;
+                                    this.recovering = true;
+                                    if let Err(error) = this.request_flush(cx) {
+                                        this.fail(error.to_string(), cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
+            })
+            .when(!self.ready && self.error.is_none(), |c| {
+                c.child(muted("正在准备连续编辑器…"))
             })
             .child(
-                div()
-                    .id("md-block-input")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.block_input.update(cx, |s, cx| s.focus(window, cx));
-                    }))
-                    .child(
-                        Textarea::new(&self.block_input)
-                            .aria_label("当前段落 Markdown")
-                            .readonly(self.readonly)
-                            .appearance(false)
-                            .bordered(false),
-                    )
-                    .test_support(),
+                canvas(
+                    move |bounds, window, cx| {
+                        let bounds = bounds.intersect(&window.content_mask().bounds);
+                        let _ = weak.update(cx, |this, cx| {
+                            #[cfg(windows)]
+                            if let Some(host) = &this.host {
+                                let result = host.set_bounds(bounds).and_then(|()| {
+                                    host.set_visible(
+                                        this.visible
+                                            && this.ready
+                                            && bounds.size.width > px(0.)
+                                            && bounds.size.height > px(0.),
+                                    )
+                                });
+                                if let Err(error) = result {
+                                    this.fail(format!("编辑器布局失败：{error:#}"), cx);
+                                }
+                            }
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .size_full()
+                .min_h(px(180.)),
             )
-            .child(
-                div()
-                    .id("md-live-preview")
-                    .bg(rgb(0xF7FAF7))
-                    .rounded_md()
-                    .p_3()
-                    .child(muted(if truncated {
-                        "实时预览 · 仅显示开头，原文完整保留"
-                    } else {
-                        "实时预览"
-                    }))
-                    .child(
-                        TextView::html("md-active-rendered", self.live_html.clone())
-                            .scrollable(false),
-                    ),
-            )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[::core::prelude::v1::test]
-    fn active_preview_resolves_definitions_outside_edited_block() {
-        let source = "[visible][ref]\n\nnext\n\n[ref]: https://example.org\n";
-        let blocks = markdown_blocks(source);
-        assert_eq!(active_preview(source, &blocks[0].range), "<p>visible</p>\n");
-    }
-
-    #[::core::prelude::v1::test]
-    fn preview_bounds_multibyte_text_and_many_lines_without_touching_source() {
-        let source = format!("{}最后", "中文\n".repeat(40_000));
-        let result = preview(&source);
-        assert!(!result.contains("最后"));
-        assert!(result.len() < 16_000);
-        assert!(source.ends_with("最后"));
-        let source = "中".repeat(PREVIEW_BYTES);
-        assert!(source.is_char_boundary(preview_end(&source)));
     }
 }

@@ -16,25 +16,75 @@ use studyapp_core::Command;
 
 impl StudyApp {
     pub fn capture_note_draft(&mut self, cx: &mut Context<Self>) {
+        self.draft_dirty_since = None;
         if let Some(draft) = self.note_editor.as_mut() {
             draft.title = self.note_title.read(cx).value().to_string();
             draft.content = self.note_content.read(cx).value().to_string();
             self.drafts.save(&self.last_library, Some(draft.clone()));
         }
-        cx.notify();
     }
 
-    pub fn poll_drafts(&mut self, cx: &mut Context<Self>) -> bool {
+    pub fn poll_drafts(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         while let Ok(update) = self.drafts.receiver.try_recv() {
             match update {
                 DraftUpdate::Loaded(path, draft)
-                    if path == DraftStore::path(&self.last_library) =>
+                    if path == DraftStore::path(&self.last_library)
+                        && self.draft_discard.is_none()
+                        && self.note_editor.is_none() =>
                 {
                     self.draft_loading = false;
                     self.recoverable_draft = draft;
                 }
                 DraftUpdate::Loaded(_, _) => {}
+                DraftUpdate::Persisted(path, token) => {
+                    if self
+                        .draft_persist
+                        .as_ref()
+                        .is_some_and(|p| p.token == token && path == DraftStore::path(&p.library))
+                    {
+                        let pending = self.draft_persist.take().expect("matching persist");
+                        self.finish_draft_persist(pending.intent, window, cx);
+                    }
+                }
+                DraftUpdate::PersistFailed(path, token, error) => {
+                    if self
+                        .draft_persist
+                        .as_ref()
+                        .is_some_and(|p| p.token == token && path == DraftStore::path(&p.library))
+                    {
+                        self.draft_persist = None;
+                        self.note_saving = false;
+                        self.draft_failed = true;
+                        self.close_requested = false;
+                        self.note_content
+                            .update(cx, |editor, cx| editor.set_readonly(false, cx));
+                        self.notice =
+                            Some(Err(format!("{error}；窗口及编辑内容已保留，请重试保存。")));
+                    }
+                }
+                DraftUpdate::Discarded(path, token) => {
+                    if self.draft_discard.as_ref().is_some_and(|pending| {
+                        pending.token == token && path == DraftStore::path(&pending.library)
+                    }) {
+                        self.draft_discard = None;
+                        self.draft_failed = false;
+                        self.notice = Some(Ok("草稿已删除，原笔记和历史版本已保留。".into()));
+                        self.finish_library_transition(window, cx);
+                    }
+                }
+                DraftUpdate::DiscardFailed(path, token, error) => {
+                    if self.draft_discard.as_ref().is_some_and(|pending| {
+                        pending.token == token && path == DraftStore::path(&pending.library)
+                    }) {
+                        let pending = self.draft_discard.take().expect("matching discard");
+                        if let Some(draft) = pending.draft {
+                            self.start_note_draft(draft, window, cx);
+                        }
+                        self.close_requested = false;
+                        self.notice = Some(Err(format!("{error}；草稿内容仍可恢复。")));
+                    }
+                }
                 DraftUpdate::Error(path, error) if path == DraftStore::path(&self.last_library) => {
                     self.draft_loading = false;
                     self.draft_failed = true;
@@ -51,23 +101,33 @@ impl StudyApp {
     }
 
     fn start_note_draft(&mut self, draft: NoteDraft, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirmation = None;
         self.note_title
             .update(cx, |s, cx| s.set_value(draft.title.clone(), window, cx));
         self.note_content
             .update(cx, |s, cx| s.set_value(draft.content.clone(), window, cx));
         self.note_editor = Some(draft);
+        self.reader_key.clear();
+        self.history = false;
         self.note_saving = false;
         self.page = Page::Notes;
         self.capture_note_draft(cx);
     }
 
     pub fn open_note_editor(&mut self, copy: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirmation.is_some() {
+            return;
+        }
         self.page = Page::Notes;
         if self.note_editor.is_some() {
             cx.notify();
             return;
         }
-        if self.draft_loading || self.draft_failed || self.recoverable_draft.is_some() {
+        if self.draft_loading
+            || self.draft_failed
+            || self.recoverable_draft.is_some()
+            || self.draft_discard.is_some()
+        {
             self.notice = Some(Err(
                 "请先恢复未保存草稿，保存或保留草稿后再开始另一份笔记。".into(),
             ));
@@ -78,8 +138,11 @@ impl StudyApp {
             let note = s
                 .notes
                 .iter()
-                .find(|n| Some(&n.id) == self.selected_note.as_ref())?;
-            let version = s.versions.iter().rev().find(|v| v.note_id == note.id)?;
+                .find(|n| Some(&n.id) == self.selected_note.as_ref() && (!n.detached || copy))?;
+            let version = s.versions.iter().rev().find(|v| {
+                v.note_id == note.id
+                    && (!copy || self.selected_version.as_ref().is_none_or(|id| id == &v.id))
+            })?;
             Some(NoteDraft {
                 note_id: (!copy).then(|| note.id.clone()),
                 expected_hash: (!copy).then(|| version.hash.clone()),
@@ -97,11 +160,15 @@ impl StudyApp {
     }
 
     pub fn new_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirmation.is_some() {
+            return;
+        }
         self.page = Page::Notes;
         if self.note_editor.is_some()
             || self.draft_loading
             || self.draft_failed
             || self.recoverable_draft.is_some()
+            || self.draft_discard.is_some()
         {
             self.notice = Some(Err("已有未保存的笔记，请先恢复或保存草稿。".into()));
             cx.notify();
@@ -121,6 +188,8 @@ impl StudyApp {
 
     pub fn recover_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.note_editor.is_none()
+            && self.confirmation.is_none()
+            && self.draft_discard.is_none()
             && let Some(draft) = self.recoverable_draft.take()
         {
             self.start_note_draft(draft, window, cx);
@@ -128,12 +197,14 @@ impl StudyApp {
     }
 
     pub fn save_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.note_saving {
-            return;
-        }
-        self.note_content
-            .update(cx, |editor, cx| editor.flush(window, cx));
-        self.capture_note_draft(cx);
+        self.request_note_action(
+            crate::editor_lifecycle::NoteIntent::Save { copy: false },
+            window,
+            cx,
+        );
+    }
+
+    pub fn commit_note(&mut self, cx: &mut Context<Self>) {
         let Some(draft) = self.note_editor.clone() else {
             return;
         };
@@ -160,6 +231,8 @@ impl StudyApp {
         let view = card()
             .id("note-editor")
             .flex_1()
+            .min_h_0()
+            .h_full()
             .min_w_0()
             .child(
                 row()
@@ -192,12 +265,11 @@ impl StudyApp {
                                 .disabled(self.note_saving)
                                 .label("另存新笔记")
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.capture_note_draft(cx);
-                                    if let Some(draft) = this.note_editor.as_mut() {
-                                        draft.note_id = None;
-                                        draft.expected_hash = None;
-                                    }
-                                    this.save_note(window, cx);
+                                    this.request_note_action(
+                                        crate::editor_lifecycle::NoteIntent::Save { copy: true },
+                                        window,
+                                        cx,
+                                    );
                                 })),
                         )
                     })
@@ -208,10 +280,22 @@ impl StudyApp {
                             .disabled(self.note_saving)
                             .label("保留草稿并返回")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.note_content
-                                    .update(cx, |editor, cx| editor.flush(window, cx));
-                                this.capture_note_draft(cx);
-                                this.recoverable_draft = this.note_editor.take();
+                                this.request_note_action(
+                                    crate::editor_lifecycle::NoteIntent::Keep,
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .child(
+                        Button::new("discard-note-draft")
+                            .small()
+                            .ghost()
+                            .disabled(self.note_saving || self.draft_discard.is_some())
+                            .label("删除草稿")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirmation =
+                                    Some(crate::editor_lifecycle::NoteConfirmation::DiscardDraft);
                                 cx.notify();
                             })),
                     ),
@@ -223,7 +307,7 @@ impl StudyApp {
                 Input::new(&self.note_title).disabled(self.note_saving || draft.note_id.is_some()),
             ))
             .child(self.note_content.clone());
-        column().flex_1().min_w_0().child(view)
+        column().flex_1().min_h_0().h_full().min_w_0().child(view)
     }
 
     pub fn export_note(&self, note_id: String, version_id: Option<String>) {

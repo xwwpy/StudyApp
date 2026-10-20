@@ -108,13 +108,14 @@ pub(crate) fn append_version(
     Arc::make_mut(&mut state.versions).push(version);
     if !baseline
         && !offline
+        && !state.notes[index].detached
         && !state.timer.paused
         && !state.unattributed_notes.contains(&state.notes[index].id)
     {
         state.active_versions.push(version_id);
     }
 }
-pub(crate) fn import(state: &mut State, paths: Vec<PathBuf>, now: i64) -> String {
+pub(crate) fn import(state: &mut State, database: &Path, paths: Vec<PathBuf>, now: i64) -> String {
     let mut success = 0;
     let mut duplicate = 0;
     let mut failures = vec![];
@@ -123,8 +124,45 @@ pub(crate) fn import(state: &mut State, paths: Vec<PathBuf>, now: i64) -> String
             let canonical = std::fs::canonicalize(&path)
                 .with_context(|| format!("找不到 {}", path.display()))?;
             let key = canonical.to_string_lossy().into_owned();
-            if state.notes.iter().any(|n| same_path(&n.path, &key)) {
-                duplicate += 1;
+            if let Some(index) = state.notes.iter().position(|n| same_path(&n.path, &key)) {
+                if !state.notes[index].detached {
+                    duplicate += 1;
+                    return Ok(());
+                }
+                let note_id = state.notes[index].id.clone();
+                // A detached managed file keeps its original path across library
+                // migration. Only resume writes if it still belongs to this library.
+                let managed = state.notes[index].managed
+                    && same_path(
+                        &key,
+                        &crate::managed::path(database, &note_id)?.to_string_lossy(),
+                    );
+                let content = if managed {
+                    crate::managed::read_content(&canonical)?
+                } else {
+                    read(&canonical)?
+                };
+                let changed = state
+                    .versions
+                    .iter()
+                    .rev()
+                    .find(|v| v.note_id == note_id)
+                    .is_none_or(|v| v.hash != hash(&content));
+                let note = &mut state.notes[index];
+                note.detached = false;
+                note.managed = managed;
+                note.path = key;
+                note.missing = false;
+                note.error = None;
+                note.updated_at = now;
+                note.revision += 1;
+                state.candidates.remove(&note_id);
+                state.unattributed_notes.remove(&note_id);
+                state.offline_unreconciled_notes.remove(&note_id);
+                if changed {
+                    append_version(state, index, content, now, true, false);
+                }
+                success += 1;
                 return Ok(());
             }
             let content = read(&canonical)?;
@@ -133,6 +171,7 @@ pub(crate) fn import(state: &mut State, paths: Vec<PathBuf>, now: i64) -> String
                 path: key,
                 title: title(&content, &canonical),
                 managed: false,
+                detached: false,
                 missing: false,
                 error: None,
                 created_at: now,
@@ -164,12 +203,35 @@ fn same_path(a: &str, b: &str) -> bool {
         a == b
     }
 }
+pub(crate) fn unmanage(state: &mut State, note_id: &str, now: i64) -> Result<()> {
+    let note = state
+        .notes
+        .iter_mut()
+        .find(|note| note.id == note_id)
+        .context("找不到笔记")?;
+    if !note.detached {
+        note.detached = true;
+        note.updated_at = now;
+        note.revision += 1;
+    }
+    state.candidates.remove(note_id);
+    state.unattributed_notes.remove(note_id);
+    state.offline_unreconciled_notes.remove(note_id);
+    state.active_versions.retain(|id| {
+        state
+            .versions
+            .iter()
+            .any(|v| v.id == *id && v.note_id != note_id)
+    });
+    Ok(())
+}
 pub(crate) fn relink(state: &mut State, note_id: &str, path: PathBuf, now: i64) -> Result<()> {
     let index = state
         .notes
         .iter()
         .position(|n| n.id == note_id)
         .context("找不到笔记")?;
+    ensure!(!state.notes[index].detached, "笔记已取消管理，请先重新导入");
     ensure!(!state.notes[index].managed, "托管笔记不能关联外部路径");
     let path = std::fs::canonicalize(path)?;
     let key = path.to_string_lossy().into_owned();
@@ -212,14 +274,14 @@ fn scan_filtered(state: &mut State, offline: bool, now: i64, external_only: bool
             state
                 .notes
                 .iter()
-                .filter(|note| !external_only || !note.managed)
+                .filter(|note| !note.detached && (!external_only || !note.managed))
                 .map(|note| note.id.clone()),
         );
     }
     let mut captured = 0;
     let mut errors = 0;
     for index in 0..state.notes.len() {
-        if external_only && state.notes[index].managed {
+        if state.notes[index].detached || (external_only && state.notes[index].managed) {
             continue;
         }
         let path = PathBuf::from(&state.notes[index].path);

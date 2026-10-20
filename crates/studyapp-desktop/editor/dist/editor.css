@@ -1,0 +1,59 @@
+:root { color-scheme: light; font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; color: #263344; background: #fff; }
+* { box-sizing: border-box; }
+html, body, main { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+main { display: flex; flex-direction: column; }
+#toolbar { display: flex; align-items: center; gap: 3px; flex: 0 0 43px; padding: 5px 14px; border-bottom: 1px solid #e8edf2; background: #fafbfd; user-select: none; }
+#toolbar button { border: 0; border-radius: 5px; background: transparent; color: #526378; min-width: 29px; height: 29px; padding: 3px 7px; font: 14px "Segoe UI", sans-serif; cursor: pointer; }
+#toolbar button:hover, #toolbar button[aria-pressed="true"] { color: #166a6c; background: #e2f0ee; }
+#toolbar button:focus-visible { outline: 2px solid #4c9193; outline-offset: 1px; }
+#toolbar button:disabled { opacity: .35; cursor: default; }
+#toolbar .separator { width: 1px; height: 17px; background: #dfe6ec; margin: 0 5px; }
+#editor-status { font-size: 12px; color: #7b8898; margin-left: auto; white-space: nowrap; }
+#editor-status.error { color: #ac3a36; }
+#editor-status.warning { color: #91631d; }
+#toolbar #source-toggle { font-size: 12px; margin-left: 8px; }
+#editor { flex: 1; min-height: 0; width: 100%; }
+#editor .cm-editor { height: 100%; font-size: 15px; }
+#editor .cm-editor.cm-focused { outline: none; }
+#editor .cm-scroller { overflow: auto; font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; line-height: 1.85; scrollbar-width: thin; scrollbar-color: #c4d0d8 transparent; }
+#editor .cm-content { padding: 27px max(26px, calc((100% - 920px) / 2)) 160px; caret-color: #177f80; }
+#editor .cm-line { padding: 0 2px; }
+#editor .cm-selectionBackground { background: #d8eceb; }
+#editor .cm-focused .cm-selectionBackground { background: #cee7e5; }
+#editor .cm-cursor { border-left-color: #177f80; }
+#editor .cm-placeholder { color: #a4aeba; }
+#editor .md-heading { color: #1d3448; font-weight: 650; letter-spacing: -.015em; line-height: 1.45; padding-top: 9px; padding-bottom: 5px; }
+.md-heading-1 { font-size: 29px; }
+.md-heading-2 { font-size: 23px; }
+.md-heading-3 { font-size: 19px; }
+.md-heading-4, .md-heading-5, .md-heading-6 { font-size: 16px; }
+.md-strong { font-weight: 700; color: #213b4e; }
+.md-emphasis { font-style: italic; }
+.md-strike { text-decoration: line-through; color: #7f8a98; }
+#editor .md-list-line { padding-left: 13px; }
+.md-list-marker { color: #6d8e9a; }
+.md-bullet { color: #338b8d; display: inline-block; width: .8em; text-align: center; }
+#editor .md-quote { border-left: 3px solid #90b9b6; padding-left: 16px; color: #617584; background: #f7faf9; }
+.md-inline-code { background: #f0f4f7; color: #b05059; border-radius: 4px; padding: 2px 4px; font: .92em "Cascadia Code", Consolas, monospace; }
+#editor .md-code-line { background: #f4f7fa; padding-left: 18px; padding-right: 18px; font: 13px/1.75 "Cascadia Code", Consolas, "Microsoft YaHei", monospace; }
+#editor .md-code-fence { min-height: 10px; line-height: 1.2; }
+.md-code-language { color: #7a8f9f; font-size: 11px; text-transform: lowercase; }
+.md-link { color: #187d92; text-decoration: underline; text-decoration-color: #8fbcc6; text-underline-offset: 3px; }
+.md-task { display: inline-flex; width: 15px; height: 15px; align-items: center; justify-content: center; padding: 0; margin: 0 5px 0 0; border: 1px solid #9eb2bc; border-radius: 3px; background: #fff; color: #fff; font: 12px/1 sans-serif; vertical-align: -1px; cursor: pointer; }
+.md-task[aria-checked="true"] { background: #388c88; border-color: #388c88; }
+#editor .md-table-row { white-space: pre; border-bottom: 1px solid #dfe7ec; padding: 6px 10px; }
+.md-table-header { background: #f0f5f7; color: #385466; font-weight: 650; border-top: 1px solid #dfe7ec; }
+.md-table-cell { display: inline-block; min-width: 80px; padding: 0 6px; vertical-align: top; white-space: pre-wrap; }
+#editor .md-table-separator { line-height: 2px; height: 2px; min-height: 2px; color: transparent; }
+#editor .md-rule { border-bottom: 1px solid #dce5eb; min-height: 18px; }
+.tok-keyword { color: #9750a4; }
+.tok-string { color: #337d52; }
+.tok-number { color: #b26b25; }
+.tok-comment { color: #82909c; font-style: italic; }
+.tok-type { color: #957023; }
+.tok-property { color: #1e8095; }
+.tok-tag { color: #b15455; }
+.tok-function { color: #2e75a3; }
+.tok-punctuation { color: #6c7b89; }
+.cm-search { font: 13px "Segoe UI", "Microsoft YaHei", sans-serif; }
+@media (max-width: 600px) { #toolbar { padding: 5px 7px; gap: 0; } #toolbar .separator { margin: 0 2px; } #editor .cm-content { padding-left: 18px; padding-right: 18px; } #editor-status { max-width: 60px; overflow: hidden; } }

@@ -2,15 +2,15 @@
 
 使用 GPUI Kit 0.7.3 构建的 Windows 中文学习桌面应用。创建或导入自己的 Markdown 笔记，定时确认学习内容，安排间隔复习，并将笔记文件同步到自己的 WebDAV、文件夹或兼容 NAS。无需 StudyApp 账户即可使用。
 
-当前版本为 **0.3.0**，采用本地优先存储。支持 Typora 风格的段落原位编辑、实时预览、版本历史、拖入导入，以及用户自有存储的笔记同步。**同步仅传输最新 Markdown，不传输学习记录、复习计划或完整版本历史**。微信登录和 StudyApp 账户云服务仍为预留接口，见 [同步指南](docs/sync-guide.md) 与 [扩展边界](docs/cloud-contract.md)。
+当前版本为 **0.4.0**，采用本地优先存储。支持 Typora 风格的连续原位编辑、即时排版和常见编程语言高亮、版本历史、拖入导入，以及用户自有存储的笔记同步。**同步仅传输最新 Markdown，不传输学习记录、复习计划或完整版本历史**。微信登录和 StudyApp 账户云服务仍为预留接口，见 [同步指南](docs/sync-guide.md) 与 [扩展边界](docs/cloud-contract.md)。
 
 ![StudyApp 今日学习原生界面](docs/images/dashboard.png)
 
 ## 启动
 
-从 [GitHub Releases](https://github.com/xwwpy/StudyApp/releases) 下载可用的 Windows x64 ZIP，解压后运行 `studyapp.exe`。ZIP 是免安装程序包，默认资料保存在用户应用数据目录，而非解压目录。发布程序**未进行代码签名**；尚无自动更新器。版本对应的标签为 `v0.3.0`；只有该标签的发布工作流成功，Release 才会出现对应下载。
+从 [GitHub Releases](https://github.com/xwwpy/StudyApp/releases) 下载可用的 Windows x64 ZIP，解压后运行 `studyapp.exe`。ZIP 是免安装程序包，默认资料保存在用户应用数据目录，而非解压目录。发布程序**未进行代码签名**；尚无自动更新器。版本对应的标签为 `v0.4.0`；只有该标签的发布工作流成功，Release 才会出现对应下载。
 
-支持 Windows 10/11 x64，使用 Windows 图形渲染；远程桌面、显卡驱动及受限运行环境可能影响窗口创建。若系统提示缺少 MSVC 运行库，安装微软 [Visual C++ x64 Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)。Linux CI 测试学习核心和同步库，不提供 Linux 桌面程序。
+支持 Windows 10/11 x64，编辑器需要 [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。Windows 常见安装已包含；缺失时按页面安装 Evergreen Runtime。编辑器资源完全离线，不需要 Node.js 或外部网站。使用 Windows 图形渲染；远程桌面、显卡驱动及受限运行环境可能影响窗口创建。若系统提示缺少 MSVC 运行库，安装微软 [Visual C++ x64 Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)。Linux CI 测试学习核心和同步库，不提供 Linux 桌面程序。
 
 开发构建需要 Rust **1.98.0**、Visual Studio 2022 C++ 桌面开发工具（含 Windows SDK）、CMake 和 PowerShell 7。在仓库根目录运行：
 
@@ -27,7 +27,7 @@ cargo run --locked -p studyapp-desktop
 
 ## 使用与规则
 
-1. 点击「新建笔记」编写标准 Markdown。默认单栏即时编辑：点击排版后的段落原位输入，当前段落下方同步显示预览，**Esc / Ctrl+Enter** 收起源码。工具栏提供标题、粗体、斜体、列表、引用、代码和表格；**Ctrl+B / Ctrl+I** 格式化选区，**Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y** 撤销重做。「源码」可编辑全文并查看即时预览，**Ctrl+S** 保存版本。托管文件位于当前资料库的 `notes/<UUID>.md`，标题不作为文件名。已有托管笔记可编辑；保存时检查预期版本，冲突或失败保留草稿，可另存新笔记。
+1. 点击「新建笔记」编写标准 Markdown。整篇笔记使用一个连续编辑区，标题、强调、列表、引用、代码、表格在原位排版，光标所在的语法显示 Markdown 标记。可以直接跨段选择、键盘移动、粘贴、撤销与重做；工具栏提供常用格式，**Ctrl+B / Ctrl+I** 格式化，**Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y** 撤销重做，**Ctrl+S** 保存版本。「Markdown / 源码」切换保留选区和撤销历史。托管文件位于资料库的 `notes/<UUID>.md`；保存时检查预期版本，冲突或失败保留草稿，可另存新笔记。
 2. 可以多选导入 `.md` / `.markdown`，或直接将多个文件、目录拖入窗口。目录导入最多 200 份 Markdown、8 层目录，不跟随链接或 Windows 重解析点；失败逐项反馈。支持 UTF-8 / UTF-8 BOM，单文件上限 10 MiB。外部原文件只读，需用「复制后编辑」创建托管副本。
 3. 笔记库按标题、路径及最新正文搜索，展示创建、修改、最近学习与复习日期；版本历史可阅读旧快照与差异，导出 Markdown 要求新文件名。修改或同步笔记不会自动确认学习。
 4. 应用运行时累计学习时间，可以暂停。默认每 **60 分钟**询问一次，可设为 **5–240 分钟**；修改间隔从下一段生效。
@@ -38,13 +38,17 @@ cargo run --locked -p studyapp-desktop
 
 导入的外部源文件只读：应用不会改写、删除它们，也不会在笔记目录初始化 Git。托管笔记由应用保存新版本；外部来源需先复制为托管笔记才能在应用内编辑。后台每 **3 秒轮询**已导入文件，发现变化后要求内容稳定至少 **3 秒**再保存快照，因此变化通常需要约 3–6 秒被记录。以哈希去重；首次导入只建立基线，不自动算学习。应用关闭期间无法捕获每次编辑，下次启动只记录最后快照与当前文件之间的离线变化。文件失联保留历史，并支持重新关联。
 
-预览支持常见 Markdown、代码和表格，过滤原始 HTML；图片仅显示说明，链接仅显示文字，不执行脚本、不自动加载远程图片、不打开链接。版本历史会增加数据库大小，当前没有历史自动清理。
+编辑器支持常见 Markdown、代码和表格，原始 HTML 以文本显示；图片显示 Markdown 说明，链接显示文字，不执行脚本、不自动加载远程图片、不打开链接。版本历史会增加数据库大小，当前没有历史自动清理。
 
 ![Markdown 原位编辑与实时预览](docs/images/note-editor.png)
 
-编辑器保留 Markdown 原文，不通过 HTML 反向转换；切换模式不会规范化 CRLF 或改写代码围栏。当前段落编辑时会显示其源码和实时效果，并非逐字符隐藏标记的完整富文本编辑器。超过 256 KiB、500 个块或包含超大单块时使用完整源码模式；单次预览限制为开头 64 KiB / 约 400 行，并显示提示，保存不会截断原文。缩短内容后可重新进入即时编辑。编辑会话撤销最多保留 100 个快照、合计 4 MiB；正文超过 4 MiB 时不保留会话撤销，已保存的版本历史不受影响。
+编辑器使用本地打包的 CodeMirror 6 和 WebView2，保留原始 Markdown，不通过 HTML 反向转换；正常编辑和切换模式保持原换行字节。增量解析、可见区域渲染，输入不会重新渲染全文。支持 Rust、Python、JavaScript/JSX、TypeScript/TSX、C/C++、C#、Java、Go、HTML、CSS、JSON、YAML、TOML、SQL、Shell 高亮；未知语言显示普通代码。表格在编辑区域对齐，任务勾选写回 `[ ]` / `[x]` 并支持撤销。单文件上限仍为 10 MiB，超限粘贴会拒绝且保留原文。极大单行或复杂嵌套文档仍可能比普通笔记慢。
 
-编辑草稿在后台自动写入当前资料库的 `note-draft.json`；切换页面继续保留，选择「保留草稿并返回」或重启后可显式恢复。每个资料库保留一份待恢复草稿，开始另一份前需先处理已有草稿。正常关闭会刷新待写内容；异常退出可能损失最后约 650 毫秒内的输入。草稿文件不包含在 SQLite 备份中。
+草稿在后台自动写入当前资料库的 `note-draft.json`；切换页面继续保留，每库一份。保存、保留、切库和关闭会先确认编辑器末次输入；保留、切库和关闭还会等待草稿落盘确认。写入失败保留窗口和编辑内容。异常退出可能损失最后约 1 秒的输入；草稿不包含在 SQLite 备份中。「删除草稿」可删除当前编辑草稿或待恢复草稿，确认后清空草稿记录，保留原笔记文件及版本。
+
+「取消管理」停止该笔记的文件扫描、学习内容自动归属和同步，将其从笔记库列表移除；原文件、历史、学习与复习记录保留。已存在的远端同 ID 文件不会被重新导入；再次明确导入同一路径可恢复管理。同步运行时暂时不能取消管理、恢复备份或切换资料库，避免在途上传与这些操作交错。
+
+数据库升级到 schema 3，并兼容读取 schema 1/2。旧版程序不能打开升级后的数据库；升级前请导出备份。取消管理的笔记随备份保留状态，恢复备份不会重建其磁盘文件。
 
 ## 连接自己的存储
 
@@ -85,14 +89,16 @@ $smoke = Join-Path $env:TEMP ('studyapp-smoke-' + [guid]::NewGuid().ToString('N'
 
 ```powershell
 cargo build --locked --release -p studyapp-desktop
-.\scripts\package.ps1 -Version 0.2.0
+.\scripts\package.ps1 -Version 0.4.0
 ```
 
-脚本生成 `dist/StudyApp-0.2.0-windows-x86_64.zip` 与 `.zip.sha256`，包含程序、README、MIT LICENSE、发布说明、同步指南、锁文件及第三方许可证/源代码下载链接。输出已存在时拒绝覆盖，可用 `-OutputDirectory` 指定新目录；不会删除文件。`-BinaryPath` 允许验证打包其他已构建程序。SHA256 可用 `Get-FileHash -Algorithm SHA256` 核对。
+编辑器开发另需 Node.js 22+：在 `crates/studyapp-desktop/editor` 运行 `npm ci`、`npm run check`、`npm run build`、`npm test` 和 `npm run bundle:check`。源码、锁文件与确定性资源一同提交，普通 Rust 构建无需 Node.js。
+
+脚本生成 `dist/StudyApp-0.4.0-windows-x86_64.zip` 与 `.zip.sha256`，包含程序、README、MIT LICENSE、发布说明、同步指南、锁文件及第三方许可证/源代码下载链接。输出已存在时拒绝覆盖，可用 `-OutputDirectory` 指定新目录；不会删除文件。`-BinaryPath` 允许验证打包其他已构建程序。SHA256 可用 `Get-FileHash -Algorithm SHA256` 核对。
 
 ## CI/CD 与依赖
 
-[CI](https://github.com/xwwpy/StudyApp/blob/main/.github/workflows/ci.yml) 在 PR、`main` 和 `codex/**` 推送时检查格式、Windows/Linux 学习核心与同步测试、Windows 全工作区 Clippy 和测试、原生构建及隔离 UI 冒烟。截图和结果即使失败也尝试上传；Linux 无 GPU 要求。
+[CI](https://github.com/xwwpy/StudyApp/blob/main/.github/workflows/ci.yml) 在 PR、`main` 和 `codex/**` 推送时检查格式、Windows/Linux 学习核心与同步测试、Windows 全工作区 Clippy 和测试、原生构建及隔离 UI 冒烟；还验证前端类型、离线资源一致性、依赖审计和浏览器回归。截图和结果即使失败也尝试上传；Linux 无 GPU 要求。
 
 [Security](https://github.com/xwwpy/StudyApp/blob/main/.github/workflows/security.yml) 在上述事件及每周运行 `cargo-audit 0.22.2` 和 `cargo-deny 0.20.2`。审计读取提交的 Cargo.lock 和当前 RustSec 数据，不忽略已知漏洞；许可证/来源检查限定支持的 Windows 依赖图，重复版本警告保留。Dependabot 每周检查 Cargo 和固定提交的 Actions。框架传递依赖的告警需要持续跟进，不能把构建通过等同于安全审计通过。
 

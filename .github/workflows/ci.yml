@@ -18,6 +18,8 @@ env:
   RUST_BACKTRACE: '1'
 
 jobs:
+  editor:
+    uses: ./.github/workflows/editor.yml
   core:
     name: Core and sync (${{ matrix.os }})
     strategy:

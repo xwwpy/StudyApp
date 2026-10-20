@@ -19,6 +19,8 @@ pub struct Note {
     pub title: String,
     #[serde(default)]
     pub managed: bool,
+    #[serde(default)]
+    pub detached: bool,
     pub missing: bool,
     pub error: Option<String>,
     pub created_at: i64,
@@ -123,6 +125,9 @@ pub enum Command {
         path: PathBuf,
     },
     Import(Vec<PathBuf>),
+    UnmanageNote {
+        note_id: String,
+    },
     Relink {
         note_id: String,
         path: PathBuf,

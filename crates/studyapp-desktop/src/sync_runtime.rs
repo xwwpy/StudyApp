@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -240,9 +240,16 @@ impl SyncRuntime {
                     test_only,
                 });
             }
+            let excluded: BTreeSet<_> = snapshot
+                .notes
+                .iter()
+                .filter(|note| note.detached)
+                .map(|note| note.id.clone())
+                .collect();
             let notes: Vec<_> = snapshot
                 .notes
                 .iter()
+                .filter(|note| !note.detached)
                 .filter_map(|note| {
                     snapshot
                         .versions
@@ -258,7 +265,7 @@ impl SyncRuntime {
                         })
                 })
                 .collect();
-            let plans = plan_sync(provider.as_ref(), &notes, &baselines)?;
+            let plans = plan_sync(provider.as_ref(), &notes, &baselines, &excluded)?;
             let mut completed = vec![];
             let mut errors = vec![];
             for plan in plans {
@@ -301,6 +308,13 @@ impl SyncRuntime {
         for plan in completion.plans {
             let result = (|| -> Result<()> {
                 let snapshot = engine.snapshot();
+                ensure!(
+                    !snapshot
+                        .notes
+                        .iter()
+                        .any(|note| note.id == plan.id && note.detached),
+                    "笔记已取消管理，未应用迟到的同步结果"
+                );
                 let current = snapshot
                     .versions
                     .iter()
@@ -683,6 +697,83 @@ mod tests {
             engine.snapshot().versions.last().unwrap().content,
             "during sync"
         );
+    }
+
+    #[test]
+    fn detached_notes_are_excluded_from_upload_and_remote_reimport_after_restart() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let (mut engine, mut runtime) = library(&root, "local");
+        let id = create(&mut engine, "original");
+        let folder = root.join("shared");
+        configure(&mut runtime, &folder);
+        engine
+            .apply(
+                Command::UnmanageNote {
+                    note_id: id.clone(),
+                },
+                NOW + 1,
+            )
+            .unwrap();
+        let job = runtime.task(Arc::new(engine.snapshot()), false).unwrap()().unwrap();
+        assert!(job.plans.is_empty());
+        runtime.finish(Ok(job), &mut engine, NOW + 2).unwrap();
+        let provider = LocalFolderProvider::new(&folder).unwrap();
+        assert!(provider.read(&id).unwrap().is_none());
+        provider
+            .write(&id, "remote retained content", None)
+            .unwrap();
+        let database = engine.snapshot().data_path;
+        drop(engine);
+        let mut engine = Engine::open(Path::new(&database), NOW + 3).unwrap();
+        let mut runtime = SyncRuntime::load(Path::new(&database));
+        let message = sync(&mut runtime, &mut engine);
+        assert!(!message.contains("未完成"));
+        assert!(runtime.data.baselines.is_empty());
+        assert_eq!(engine.snapshot().notes.len(), 1);
+        assert!(engine.snapshot().notes[0].detached);
+        assert_eq!(engine.snapshot().versions.len(), 1);
+        assert_eq!(
+            provider.read(&id).unwrap().unwrap().content,
+            "remote retained content"
+        );
+    }
+
+    #[test]
+    fn late_sync_conflict_cannot_create_copy_or_advance_detached_baseline() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let (mut engine, mut runtime) = library(&root, "local");
+        let id = create(&mut engine, "original");
+        let folder = root.join("shared");
+        configure(&mut runtime, &folder);
+        sync(&mut runtime, &mut engine);
+        let baseline = runtime.data.baselines.clone();
+        let provider = LocalFolderProvider::new(&folder).unwrap();
+        let previous = provider.read(&id).unwrap().unwrap();
+        provider
+            .write(&id, "remote conflict", previous.revision.as_deref())
+            .unwrap();
+        edit(&mut engine, &id, "local conflict");
+        let completion = runtime.task(Arc::new(engine.snapshot()), false).unwrap()().unwrap();
+        assert!(matches!(
+            completion.plans[0].action,
+            SyncAction::Conflict { .. }
+        ));
+        engine
+            .apply(
+                Command::UnmanageNote {
+                    note_id: id.clone(),
+                },
+                NOW + 12,
+            )
+            .unwrap();
+        let versions = engine.snapshot().versions.len();
+        let message = runtime
+            .finish(Ok(completion), &mut engine, NOW + 13)
+            .unwrap();
+        assert!(message.contains("未完成"));
+        assert_eq!(engine.snapshot().notes.len(), 1);
+        assert_eq!(engine.snapshot().versions.len(), versions);
+        assert_eq!(runtime.data.baselines, baseline);
     }
 
     #[test]

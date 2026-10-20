@@ -75,7 +75,11 @@ pub(crate) fn path(database: &Path, id: &str) -> Result<PathBuf> {
 }
 
 pub(crate) fn rebase(state: &mut State, database: &Path) -> Result<()> {
-    for note in state.notes.iter_mut().filter(|note| note.managed) {
+    for note in state
+        .notes
+        .iter_mut()
+        .filter(|note| note.managed && !note.detached)
+    {
         note.path = path(database, &note.id)?.to_string_lossy().into_owned();
     }
     Ok(())
@@ -164,6 +168,7 @@ pub(crate) fn create(
             title.trim().into()
         },
         managed: true,
+        detached: false,
         missing: false,
         error: None,
         created_at: now,
@@ -203,6 +208,7 @@ pub(crate) fn edit(
         .iter()
         .position(|note| note.id == id)
         .context("找不到笔记")?;
+    ensure!(!state.notes[index].detached, "笔记已取消管理，请先重新导入");
     ensure!(
         state.notes[index].managed,
         "导入的外部笔记为只读，请创建托管副本后编辑"
@@ -264,7 +270,7 @@ pub(crate) fn restore_writes(state: &mut State, database: &Path, now: i64) -> Re
     rebase(state, database)?;
     let mut writes = Vec::new();
     for index in 0..state.notes.len() {
-        if !state.notes[index].managed {
+        if !state.notes[index].managed || state.notes[index].detached {
             continue;
         }
         let note_id = state.notes[index].id.clone();

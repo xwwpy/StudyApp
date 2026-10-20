@@ -38,6 +38,8 @@ try {
     }
     Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/release-notes.md') -Destination (Join-Path $staging 'RELEASE-NOTES.md')
     Copy-Item -LiteralPath (Join-Path $repoRoot 'Cargo.lock') -Destination (Join-Path $staging 'Cargo.lock')
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'crates/studyapp-desktop/editor/dist/THIRD_PARTY_LICENSES.txt') -Destination (Join-Path $staging 'EDITOR-THIRD-PARTY-LICENSES.txt')
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'crates/studyapp-desktop/editor/package-lock.json') -Destination (Join-Path $staging 'editor-package-lock.json')
     [IO.Directory]::CreateDirectory((Join-Path $staging 'docs')) | Out-Null
     foreach ($document in @('cloud-contract.md', 'sync-guide.md')) {
         Copy-Item -LiteralPath (Join-Path $repoRoot "docs/$document") -Destination (Join-Path $staging "docs/$document")

@@ -5,10 +5,12 @@ use std::collections::{BTreeMap, BTreeSet};
 /// persisted here. The caller must verify `expected_local_hash`, execute the
 /// action, and only then persist `next_baseline`. Preserve a conflict copy before
 /// receiving its remote original. An external-source copy never edits the source.
+/// Excluded IDs are neither uploaded nor read/imported from the remote listing.
 pub fn plan_sync(
     provider: &dyn Provider,
     notes: &[SyncNote],
     baselines: &BTreeMap<String, Baseline>,
+    excluded: &BTreeSet<String>,
 ) -> Result<Vec<NotePlan>> {
     if notes.len() > MAX_ENTRIES {
         return Err(SyncError::LimitExceeded);
@@ -16,6 +18,9 @@ pub fn plan_sync(
     let mut local = BTreeMap::new();
     let mut bytes = 0usize;
     for note in notes {
+        if excluded.contains(&note.id) {
+            continue;
+        }
         validate_id(&note.id)?;
         validate_content(&note.content)?;
         if content_hash(&note.content) != note.hash {
@@ -38,7 +43,9 @@ pub fn plan_sync(
     let mut ids: BTreeSet<String> = local.keys().map(|id| (*id).to_owned()).collect();
     for id in remote_ids {
         validate_id(&id)?;
-        ids.insert(id);
+        if !excluded.contains(&id) {
+            ids.insert(id);
+        }
     }
     if ids.len() > MAX_ENTRIES {
         return Err(SyncError::LimitExceeded);

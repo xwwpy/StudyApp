@@ -5,10 +5,9 @@ use crate::{
 };
 use gpui_kit::{
     component::{
-        Selectable, Sizable,
+        Disableable, Selectable, Sizable,
         button::{Button, ButtonVariants},
         input::Input,
-        text::TextView,
         tooltip::Tooltip,
     },
     prelude::FluentBuilder,
@@ -20,7 +19,7 @@ use studyapp_desktop::presentation::stamp;
 impl StudyApp {
     pub fn notes(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
         let query = self.search.read(cx).value().to_lowercase();
-        let notes = snapshot.notes.iter().filter(|n| {
+        let notes = snapshot.notes.iter().filter(|n| !n.detached).filter(|n| {
             query.is_empty()
                 || n.title.to_lowercase().contains(&query)
                 || n.path.to_lowercase().contains(&query)
@@ -32,7 +31,11 @@ impl StudyApp {
                     .is_some_and(|v| v.content.to_lowercase().contains(&query))
         });
         let list = column()
+            .id("note-list-scroll")
             .w(px(265.))
+            .h_full()
+            .min_h_0()
+            .overflow_y_scroll()
             .flex_shrink_0()
             .child(Input::new(&self.search).cleanable(true))
             .child(muted("可拖入多个 Markdown 或目录（最多 200 份，8 层）。"))
@@ -68,7 +71,6 @@ impl StudyApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_note = Some(id.clone());
                         this.selected_version = None;
-                        this.refresh_preview();
                         cx.notify();
                     }))
             }));
@@ -80,7 +82,8 @@ impl StudyApp {
             self.note_editor_view(cx)
         } else if let Some(note) = selected {
             let id = note.id.clone();
-            let managed = note.managed;
+            let managed = note.managed && !note.detached;
+            let unmanage_id = id.clone();
             let export_id = id.clone();
             let export_version = self.selected_version.clone();
             let versions: Vec<_> = snapshot
@@ -94,6 +97,8 @@ impl StudyApp {
                 .find(|v| self.selected_version.as_ref().is_none_or(|id| id == &v.id));
             let mut reader = card()
                 .flex_1()
+                .h_full()
+                .min_h_0()
                 .min_w_0()
                 .child(
                     row()
@@ -113,7 +118,7 @@ impl StudyApp {
                             Button::new("edit-note")
                                 .small()
                                 .ghost()
-                                .label(if note.managed {
+                                .label(if managed {
                                     "编辑笔记"
                                 } else {
                                     "复制后编辑"
@@ -131,7 +136,24 @@ impl StudyApp {
                                     this.export_note(export_id.clone(), export_version.clone())
                                 })),
                         )
-                        .when(!note.managed, |r| {
+                        .when(!note.detached, |r| {
+                            r.child(
+                                Button::new("unmanage-note")
+                                    .small()
+                                    .ghost()
+                                    .disabled(self.sync_panel.read(cx).status.busy)
+                                    .label("取消管理")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.confirmation = Some(
+                                            crate::editor_lifecycle::NoteConfirmation::Unmanage(
+                                                unmanage_id.clone(),
+                                            ),
+                                        );
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .when(!note.managed && !note.detached, |r| {
                             r.child(
                                 Button::new("relink-note")
                                     .small()
@@ -143,6 +165,9 @@ impl StudyApp {
                             )
                         }),
                 )
+                .when(note.detached, |c| {
+                    c.child(muted("已取消管理 · 当前仅查看历史快照"))
+                })
                 .child(muted(note.path.clone()))
                 .child(muted(format!(
                     "{} · 创建：{} · 修改：{}",
@@ -169,8 +194,6 @@ impl StudyApp {
                                 .label("阅读笔记")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.history = false;
-                                    this.selected_version = None;
-                                    this.refresh_preview();
                                     cx.notify();
                                 })),
                         )
@@ -200,7 +223,6 @@ impl StudyApp {
                         ))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.selected_version = Some(id.clone());
-                            this.refresh_preview();
                             cx.notify();
                         }))
                 })));
@@ -245,10 +267,7 @@ impl StudyApp {
                     }
                 }
             } else {
-                reader = reader.child(TextView::html(
-                    SharedString::from(format!("markdown-{}", self.preview_key)),
-                    self.preview_html.clone(),
-                ));
+                reader = reader.child(self.note_content.clone());
             }
             reader
         } else {
@@ -258,7 +277,10 @@ impl StudyApp {
             )
             .flex_1()
         };
-        column().when(self.draft_loading, |c| c.child(muted("正在检查本地草稿…")))
+        column().flex_1().h_full().min_h_0()
+            .when(self.confirmation.is_some(), |c| c.child(self.confirmation_view(cx)))
+            .when(self.draft_discard.is_some(), |c| c.child(muted("正在删除草稿…")))
+            .when(self.draft_loading, |c| c.child(muted("正在检查本地草稿…")))
             .when(self.draft_failed, |c| c.child(card().child(heading("草稿文件暂时无法读取或保存"))
                 .child(muted("为保护已有草稿，暂时不能开始另一份笔记。修复目录权限后可重试；当前编辑内容仍可保存为笔记。"))
                 .child(Button::new("retry-note-draft").label("重试草稿读取").on_click(cx.listener(|this, _, _, cx| {
@@ -267,7 +289,13 @@ impl StudyApp {
                 })))))
             .when(self.recoverable_draft.is_some(), |c| c.child(card().id("draft-recovery").child(heading("发现未保存的笔记草稿"))
                 .child(muted("草稿仍保留在当前资料库，恢复后可继续编辑或另存为新笔记。"))
-                .child(Button::new("recover-note-draft").primary().label("恢复草稿").on_click(cx.listener(|this, _, window, cx| this.recover_note(window, cx))))))
-            .child(row().items_start().w_full().child(list).child(detail))
+                .child(row()
+                    .child(Button::new("recover-note-draft").primary().label("恢复草稿").on_click(cx.listener(|this, _, window, cx| this.recover_note(window, cx))))
+                    .child(Button::new("discard-recovered-draft").ghost().label("删除草稿").on_click(cx.listener(|this, _, _, cx| {
+                        this.confirmation = Some(crate::editor_lifecycle::NoteConfirmation::DiscardDraft);
+                        cx.notify();
+                    })))
+                )))
+            .child(row().items_start().flex_1().min_h_0().w_full().child(list).child(detail))
     }
 }

@@ -420,7 +420,7 @@ fn version_one_database_and_backup_default_imported_notes_to_read_only() {
     let schema: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(schema, 2);
+    assert_eq!(schema, 3);
 }
 
 #[test]

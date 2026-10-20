@@ -9,7 +9,7 @@ use std::{
 };
 
 pub(crate) const APP_ID: i32 = 0x53545544;
-pub(crate) const SCHEMA: i32 = 2;
+pub(crate) const SCHEMA: i32 = 3;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Undo {
     pub event_id: String,
@@ -386,11 +386,13 @@ pub(crate) fn initialize(conn: &mut Connection) -> Result<()> {
         tx.commit()?;
     }
     let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version == 1 {
+    if version == 1 || version == 2 {
         let tx = conn.transaction()?;
-        tx.execute_batch(
-            "CREATE TABLE write_intents (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);",
-        )?;
+        if version == 1 {
+            tx.execute_batch(
+                "CREATE TABLE write_intents (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);",
+            )?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA)?;
         tx.commit()?;
         return Ok(());
@@ -454,7 +456,7 @@ pub(crate) fn verified_backup(path: &Path) -> Result<State> {
     let app_id: i32 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
     let schema: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     ensure!(
-        app_id == APP_ID && (schema == 1 || schema == SCHEMA),
+        app_id == APP_ID && (1..=SCHEMA).contains(&schema),
         "备份不是受支持的 StudyApp 资料库"
     );
     let check: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;

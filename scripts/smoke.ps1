@@ -16,6 +16,8 @@ if ($process.ExitCode -ne 0) { throw "Native smoke exit code: $($process.ExitCod
 $report = Join-Path $data 'smoke-result.txt'
 if (-not (Test-Path -LiteralPath $report)) { throw 'Smoke report missing' }
 if ((Get-Content -LiteralPath $report -Raw) -notmatch '^PASS:') { throw 'Smoke report did not pass' }
+$draft = Get-Content -LiteralPath (Join-Path $data 'note-draft.json') -Raw | ConvertFrom-Json
+if ($draft.content -cne '关闭窗口前的末次输入 🧠') { throw 'Normal window close did not persist the last editor input' }
 foreach ($index in 0..4) {
     $image = Join-Path $data "page-$index.png"
     if (-not (Test-Path -LiteralPath $image)) { throw "Screenshot missing: $image" }

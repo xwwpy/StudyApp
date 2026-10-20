@@ -45,15 +45,16 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
     cx.spawn(async move |cx| {
         cx.background_executor().timer(Duration::from_secs(2)).await;
         for (index, page) in [Page::Today, Page::Notes, Page::Reviews, Page::Stats, Page::Settings].into_iter().enumerate() {
-            let result = window.update(cx, |_, _, cx| {
+            let result = window.update(cx, |_, window, cx| {
                 view.update(cx, |app, cx| {
                     app.page = page;
                     if page == Page::Notes {
                         app.selected_note = app.snapshot.as_ref().and_then(|s| s.notes.first().map(|n| n.id.clone()));
-                        app.refresh_preview();
                     }
                     cx.notify();
                 });
+                window.refresh();
+                window.draw(cx).clear(cx);
             });
             if let Err(error) = result { eprintln!("smoke window failed: {error}"); std::process::exit(2); }
             cx.background_executor().timer(Duration::from_millis(700)).await;
@@ -68,6 +69,16 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
             }
             #[cfg(not(feature = "ui-test"))]
             let _ = index;
+        }
+        for attempt in 0..200 {
+            let ready = window.update(cx, |_, _, cx| {
+                let editor = view.read(cx).note_content.read(cx);
+                assert!(editor.error().is_none(), "{:?}", editor.error());
+                editor.ready()
+            }).expect("editor startup");
+            if ready { break; }
+            assert!(attempt < 199, "offline editor did not become ready");
+            cx.background_executor().timer(Duration::from_millis(50)).await;
         }
         #[cfg(feature = "ui-test")]
         {
@@ -170,112 +181,7 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
                 window.dispatch_event(PlatformInput::FileDrop(FileDropEvent::Submit { position }), cx);
             }).expect("native file drop");
             cx.background_executor().timer(Duration::from_secs(1)).await;
-            let markdown_editor = window.update(cx, |_, window, cx| {
-                assert_eq!(view.read(cx).snapshot.as_ref().unwrap().notes.len(), 2);
-                window.click("new-note", cx);
-                assert!(view.read(cx).note_editor.is_some());
-                let editor = view.read(cx).note_content.clone();
-                assert!(!editor.read(cx).source_mode, "new notes use live editing by default");
-                view.update(cx, |app, cx| {
-                    app.note_title.update(cx, |s, cx| s.set_value("原生编辑测试", window, cx));
-                });
-                window.click("md-block-input", cx);
-                window.input("# 原生编辑测试\n\n第一次保存。", cx);
-                editor
-            }).expect("type in live Markdown editor");
-            cx.background_executor().timer(Duration::from_millis(20)).await;
-            window.update(cx, |_, window, cx| {
-                let editor = &markdown_editor;
-                assert_eq!(editor.read(cx).value(), "# 原生编辑测试\n\n第一次保存。");
-                assert!(editor.read(cx).live_html.contains("<h1>原生编辑测试</h1>"));
-                window.click("md-finish", cx);
-                window.click(("md-block", 1_usize), cx);
-                window.press("ctrl-a", cx);
-                window.input("第一次保存，**加粗知识点**与中文 🧠。", cx);
-            }).expect("edit a rendered paragraph");
-            cx.background_executor().timer(Duration::from_millis(20)).await;
-            window.update(cx, |_, window, cx| {
-                let editor = &markdown_editor;
-                assert!(editor.read(cx).live_html.contains("<strong>加粗知识点</strong>"));
-                assert_eq!(editor.read(cx).value(), "# 原生编辑测试\n\n第一次保存，**加粗知识点**与中文 🧠。");
-                window.press("ctrl-z", cx);
-                assert_eq!(editor.read(cx).value(), "# 原生编辑测试\n\n第一次保存。");
-                window.press("ctrl-shift-z", cx);
-                assert!(editor.read(cx).value().contains("中文 🧠"));
-                let before_mode_switch = editor.read(cx).value().to_owned();
-                window.click("md-source-toggle", cx);
-                assert!(editor.read(cx).source_mode);
-                assert_eq!(editor.read(cx).source_input.read(cx).value(), before_mode_switch);
-                window.click("md-source-toggle", cx);
-                assert_eq!(editor.read(cx).value(), before_mode_switch);
-                window.click(("md-block", 1_usize), cx);
-                let input = editor.read(cx).block_input.clone();
-                input.update(cx, |s, cx| s.set_selected_range(0.."第一次保存".len(), cx));
-                window.click("md-bold", cx);
-                assert!(editor.read(cx).value().contains("**第一次保存**"));
-                assert!(editor.read(cx).live_html.contains("<strong>第一次保存</strong>"));
-                window.click("md-undo", cx);
-                assert_eq!(editor.read(cx).value(), before_mode_switch);
-                window.click(("md-block", 1_usize), cx);
-                window.render_frame(cx);
-                window.render_to_image().unwrap().save(database.with_file_name("note-editor.png")).unwrap();
-                let input = editor.read(cx).block_input.clone();
-                input.update(cx, |s, cx| {
-                    let end = s.value().len();
-                    s.set_selected_range(end..end, cx);
-                    s.replace_and_mark_text_in_range(None, " 输入法", Some(4..4), window, cx);
-                });
-                window.click("save-note", cx);
-            }).expect("create managed note");
-            cx.background_executor().timer(Duration::from_secs(1)).await;
-            let managed_id = window.update(cx, |_, window, cx| {
-                let app = view.read(cx);
-                assert!(app.note_editor.is_none());
-                let id = app.selected_note.clone().unwrap();
-                let note = app.snapshot.as_ref().unwrap().notes.iter().find(|n| n.id == id).unwrap();
-                assert!(note.managed);
-                assert!(Path::new(&note.path).is_file());
-                assert!(std::fs::read_to_string(&note.path).unwrap().ends_with(" 输入法"), "saving must include the visible native IME composition");
-                window.click("edit-note", cx);
-                let editor = view.read(cx).note_content.clone();
-                let crlf = "# 中文 🧠\r\n\r\n[引用][ref]\r\n\r\n末段\r\n\r\n[ref]: https://example.org\r\n";
-                editor.update(cx, |e, cx| e.set_value(crlf.to_owned(), window, cx));
-                window.click("md-source-toggle", cx);
-                window.click("md-source-toggle", cx);
-                assert_eq!(editor.read(cx).value(), crlf, "mode switches must not normalize line endings");
-                window.click(("md-block", 0_usize), cx);
-                let input = editor.read(cx).block_input.clone();
-                input.update(cx, |s, cx| {
-                    s.set_selected_range(2..2, cx);
-                    s.replace_and_mark_text_in_range(None, &"未确认的长标题".repeat(8), None, window, cx);
-                });
-                window.click(("md-block", 1_usize), cx);
-                assert_eq!(editor.read(cx).block_input.read(cx).value(), "[引用][ref]\r\n\r\n", "click must resolve the intended block after flushing composition");
-                assert_eq!(editor.read(cx).live_html, "<p>引用</p>\n");
-                window.press("escape", cx);
-                assert!(window.try_find(("md-block", 1_usize)).is_some());
-                let large = format!("{}保留末尾", "中文\n".repeat(40_000));
-                editor.update(cx, |e, cx| e.set_value(large.clone(), window, cx));
-                assert!(editor.read(cx).source_mode);
-                assert_eq!(editor.read(cx).value(), large);
-                // Shortening a large document must re-enable live mode.
-                let source = editor.read(cx).source_input.clone();
-                source.update(cx, |s, cx| s.replace_all("# 原生编辑测试\n\n恢复即时编辑", window, cx));
-                editor.update(cx, |e, cx| e.flush(window, cx));
-                window.click("md-source-toggle", cx);
-                assert!(!editor.read(cx).source_mode);
-                window.click("md-source-toggle", cx);
-                window.click("md-source-input", cx);
-                window.press("ctrl-a", cx);
-                window.input("# 原生编辑测试\n\n第二次保存，保留历史。", cx);
-                window.click("keep-note-draft", cx);
-                assert!(view.read(cx).recoverable_draft.is_some());
-                window.click("recover-note-draft", cx);
-                assert!(view.read(cx).note_content.read(cx).value().contains("第二次保存"));
-                window.click("save-note", cx);
-                id
-            }).expect("edit and recover draft");
-            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let managed_id = crate::smoke_editor::exercise(window, &view, &database, cx).await;
             let sync_folder = database.with_file_name("sync-target");
             std::fs::create_dir(&sync_folder).unwrap();
             window.update(cx, |_, window, cx| {
@@ -311,10 +217,13 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
         }
         let report = database.with_file_name("smoke-result.txt");
         #[cfg(feature = "ui-test")]
-        let result = "PASS: five native pages rendered; screenshots captured; navigation, reviews, pause, settings, backup restore, learning versions, native file drop, live Markdown block editing, format toolbar, cross-mode undo/redo, CRLF roundtrip, reference preview, IME save and block switching, large-document fallback, draft recovery, version history, folder connection and actual Markdown sync verified.\n";
+        let result = "PASS: five native pages rendered; screenshots captured; navigation, reviews, pause, settings, backup restore, learning versions, native file drop, continuous WebView Markdown editing, offline syntax highlighting, cross-paragraph undo/redo, source toggle, CRLF roundtrip, async save, draft recovery/deletion, unmanage/reimport, version history, folder connection and actual Markdown sync verified.\n";
         #[cfg(not(feature = "ui-test"))]
-        let result = "PASS: release executable launched and five native pages rendered; interactive assertions and screenshots require ui-test.\n";
+        let result = "PASS: release executable launched, five native pages rendered and offline WebView editor became ready; interactive assertions and screenshots require ui-test.\n";
         std::fs::write(report, result).expect("write smoke report");
+        #[cfg(feature = "ui-test")]
+        crate::smoke_editor::close_with_draft(window, &view, cx).await;
+        #[cfg(not(feature = "ui-test"))]
         cx.update(|cx| cx.quit());
     }).detach();
 }

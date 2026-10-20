@@ -185,8 +185,12 @@ impl Engine {
                 if next.timer.paused && !paused {
                     // Reconcile every source before admitting new activity. Candidates may
                     // have been observed while paused, or not observed at all.
-                    next.unattributed_notes
-                        .extend(next.notes.iter().map(|n| n.id.clone()));
+                    next.unattributed_notes.extend(
+                        next.notes
+                            .iter()
+                            .filter(|n| !n.detached)
+                            .map(|n| n.id.clone()),
+                    );
                     crate::notes::scan(&mut next, false, now);
                 }
                 next.timer.paused = paused;
@@ -201,7 +205,11 @@ impl Engine {
                 }
                 .into()
             }
-            Command::Import(paths) => crate::notes::import(&mut next, paths, now),
+            Command::Import(paths) => crate::notes::import(&mut next, &self.path, paths, now),
+            Command::UnmanageNote { note_id } => {
+                crate::notes::unmanage(&mut next, &note_id, now)?;
+                "已取消管理；原文件、版本和学习复习记录均保留，可重新导入恢复管理".into()
+            }
             Command::Relink { note_id, path } => {
                 crate::notes::relink(&mut next, &note_id, path, now)?;
                 "笔记已重新关联".into()

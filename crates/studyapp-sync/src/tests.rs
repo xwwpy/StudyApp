@@ -58,16 +58,42 @@ fn planner_conflict_and_external_copy_preserve_source_and_baseline() {
             remote_hash: content_hash("old"),
         },
     );
-    let plan = plan_sync(&provider, &notes, &baselines).unwrap();
+    let plan = plan_sync(&provider, &notes, &baselines, &Default::default()).unwrap();
     assert!(
         matches!(&plan[0].action, SyncAction::Conflict {local_content, remote_content} if local_content == "local" && remote_content == "remote")
     );
     assert_eq!(baselines[ID].local_hash, content_hash("old"));
     notes[0].managed = false;
-    let plan = plan_sync(&provider, &notes, &baselines).unwrap();
+    let plan = plan_sync(&provider, &notes, &baselines, &Default::default()).unwrap();
     assert!(matches!(&plan[0].action, SyncAction::CopyExternal {content} if content == "remote"));
     assert_eq!(plan[0].next_baseline.local_hash, content_hash("local"));
     assert_eq!(plan[0].next_baseline.remote_hash, content_hash("remote"));
+}
+
+#[test]
+fn planner_excludes_detached_ids_from_both_local_and_remote_union() {
+    let provider = LocalFolderProvider::new(folder()).unwrap();
+    let active = "123e4567-e89b-42d3-a456-426614174001";
+    provider.write(ID, "retained remote", None).unwrap();
+    provider.write(active, "active remote", None).unwrap();
+    let notes = [SyncNote {
+        id: ID.into(),
+        title: "detached".into(),
+        content: "retained local".into(),
+        hash: content_hash("retained local"),
+        managed: true,
+    }];
+    let excluded = std::collections::BTreeSet::from([ID.into()]);
+    for local in [notes.as_slice(), &[]] {
+        let plans = plan_sync(&provider, local, &BTreeMap::new(), &excluded).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].id, active);
+        assert!(matches!(plans[0].action, SyncAction::ImportRemote { .. }));
+    }
+    assert_eq!(
+        provider.read(ID).unwrap().unwrap().content,
+        "retained remote"
+    );
 }
 
 #[test]
@@ -83,7 +109,7 @@ fn independent_folders_roundtrip_and_repeat_is_unchanged() {
         hash: local.hash,
         managed: true,
     }];
-    let plan = plan_sync(&b, &notes, &BTreeMap::new()).unwrap();
+    let plan = plan_sync(&b, &notes, &BTreeMap::new(), &Default::default()).unwrap();
     match &plan[0].action {
         SyncAction::Push {
             content,
@@ -95,10 +121,10 @@ fn independent_folders_roundtrip_and_repeat_is_unchanged() {
     }
     let baseline = BTreeMap::from([(ID.into(), plan[0].next_baseline.clone())]);
     assert!(matches!(
-        plan_sync(&b, &notes, &baseline).unwrap()[0].action,
+        plan_sync(&b, &notes, &baseline, &Default::default()).unwrap()[0].action,
         SyncAction::Unchanged
     ));
-    let incoming = plan_sync(&b, &[], &BTreeMap::new()).unwrap();
+    let incoming = plan_sync(&b, &[], &BTreeMap::new(), &Default::default()).unwrap();
     assert!(
         matches!(&incoming[0].action, SyncAction::ImportRemote {content} if content == "hello")
     );
@@ -268,7 +294,7 @@ fn missing_etag_cannot_authorize_remote_overwrite() {
         },
     )]);
     assert!(matches!(
-        plan_sync(&provider, &notes, &baseline),
+        plan_sync(&provider, &notes, &baseline, &Default::default()),
         Err(SyncError::MissingRevision)
     ));
     server.join().unwrap();
@@ -295,7 +321,7 @@ fn planner_one_sided_changes_and_missing_remote_are_non_destructive() {
     provider
         .write(ID, "remote change", original.revision.as_deref())
         .unwrap();
-    let incoming = plan_sync(&provider, &notes, &baseline).unwrap();
+    let incoming = plan_sync(&provider, &notes, &baseline, &Default::default()).unwrap();
     assert!(
         matches!(&incoming[0].action, SyncAction::Pull {content} if content == "remote change")
     );
@@ -316,14 +342,14 @@ fn planner_one_sided_changes_and_missing_remote_are_non_destructive() {
             remote_hash: content_hash("remote change"),
         },
     )]);
-    let outgoing = plan_sync(&provider, &notes, &baseline).unwrap();
+    let outgoing = plan_sync(&provider, &notes, &baseline, &Default::default()).unwrap();
     assert!(
         matches!(&outgoing[0].action, SyncAction::Push {content, expected_revision: Some(_)} if content == "local change")
     );
     assert_eq!(outgoing[0].next_baseline.remote_hash, notes[0].hash);
     let empty = LocalFolderProvider::new(folder()).unwrap();
     assert!(matches!(
-        plan_sync(&empty, &notes, &baseline).unwrap()[0].action,
+        plan_sync(&empty, &notes, &baseline, &Default::default()).unwrap()[0].action,
         SyncAction::Push {
             expected_revision: None,
             ..
@@ -331,7 +357,7 @@ fn planner_one_sided_changes_and_missing_remote_are_non_destructive() {
     ));
     notes[0].hash = "incorrect".into();
     assert!(matches!(
-        plan_sync(&provider, &notes, &baseline),
+        plan_sync(&provider, &notes, &baseline, &Default::default()),
         Err(SyncError::InvalidContent)
     ));
 }

@@ -121,12 +121,25 @@ impl Worker {
                         if library != engine.snapshot().data_path {
                             let error = "资料库已切换，旧窗口的操作未执行；请在当前资料库重新操作"
                                 .to_owned();
+                            let editor_result = matches!(
+                                work.as_ref(),
+                                Work::Apply(
+                                    Command::Submit { .. }
+                                        | Command::Manual { .. }
+                                        | Command::EditSession { .. }
+                                )
+                            );
+                            let note_result = matches!(
+                                work.as_ref(),
+                                Work::Apply(Command::CreateNote { .. } | Command::SaveNote { .. })
+                            )
+                            .then(|| Err(error.clone()));
                             let _ = updates.send(Update {
                                 snapshot: Some(Arc::new(engine.snapshot())),
-                                notice: Some(Err(error.clone())),
-                                editor_result: true,
+                                notice: Some(Err(error)),
+                                editor_result,
                                 library_replaced: false,
-                                note_result: Some(Err(error)),
+                                note_result,
                                 sync_status: None,
                             });
                             continue;
@@ -174,7 +187,18 @@ impl Worker {
                                 | Command::EditSession { .. }
                         );
                         let restoring = matches!(&command, Command::Restore(_));
-                        let result = engine.apply(command, now).map_err(|e| format!("{e:#}"));
+                        let result = if synchronization.status.busy
+                            && (restoring || matches!(&command, Command::UnmanageNote { .. }))
+                        {
+                            Err(if restoring {
+                                "同步正在运行，请等待完成后再恢复资料库"
+                            } else {
+                                "同步正在运行，请等待完成后再取消管理笔记"
+                            }
+                            .into())
+                        } else {
+                            engine.apply(command, now).map_err(|e| format!("{e:#}"))
+                        };
                         if existing_notes.is_some() || saved_note.is_some() {
                             note_result = Some(match &result {
                                 Ok(_) => saved_note
@@ -282,6 +306,10 @@ impl Worker {
                     }
                     Ok(Work::SwitchLibrary(directory)) => {
                         let result = (|| -> anyhow::Result<String> {
+                            anyhow::ensure!(
+                                !synchronization.status.busy,
+                                "同步正在运行，请等待完成后再切换资料库"
+                            );
                             engine.checkpoint()?;
                             std::fs::create_dir_all(&directory)?;
                             let (next_lock, next) =
@@ -400,6 +428,163 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unmanage_is_rejected_while_network_sync_is_busy() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let worker = Worker::start(root.join("study.sqlite3"), None);
+        worker
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let created = apply(
+            &worker,
+            Command::CreateNote {
+                title: "protected during sync".into(),
+                content: "retained".into(),
+            },
+        );
+        let id = created.snapshot.unwrap().notes[0].id.clone();
+        let result = while_network_sync_is_busy(&worker, || {
+            apply(&worker, Command::UnmanageNote { note_id: id })
+        });
+        assert!(result.notice.unwrap().unwrap_err().contains("同步"));
+        assert!(!result.snapshot.unwrap().notes[0].detached);
+    }
+
+    #[test]
+    fn restore_is_rejected_while_sync_is_busy_and_succeeds_after_it_finishes() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let worker = Worker::start(root.join("study.sqlite3"), None);
+        worker
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let created = apply(
+            &worker,
+            Command::CreateNote {
+                title: "restore after sync".into(),
+                content: "retained".into(),
+            },
+        );
+        let note = created.snapshot.unwrap().notes[0].clone();
+        apply(
+            &worker,
+            Command::UnmanageNote {
+                note_id: note.id.clone(),
+            },
+        )
+        .notice
+        .unwrap()
+        .unwrap();
+        let backup = root.join("detached.sqlite3");
+        apply(&worker, Command::Backup(backup.clone()))
+            .notice
+            .unwrap()
+            .unwrap();
+        let reimported = apply(&worker, Command::Import(vec![PathBuf::from(&note.path)]));
+        reimported.notice.unwrap().unwrap();
+        assert!(!reimported.snapshot.unwrap().notes[0].detached);
+
+        let rejected = while_network_sync_is_busy(&worker, || {
+            apply(&worker, Command::Restore(backup.clone()))
+        });
+        assert!(rejected.notice.unwrap().unwrap_err().contains("同步"));
+        assert!(!rejected.library_replaced);
+        assert!(!rejected.snapshot.unwrap().notes[0].detached);
+        assert_eq!(std::fs::read_to_string(&note.path).unwrap(), "retained");
+
+        let finished = receive_notice(&worker);
+        assert!(!finished.sync_status.unwrap().busy);
+        let restored = apply(&worker, Command::Restore(backup));
+        restored.notice.unwrap().unwrap();
+        assert!(restored.library_replaced);
+        assert!(restored.snapshot.unwrap().notes[0].detached);
+    }
+
+    #[test]
+    fn library_switch_is_rejected_while_sync_is_busy_and_succeeds_after_it_finishes() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let worker = Worker::start(root.join("study.sqlite3"), None);
+        let origin = worker
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .snapshot
+            .unwrap()
+            .data_path
+            .clone();
+        let next = root.join("next");
+        let rejected = while_network_sync_is_busy(&worker, || {
+            worker
+                .sender
+                .send(Work::SwitchLibrary(next.clone()))
+                .unwrap();
+            receive_notice(&worker)
+        });
+        assert!(rejected.notice.unwrap().unwrap_err().contains("同步"));
+        assert!(!rejected.library_replaced);
+        assert_eq!(rejected.snapshot.unwrap().data_path, origin);
+        assert!(!next.exists());
+
+        let finished = receive_notice(&worker);
+        assert!(!finished.sync_status.unwrap().busy);
+        worker
+            .sender
+            .send(Work::SwitchLibrary(next.clone()))
+            .unwrap();
+        let switched = receive_notice(&worker);
+        switched.notice.unwrap().unwrap();
+        assert!(switched.library_replaced);
+        assert_ne!(switched.snapshot.unwrap().data_path, origin);
+        assert!(next.join("studyapp.sqlite3").is_file());
+    }
+
+    fn while_network_sync_is_busy(worker: &Worker, action: impl FnOnce() -> Update) -> Update {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // Hold the initial TLS handshake so the worker has a deterministic,
+        // in-flight network task. Release with invalid TLS after the assertion.
+        let url = format!("https://{}/", listener.local_addr().unwrap());
+        let (entered, wait_entered) = mpsc::channel();
+        let (release, wait_release) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            entered.send(()).unwrap();
+            wait_release.recv_timeout(Duration::from_secs(10)).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 500 Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        worker
+            .sender
+            .send(Work::ConfigureSync {
+                settings: crate::sync_runtime::SyncSettings {
+                    target: crate::sync_runtime::SyncTarget::WebDav {
+                        url,
+                        username: "fixture".into(),
+                    },
+                    auto_minutes: None,
+                },
+                password: Some(zeroize::Zeroizing::new("fixture".into())),
+            })
+            .unwrap();
+        receive_notice(worker).notice.unwrap().unwrap();
+        worker
+            .sender
+            .send(Work::StartSync { test_only: false })
+            .unwrap();
+        wait_entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let result = action();
+        release.send(()).unwrap();
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
     fn stale_ui_commands_and_import_completions_cannot_cross_libraries() {
         let root = tempfile::tempdir().unwrap().keep();
         let worker = Worker::start(root.join("original.sqlite3"), None);
@@ -441,6 +626,107 @@ mod tests {
             .unwrap();
         let barrier = apply(&worker, Command::SetPaused(true));
         assert!(barrier.snapshot.unwrap().notes.is_empty());
+    }
+
+    #[test]
+    fn stale_commands_report_only_their_own_editor_result() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let worker = Worker::start(root.join("original.sqlite3"), None);
+        let origin = worker
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .snapshot
+            .unwrap()
+            .data_path
+            .clone();
+        worker
+            .sender
+            .send(Work::SwitchLibrary(root.join("next")))
+            .unwrap();
+        assert!(receive_notice(&worker).library_replaced);
+        for (work, note_result, editor_result) in [
+            (
+                Work::Apply(Command::ExportNote {
+                    note_id: "old-note".into(),
+                    version_id: None,
+                    path: root.join("must-not-export.md"),
+                }),
+                false,
+                false,
+            ),
+            (
+                Work::Apply(Command::Backup(root.join("must-not-backup.sqlite3"))),
+                false,
+                false,
+            ),
+            (Work::ImportPaths(vec![]), false, false),
+            (
+                Work::Apply(Command::CreateNote {
+                    title: "stale new note".into(),
+                    content: "preserve UI draft".into(),
+                }),
+                true,
+                false,
+            ),
+            (
+                Work::Apply(Command::SaveNote {
+                    note_id: "old-note".into(),
+                    expected_hash: "old-hash".into(),
+                    content: "preserve UI draft".into(),
+                }),
+                true,
+                false,
+            ),
+            (
+                Work::Apply(Command::Manual {
+                    started_at: 1000,
+                    minutes: 1,
+                    summary: "stale session".into(),
+                    note_ids: vec![],
+                    version_ids: None,
+                }),
+                false,
+                true,
+            ),
+            (
+                Work::Apply(Command::Submit {
+                    session_id: "old-session".into(),
+                    summary: "stale pending session".into(),
+                    note_ids: vec![],
+                    version_ids: None,
+                }),
+                false,
+                true,
+            ),
+            (
+                Work::Apply(Command::EditSession {
+                    session_id: "old-session".into(),
+                    summary: "stale session edit".into(),
+                    learned: true,
+                    note_ids: vec![],
+                    version_ids: None,
+                }),
+                false,
+                true,
+            ),
+        ] {
+            worker
+                .sender
+                .send(Work::Scoped {
+                    library: origin.clone(),
+                    work: Box::new(work),
+                })
+                .unwrap();
+            let rejected = receive_notice(&worker);
+            assert!(rejected.notice.unwrap().is_err());
+            assert_eq!(rejected.note_result.is_some(), note_result);
+            assert!(rejected.note_result.is_none_or(|result| result.is_err()));
+            assert_eq!(rejected.editor_result, editor_result);
+            assert!(rejected.snapshot.unwrap().notes.is_empty());
+        }
+        assert!(!root.join("must-not-export.md").exists());
+        assert!(!root.join("must-not-backup.sqlite3").exists());
     }
 
     fn receive_notice(worker: &Worker) -> Update {

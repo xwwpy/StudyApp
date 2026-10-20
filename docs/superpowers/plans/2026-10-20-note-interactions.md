@@ -53,4 +53,4 @@ Owner: root and independent reviewer.
 - [x] Verify real visible reading/editing after navigation and save actual input.
 - [x] Review integrated diff for stale actions, data-loss paths and user-visible layout failures.
 - [x] Run format, Clippy, workspace tests, browser tests and fresh native smoke; bump to 0.5.0 and update docs.
-- [ ] Commit/push, verify CI, release and verify the actual published package.
+- [x] Commit/push, verify CI, release and verify the actual published package.

@@ -13,6 +13,12 @@
 - 独立审查已关闭发现的设置覆盖竞态、悬停遮挡、Unicode 保存拒绝恢复和累计补丁上限问题，无剩余可操作问题。`cargo-deny` 许可证/来源/依赖策略通过；`cargo-audit` 官方公告库检查为 0 个已知漏洞，保留 9 项停止维护及非 Windows glib 的 unsound 警告。
 - CI/CD 增加实际桌面 BMP、原生窗口状态、交互报告和日志归档；正式版本由两平台业务测试、前端检查、Windows 全量测试/Clippy/原生回归、安全和许可证检查通过后发布。
 
+提交 `a40c0cd` 的 [main CI](https://github.com/xwwpy/StudyApp/actions/runs/39412304784) 与[安全和许可证检查](https://github.com/xwwpy/StudyApp/actions/runs/39412304696)均已成功。Windows/Linux 业务测试、编辑器检查、Windows 全量测试/Clippy 及真实原生窗口回归全部通过。
+
+[v0.5.0 发布流水线](https://github.com/xwwpy/StudyApp/actions/runs/39412964578)全部成功，[正式 Release](https://github.com/xwwpy/StudyApp/releases/tag/v0.5.0)已发布。从 GitHub 重新下载 ZIP，14,753,422 字节，SHA256 `668f5c7ec904cac72e7471d617a15f0f2be002645631dfd5a1777a74f538e893`，同时匹配校验文件和 GitHub 资产摘要。实际包内修改后的源码、许可证和声明均已核对；解压到全新 `.scratch/published-v050-b079fd8ce32d47659b6b62d2c8454920` 后，正式 EXE 通过五页渲染和离线 WebView2 ready 检查。发布后的文档提交仅补充记录，未修改版本标签或已发布代码。
+
+本地优化发布包为 `WW-StudyApp-0.5.0-windows-x86_64.zip`，14,752,576 字节、986 个条目，SHA256 `c2a217c5fc4513c9b87c1d05c7c4322b5096afb88285d7aaa3248b3bc17a9945`。已检查包内 EXE、修改后的 GPUI 源码/许可证/来源说明，不含数据库、草稿、同步配置或 PDB。解压到全新的 `.scratch/package-v050-175e38eb9b35482d83404a2bd4aa3374/unpacked` 后，实际 `WW-StudyApp.exe` 通过五页渲染和离线编辑器 ready 检查。此启动检查不代替 ui-test 构建的完整交互验收；GitHub 发布包由 CI 独立构建。
+
 应用显示名称为 **WW-StudyApp**，现有数据目录、同步协议和凭据标识保持兼容。仍需 WebView2 Runtime；真实硬件输入法与各厂商 WebDAV/NAS 没有全矩阵验证，微信和账户级全量云保存仍预留。同步仅传输最新 Markdown；暂无代码签名和自动更新器。
 
 ## 0.4.0 连续编辑、目录和资料迁移验收

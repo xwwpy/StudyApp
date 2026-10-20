@@ -120,7 +120,7 @@ cargo build --locked --release -p studyapp-desktop
 
 [Security](https://github.com/xwwpy/StudyApp/blob/main/.github/workflows/security.yml) 在上述事件及每周运行 `cargo-audit 0.22.2` 和 `cargo-deny 0.20.2`。审计读取提交的 Cargo.lock 和当前 RustSec 数据，不忽略已知漏洞；许可证/来源检查限定支持的 Windows 依赖图，重复版本警告保留。Dependabot 每周检查 Cargo 和固定提交的 Actions。框架传递依赖的告警需要持续跟进，不能把构建通过等同于安全审计通过。
 
-0.1.0 于 2026-10-19 的本地 RustSec 审计报告 **0 个已知漏洞**，同时保留 `instant`、`paste`、`rustls-pemfile`、`rustybuzz`、`ttf-parser`、`zbus_names`、`zvariant`、`zvariant_derive` 的停止维护警告。这些来自框架传递依赖，应继续跟踪上游升级；没有添加忽略规则。该结果仅对应当时的 0.1.0 锁文件及公告快照，不证明新增同步依赖已完成审计；0.2.0 结果见验证记录与对应工作流，CI 会使用更新的公告。
+0.5.0 于 2026-10-20 的本地 RustSec 审计报告 **0 个已知漏洞**，[对应提交的远端安全检查](https://github.com/xwwpy/StudyApp/actions/runs/39412304696)也已通过。保留 9 项停止维护警告及非 Windows 依赖 `glib` 的 unsound 警告；没有添加忽略规则。框架传递依赖仍需跟踪上游升级，审计结论仅对应当时锁文件和公告快照，详细证据见 [验证记录](docs/verification.md)。
 
 [Release](https://github.com/xwwpy/StudyApp/blob/main/.github/workflows/release.yml) 仅由 `v*` 标签触发，验证标签等于所有工作区包版本，通过 Windows/Linux 学习核心与同步测试，以及格式、Windows 工作区测试、Clippy、依赖审计和原生 UI 冒烟后构建 Windows release ZIP 和 SHA256，使用最小权限发布 GitHub Release。Actions 固定完整提交，只有发布 job 拥有仓库写权限。工作流定义不代表已在 GitHub 执行成功；实际验证见 [verification.md](docs/verification.md)。
 

@@ -342,6 +342,24 @@ impl StudyApp {
             .child(muted(
                 "草稿自动保存在当前资料库；保存生成历史版本。修改笔记不会自动计为学习。",
             ))
+            .children(self.snapshot.as_ref().and_then(|snapshot| {
+                if !snapshot.settings.show_file_paths {
+                    return None;
+                }
+                draft.note_id.as_ref().and_then(|id| {
+                    snapshot
+                        .notes
+                        .iter()
+                        .find(|note| &note.id == id)
+                        .map(|note| {
+                            muted(studyapp_desktop::presentation::display_path(&note.path))
+                                .id("editor-file-path")
+                                .test_support()
+                                .truncate()
+                                .flex_shrink_0()
+                        })
+                })
+            }))
             .child(div().id("note-title").child(
                 Input::new(&self.note_title).disabled(self.note_saving || draft.note_id.is_some()),
             ))

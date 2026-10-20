@@ -16,7 +16,7 @@ if (-not $OutputDirectory) { $OutputDirectory = Join-Path $repoRoot 'dist' }
 $binary = (Resolve-Path -LiteralPath $BinaryPath).Path
 if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'BinaryPath must name one existing file' }
 $output = [IO.Path]::GetFullPath($OutputDirectory)
-$name = "StudyApp-$Version-windows-x86_64"
+$name = "WW-StudyApp-$Version-windows-x86_64"
 $staging = Join-Path $output $name
 $archive = Join-Path $output "$name.zip"
 $checksum = "$archive.sha256"
@@ -32,7 +32,7 @@ try {
     $workspace = @($metadata.packages | Where-Object { $_.id -in $metadata.workspace_members })
     if (@($workspace | Where-Object { $_.version -cne $Version }).Count -gt 0) { throw 'Version differs from workspace package versions' }
     [IO.Directory]::CreateDirectory($staging) | Out-Null
-    Copy-Item -LiteralPath $binary -Destination (Join-Path $staging 'studyapp.exe')
+    Copy-Item -LiteralPath $binary -Destination (Join-Path $staging 'WW-StudyApp.exe')
     foreach ($file in @('README.md', 'LICENSE')) {
         Copy-Item -LiteralPath (Join-Path $repoRoot $file) -Destination (Join-Path $staging $file)
     }
@@ -59,14 +59,25 @@ try {
     $apacheLicense = Join-Path (Split-Path -Parent $anyhow.manifest_path) 'LICENSE-APACHE'
     Copy-Item -LiteralPath $apacheLicense -Destination (Join-Path $staging 'LICENSE-APACHE-2.0.txt')
     $notices = [Collections.Generic.List[string]]::new()
-    $notices.Add("# Third-party notices`n`nDependencies below are conservatively collected from the locked Windows graph, including development/test features. Each dependency retains its own license. StudyApp does not modify their sources. Exact source archives are linked for source availability, including MPL-2.0 components. Shared Apache-2.0 license text is in LICENSE-APACHE-2.0.txt; crate-specific notices are copied where supplied in source archives.`n")
-    $dependencies = @($metadata.packages | Where-Object { $_.source } | Sort-Object name,version)
+    $notices.Add("# Third-party notices`n`nDependencies below are conservatively collected from the locked Windows graph, including development/test features. Each dependency retains its own license. Registry dependencies are unmodified. The patched GPUI Windows renderer is explicitly identified below, with its complete modified source and upstream license included. Exact source archives are linked for source availability, including MPL-2.0 components. Shared Apache-2.0 license text is in LICENSE-APACHE-2.0.txt; crate-specific notices are copied where supplied in source archives.`n")
+    $dependencies = @($metadata.packages | Where-Object { $_.id -notin $metadata.workspace_members } | Sort-Object name,version)
     foreach ($package in $dependencies) {
-        if ($package.source -notmatch '^registry\+') { throw "Review non-registry dependency notices manually: $($package.id)" }
-        $notices.Add("## $($package.name) $($package.version)`n`nLicense expression: $($package.license)`n`nSource: https://crates.io/api/v1/crates/$($package.name)/$($package.version)/download`n")
+        $root = Split-Path -Parent $package.manifest_path
+        if ($package.source -match '^registry\+') {
+            $notices.Add("## $($package.name) $($package.version)`n`nLicense expression: $($package.license)`n`nSource: https://crates.io/api/v1/crates/$($package.name)/$($package.version)/download`n")
+        } elseif (-not $package.source -and $package.name -eq 'gpui-pre-windows' -and $package.version -eq '0.3.9' -and [IO.Path]::GetFullPath($root) -eq [IO.Path]::GetFullPath((Join-Path $repoRoot 'vendor/gpui-pre-windows'))) {
+            $notices.Add("## gpui-pre-windows 0.3.9 (modified)`n`nLicense: Apache-2.0. WW-StudyApp changes the native composition target to draw behind child windows. Full patched source, original license and provenance are included in third-party/gpui-pre-windows-0.3.9/. See STUDYAPP-PATCH.md there.`n`nSource: https://github.com/xwwpy/StudyApp/tree/v$Version/vendor/gpui-pre-windows`n")
+            foreach ($sourceFile in (Get-ChildItem -LiteralPath $root -File -Recurse)) {
+                $relativeSource = [IO.Path]::GetRelativePath($root, $sourceFile.FullName)
+                $sourceDestination = Join-Path $staging "third-party/gpui-pre-windows-0.3.9/$relativeSource"
+                [IO.Directory]::CreateDirectory((Split-Path -Parent $sourceDestination)) | Out-Null
+                Copy-Item -LiteralPath $sourceFile.FullName -Destination $sourceDestination
+            }
+        } else {
+            throw "Review non-registry dependency notices manually: $($package.id)"
+        }
         if ($package.repository) { $notices.Add("Upstream: $($package.repository)`n") }
         if ($package.authors.Count) { $notices.Add("Declared authors: $($package.authors -join ', ')`n") }
-        $root = Split-Path -Parent $package.manifest_path
         $licenseFiles = @(Get-ChildItem -LiteralPath $root -File | Where-Object { $_.Name -match '^(LICEN[CS]E|COPYING|NOTICE|AUTHORS)($|[._-])' })
         if ($package.license_file) {
             $declaredFile = Get-Item -LiteralPath (Join-Path $root $package.license_file)

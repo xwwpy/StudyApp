@@ -1,4 +1,4 @@
-import { Compartment, EditorSelection, EditorState, Extension, Transaction } from "@codemirror/state";
+import { ChangeSet, Compartment, EditorSelection, EditorState, Extension, Text, Transaction } from "@codemirror/state";
 import { drawSelection, EditorView, keymap, placeholder, ViewUpdate } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
@@ -6,7 +6,8 @@ import { syntaxHighlighting } from "@codemirror/language";
 import { codeHighlighting, fencedLanguage } from "./languages";
 import { renderedMarkdown } from "./decorations";
 import { formatCommand } from "./formatting";
-import { documentBudget, documentLimits, MAX_DOCUMENT_BYTES, stringBytes } from "./limits";
+import { documentBudget, documentLimits, MAX_DOCUMENT_BYTES, MAX_TRANSACTION_PATCHES, stringBytes } from "./limits";
+import { incompleteScalars, scalarText, splitsScalar } from "./unicode";
 
 interface Load { generation: number; text: string; readonly: boolean; }
 interface TestAction { type: string; request?: string | number; from?: number; to?: number; text?: string; anchor?: number; head?: number; name?: string; edits?: number; }
@@ -34,6 +35,7 @@ let source = false;
 let loaded = false;
 let loadEpoch = 0;
 let pendingFlush = false;
+let unpublished: { base: EditorState; changes: ChangeSet } | undefined;
 const status = document.querySelector<HTMLElement>("#editor-status")!;
 const toolbar = document.querySelector<HTMLElement>("#toolbar")!;
 const sourceButton = document.querySelector<HTMLButtonElement>("#source-toggle")!;
@@ -70,21 +72,66 @@ function updateToolbar(): void {
 function readonlyExtensions(value: boolean): Extension {
   return [EditorState.readOnly.of(value), EditorView.editable.of(!value)];
 }
+function publishPatchSet(base: Text, changes: ChangeSet): void {
+  const patches: { fromLine: number; fromColumn: number; toLine: number; toColumn: number; text: string }[] = [];
+  changes.iterChanges((from, to, _newFrom, _newTo, inserted) => {
+    const first = base.lineAt(from), last = base.lineAt(to);
+    patches.push({
+      fromLine: first.number, fromColumn: from - first.from + 1,
+      toLine: last.number, toColumn: to - last.from + 1, text: inserted.toString()
+    });
+  });
+  if (!patches.length) return;
+  const baseRevision = revision++;
+  post({ type: "change", generation, baseRevision, revision, changes: patches });
+}
+function publishBatches(base: EditorState, changes: ChangeSet): void {
+  const budget = base.field(documentBudget);
+  const shrinking: { from: number; to: number; insert: Text }[] = [];
+  const growing: typeof shrinking = [];
+  changes.iterChanges((from, to, _newFrom, _newTo, insert) => {
+    const firstLine = base.doc.lineAt(from).number - 1;
+    const lastLine = base.doc.lineAt(to).number - 1;
+    let removedBytes = stringBytes(base.doc.sliceString(from, to));
+    for (let line = firstLine; line < lastLine; line++) removedBytes += budget.newlineWidths[line] - 1;
+    const insertedBytes = stringBytes(insert.toString()) + (insert.lines - 1) * (budget.preferredWidth - 1);
+    (insertedBytes < removedBytes ? shrinking : growing).push({ from, to, insert });
+  });
+  let applied = ChangeSet.empty(base.doc.length);
+  let current = base.doc;
+  // Keep original patches and untouched raw EOLs. Shrinking first ensures an
+  // intermediate native revision cannot exceed either endpoint's byte budget.
+  // Mapping each batch through prior batches keeps its line/column base exact.
+  for (const group of [shrinking, growing]) {
+    for (let offset = 0; offset < group.length; offset += MAX_TRANSACTION_PATCHES) {
+      const batch = ChangeSet.of(group.slice(offset, offset + MAX_TRANSACTION_PATCHES), base.doc.length).map(applied);
+      publishPatchSet(current, batch);
+      current = batch.apply(current);
+      applied = applied.compose(batch);
+    }
+  }
+}
 function publishChanges(update: ViewUpdate): void {
   if (!loaded) return;
   for (const transaction of update.transactions) {
     if (!transaction.docChanged) continue;
-    const changes: { fromLine: number; fromColumn: number; toLine: number; toColumn: number; text: string }[] = [];
-    transaction.changes.iterChanges((from, to, _newFrom, _newTo, inserted) => {
-      const first = transaction.startState.doc.lineAt(from);
-      const last = transaction.startState.doc.lineAt(to);
-      changes.push({
-        fromLine: first.number, fromColumn: from - first.from + 1,
-        toLine: last.number, toColumn: to - last.from + 1, text: inserted.toString()
-      });
+    // Windows can deliver an astral character as separate UTF-16 key events.
+    // Compose those transient edits before crossing Rust's scalar-string IPC
+    // boundary; never emit an unpaired surrogate or a split-scalar position.
+    const pending = unpublished
+      ? { base: unpublished.base, changes: unpublished.changes.compose(transaction.changes) }
+      : { base: transaction.startState, changes: transaction.changes };
+    unpublished = pending;
+    let patches = 0;
+    let valid = true;
+    pending.changes.iterChanges((from, to, _newFrom, _newTo, inserted) => {
+      patches++;
+      valid &&= scalarText(inserted.toString()) && !splitsScalar(pending.base.doc, from) && !splitsScalar(pending.base.doc, to);
     });
-    const baseRevision = revision++;
-    post({ type: "change", generation, baseRevision, revision, changes });
+    if (!valid) continue;
+    unpublished = undefined;
+    if (patches > MAX_TRANSACTION_PATCHES) publishBatches(pending.base, pending.changes);
+    else publishPatchSet(pending.base.doc, pending.changes);
   }
 }
 function command(name: string): boolean {
@@ -140,6 +187,7 @@ function load(value: Load): void {
   }
   if (stringBytes(value.text) > MAX_DOCUMENT_BYTES) { error("笔记超过 10 MiB，当前内容已保留。"); return; }
   loaded = false;
+  unpublished = undefined;
   loadEpoch++;
   generation = value.generation;
   revision = 0;
@@ -169,11 +217,22 @@ async function flush(value: { request: number }): Promise<void> {
     if (epoch !== loadEpoch) return;
     if (performance.now() > deadline) {
       pendingFlush = false;
+      if (unpublished && !view.composing) {
+        const rollback = incompleteScalars(view.state.doc);
+        if (rollback.length) {
+          view.dispatch({ changes: rollback, annotations: Transaction.addToHistory.of(false) });
+          const message = "最后一个字符输入未完成，已取消该次字符；请重新输入后再保存。";
+          warning(message);
+          updateToolbar();
+          post({ type: "flushRejected", generation: requestGeneration, request: value.request, message });
+          return;
+        }
+      }
       updateToolbar();
-      error("输入法尚未结束，请完成当前输入后重试保存");
+      error("输入法或 Unicode 字符尚未完成，请完成当前输入后重试保存");
       return;
     }
-    if (!view.composing && stableRevision === revision) stableTicks++;
+    if (!view.composing && !unpublished && stableRevision === revision) stableTicks++;
     else stableTicks = 0;
     stableRevision = revision;
   }

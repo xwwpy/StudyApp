@@ -19,6 +19,7 @@ fn short(engine: &mut Engine, now: i64) {
                 interval_minutes: 5,
                 answer_minutes: 1,
                 review_days: vec![1, 3],
+                show_file_paths: false,
             }),
             now,
         )
@@ -426,7 +427,8 @@ fn failed_sql_write_rolls_back_memory_and_database() {
                 Command::SaveSettings(Settings {
                     interval_minutes: 5,
                     answer_minutes: 1,
-                    review_days: vec![2]
+                    review_days: vec![2],
+                    show_file_paths: false,
                 }),
                 1000
             )
@@ -519,6 +521,7 @@ fn activity_ten_second_tick_splits_boundary_and_settings_take_next_cycle() {
                 interval_minutes: 10,
                 answer_minutes: 2,
                 review_days: vec![2],
+                show_file_paths: false,
             }),
             1299,
         )

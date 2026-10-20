@@ -47,6 +47,7 @@ impl Default for Settings {
             interval_minutes: 60,
             answer_minutes: 5,
             review_days: vec![1, 3, 7, 14, 30],
+            show_file_paths: false,
         }
     }
 }

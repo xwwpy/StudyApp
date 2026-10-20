@@ -86,8 +86,11 @@ jobs:
           name: windows-release-smoke
           path: |
             ${{ env.SMOKE_DIR }}/*.png
+            ${{ env.SMOKE_DIR }}/*.bmp
+            ${{ env.SMOKE_DIR }}/native-*.json
             ${{ env.SMOKE_DIR }}/smoke-result.txt
             ${{ env.SMOKE_DIR }}/library-smoke-result.txt
+            ${{ env.SMOKE_DIR }}/interactions-smoke-result.txt
             ${{ env.SMOKE_DIR }}/*.log
           if-no-files-found: warn
           retention-days: 30
@@ -132,5 +135,5 @@ jobs:
         run: |
           $assets = @(Get-ChildItem -LiteralPath dist -File | Where-Object { $_.Extension -in '.zip', '.sha256' } | ForEach-Object { $_.FullName })
           if ($assets.Count -ne 2) { throw 'Expected one ZIP and one checksum' }
-          gh release create $env:RELEASE_TAG @assets --verify-tag --title "StudyApp $env:RELEASE_TAG" --notes-file docs/release-notes.md
+          gh release create $env:RELEASE_TAG @assets --verify-tag --title "WW-StudyApp $env:RELEASE_TAG" --notes-file docs/release-notes.md
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

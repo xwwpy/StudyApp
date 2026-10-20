@@ -207,12 +207,26 @@ impl Engine {
                 "笔记所属目录已更新".into()
             }
             Command::SaveSettings(settings) => {
-                settings.validate()?;
-                if next.timer.active_seconds == 0 {
-                    next.timer.target_seconds = u64::from(settings.interval_minutes) * 60;
-                }
-                next.settings = settings;
+                Self::save_settings(&mut next, settings)?;
                 "设置已保存".into()
+            }
+            Command::SaveLearningSettings {
+                interval_minutes,
+                answer_minutes,
+                review_days,
+            } => {
+                let settings = Settings {
+                    interval_minutes,
+                    answer_minutes,
+                    review_days,
+                    ..next.settings.clone()
+                };
+                Self::save_settings(&mut next, settings)?;
+                "学习设置已保存".into()
+            }
+            Command::SetShowFilePaths(visible) => {
+                next.settings.show_file_paths = visible;
+                "显示设置已保存".into()
             }
             Command::SetPaused(paused) => {
                 if next.timer.paused && !paused {
@@ -462,6 +476,15 @@ impl Engine {
         self.state = next;
         Ok(message)
     }
+    fn save_settings(state: &mut State, settings: Settings) -> Result<()> {
+        settings.validate()?;
+        if state.timer.active_seconds == 0 {
+            state.timer.target_seconds = u64::from(settings.interval_minutes) * 60;
+        }
+        state.settings = settings;
+        Ok(())
+    }
+
     pub fn tick(&mut self, now: i64, elapsed_seconds: u64) -> Result<()> {
         self.recover_writes()?;
         let mut next = self.state.clone();

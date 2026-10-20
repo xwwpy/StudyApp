@@ -41,6 +41,17 @@ impl EditorDocument {
     pub fn revision(&self) -> u64 {
         self.revision
     }
+
+    /// Both a successful flush and an editable refusal may settle only the
+    /// exact outstanding request for the current document.
+    pub fn matches_flush_response(
+        &self,
+        generation: u64,
+        request: u64,
+        pending: Option<u64>,
+    ) -> bool {
+        generation == self.generation && pending == Some(request)
+    }
     /// Explicit recovery after a bridge failure. Keep canonical raw bytes when
     /// they already match; otherwise retain the document's preferred EOL.
     pub fn recover(&mut self, normalized: &str) -> anyhow::Result<()> {
@@ -196,6 +207,18 @@ fn line_starts(text: &str) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_flush_refusals_cannot_settle_another_request_or_document() {
+        let mut document = EditorDocument::new("保留".into());
+        assert!(document.matches_flush_response(1, 7, Some(7)));
+        assert!(!document.matches_flush_response(1, 6, Some(7)));
+        assert!(!document.matches_flush_response(1, 7, None));
+        document.reset("新文档".into());
+        assert!(!document.matches_flush_response(1, 7, Some(7)));
+        assert!(document.matches_flush_response(2, 7, Some(7)));
+        assert_eq!(document.text(), "新文档");
+    }
 
     fn patch(from: (usize, usize), to: (usize, usize), text: &str) -> EditPatch {
         EditPatch {

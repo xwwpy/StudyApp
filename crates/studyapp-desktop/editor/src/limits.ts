@@ -1,4 +1,5 @@
 import { EditorState, Extension, Facet, StateField, Text, Transaction } from "@codemirror/state";
+import { incompleteScalars, scalarText, splitsScalar } from "./unicode";
 
 export const MAX_DOCUMENT_BYTES = 10 * 1024 * 1024;
 export const MAX_TRANSACTION_PATCHES = 4096;
@@ -28,10 +29,13 @@ function estimate(transaction: Transaction): Budget {
   let bytes = previous.bytes;
   let rawBytes = previous.rawBytes;
   let patches = 0;
+  let recountUnicode = false;
   const newlineChanges: { from: number; to: number; inserted: number }[] = [];
   transaction.changes.iterChanges((from, to, _newFrom, _newTo, inserted) => {
     patches++;
     if (patches <= MAX_TRANSACTION_PATCHES) {
+      recountUnicode ||= !scalarText(inserted.toString())
+        || splitsScalar(transaction.startState.doc, from) || splitsScalar(transaction.startState.doc, to);
       const delta = textBytes(inserted) - textBytes(transaction.startState.doc, from, to);
       const firstLine = transaction.startState.doc.lineAt(from).number - 1;
       const lastLine = transaction.startState.doc.lineAt(to).number - 1;
@@ -42,6 +46,13 @@ function estimate(transaction: Transaction): Budget {
       if (firstLine !== lastLine || inserted.lines > 1) newlineChanges.push({ from: firstLine, to: lastLine, inserted: inserted.lines - 1 });
     }
   });
+  if (recountUnicode) {
+    // UTF-8 byte counts are not additive across a temporarily split surrogate.
+    // Ordinary complete Unicode transactions keep the incremental fast path.
+    const correction = textBytes(transaction.newDoc) - bytes;
+    bytes += correction;
+    rawBytes += correction;
+  }
   let newlineWidths = previous.newlineWidths;
   if (rawBytes <= MAX_DOCUMENT_BYTES && patches <= MAX_TRANSACTION_PATCHES && newlineChanges.length) {
     // Ordinary character typing reuses this list. Newline transactions make one
@@ -85,6 +96,10 @@ export function documentLimits(rawText: string, rejected: (message: string) => v
       const { rawBytes, patches } = estimate(transaction);
       if (rawBytes > MAX_DOCUMENT_BYTES) {
         rejected("编辑未应用：笔记上限为 10 MiB，请减少粘贴内容。");
+        const rollback = incompleteScalars(transaction.startState.doc);
+        if (rollback.length) {
+          return { changes: rollback, annotations: Transaction.addToHistory.of(false) };
+        }
         return [];
       }
       if (patches > MAX_TRANSACTION_PATCHES) {

@@ -11,7 +11,7 @@ use gpui_kit::component::{
     tooltip::Tooltip,
 };
 use gpui_kit::{prelude::FluentBuilder, *};
-use studyapp_core::{Command, Review, SessionStatus, Settings, Snapshot};
+use studyapp_core::{Command, Review, SessionStatus, Snapshot};
 use studyapp_desktop::presentation::{calendar_stats, duration, stamp};
 
 fn today_date() -> String {
@@ -856,15 +856,24 @@ impl StudyApp {
             .child(column().gap_2().child(muted("复习间隔（天，以逗号分隔）")).child(Input::new(&self.review_days)))
             .child(muted("询问间隔从下一时间段生效；复习间隔只影响新建计划。暂停和休眠期间不累计学习时间。"))
             .child(Button::new("save-settings").primary().label("保存设置").on_click(cx.listener(|this, _, _, cx| {
-                let result = (|| -> anyhow::Result<Settings> {
-                    Ok(Settings {
+                let result = (|| -> anyhow::Result<Command> {
+                    Ok(Command::SaveLearningSettings {
                         interval_minutes: this.interval.read(cx).value().trim().parse().map_err(|_| anyhow::anyhow!("询问间隔必须是整数"))?,
                         answer_minutes: this.deadline.read(cx).value().trim().parse().map_err(|_| anyhow::anyhow!("回答期限必须是整数"))?,
                         review_days: this.review_days.read(cx).value().replace('，', ",").split(',').map(|s| s.trim().parse::<u32>().map_err(|_| anyhow::anyhow!("复习间隔请填写逗号分隔的正整数"))).collect::<anyhow::Result<Vec<_>>>()?,
                     })
                 })();
-                match result { Ok(settings) => this.send(Command::SaveSettings(settings), cx), Err(e) => { this.notice = Some(Err(e.to_string())); cx.notify(); } }
+                match result { Ok(command) => this.send(command, cx), Err(e) => { this.notice = Some(Err(e.to_string())); cx.notify(); } }
             }))))
+            .child(card().child(heading("显示"))
+                .child(Checkbox::new("show-file-paths")
+                    .label("显示笔记文件的存储路径")
+                    .checked(snapshot.settings.show_file_paths)
+                    .disabled(self.storage_busy)
+                    .on_click(cx.listener(|this, checked, _, cx| {
+                        this.send(Command::SetShowFilePaths(*checked), cx);
+                    })))
+                .child(muted("默认隐藏笔记列表、详情、编辑区及空间管理中的文件地址。此选择自动保存在当前资料库；右键仍可定位或复制路径。")))
             .child(card().child(heading("数据保存"))
                 .child(row().child(pill("✓ 本地资料库", LIGHT)).child(muted("可在下方配置笔记文件同步")))
                 .child(muted(studyapp_desktop::presentation::display_path(&snapshot.data_path)))

@@ -8,7 +8,7 @@ use gpui_kit::{
         Disableable, Selectable, Sizable,
         button::{Button, ButtonVariants},
         input::Input,
-        tooltip::Tooltip,
+        menu::ContextMenuExt,
     },
     prelude::FluentBuilder,
     *,
@@ -79,6 +79,9 @@ impl StudyApp {
             )
             .children(notes.map(|note| {
                 let id = note.id.clone();
+                let drag = crate::note_actions::NoteDrag::new(note, snapshot);
+                let menu_note_id = id.clone();
+                let menu_owner = cx.weak_entity();
                 let tip = note_tip(snapshot, &id);
                 let chosen = self.selected_note.as_ref() == Some(&id);
                 card()
@@ -98,13 +101,77 @@ impl StudyApp {
                         snapshot.versions.iter().filter(|v| v.note_id == id).count(),
                         stamp(note.updated_at)
                     )))
+                    .when(snapshot.settings.show_file_paths, |c| {
+                        c.child(
+                            muted(display_path(&note.path))
+                                .id(SharedString::from(format!("note-row-path-{}", note.id)))
+                                .test_support()
+                                .truncate(),
+                        )
+                    })
                     .when(note.missing, |c| c.child(pill("原文件失联", 0xFFF0E9)))
-                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    // Anchor within the sidebar so native editor children cannot
+                    // cover learning/review timestamps near the row's right edge.
+                    .tooltip(move |window, cx| sidebar_tooltip(tip.clone(), window, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_note = Some(id.clone());
                         this.selected_version = None;
                         cx.notify();
                     }))
+                    .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+                    .context_menu(move |menu, window, cx| {
+                        let opened = menu_owner.update(cx, |this, cx| {
+                            let snapshot = this.snapshot.clone()?;
+                            let note = snapshot
+                                .notes
+                                .iter()
+                                .find(|n| n.id == menu_note_id)?
+                                .clone();
+                            this.note_menu_sequence = this.note_menu_sequence.wrapping_add(1);
+                            let token = this.note_menu_sequence;
+                            this.active_note_menu = Some(token);
+                            this.note_content
+                                .update(cx, |editor, cx| editor.set_visible(false, cx));
+                            cx.notify();
+                            Some((snapshot, note, token, this.storage_busy))
+                        });
+                        let Ok(Some((snapshot, note, token, busy))) = opened else {
+                            return menu;
+                        };
+                        let dismissed = menu_owner.clone();
+                        cx.subscribe_self(move |_, _: &DismissEvent, cx| {
+                            let _ = dismissed.update(cx, |this, cx| {
+                                if this.active_note_menu == Some(token) {
+                                    this.active_note_menu = None;
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
+                        let released = menu_owner.clone();
+                        cx.on_release(move |_, cx| {
+                            let _ = released.update(cx, |this, cx| {
+                                if this.active_note_menu == Some(token) {
+                                    this.active_note_menu = None;
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
+                        let action_owner = menu_owner.clone();
+                        crate::note_actions::note_context_menu(
+                            menu,
+                            &snapshot,
+                            &note,
+                            busy,
+                            window,
+                            cx,
+                            move |action, _, cx| {
+                                let _ = action_owner
+                                    .update(cx, |this, cx| this.handle_note_action(action, cx));
+                            },
+                        )
+                    })
             }));
         let selected = snapshot
             .notes
@@ -227,7 +294,15 @@ impl StudyApp {
                 .when(note.detached, |c| {
                     c.child(muted("已取消管理 · 当前仅查看历史快照"))
                 })
-                .child(muted(display_path(&note.path)).truncate().flex_shrink_0())
+                .when(snapshot.settings.show_file_paths, |c| {
+                    c.child(
+                        muted(display_path(&note.path))
+                            .id("note-file-path")
+                            .test_support()
+                            .truncate()
+                            .flex_shrink_0(),
+                    )
+                })
                 .child(muted(format!(
                     "{} · 创建：{} · 修改：{}",
                     if note.managed {

@@ -81,6 +81,9 @@ pub struct StudyApp {
     pub storage_report: Option<crate::storage_backend::StorageReport>,
     pub storage_busy: bool,
     pub storage_confirm: Option<String>,
+    pub storage_copy_scroll: ScrollHandle,
+    pub active_note_menu: Option<u64>,
+    pub note_menu_sequence: u64,
     notified: HashSet<String>,
     _poll: Task<()>,
 }
@@ -179,6 +182,9 @@ impl StudyApp {
             storage_report: None,
             storage_busy: false,
             storage_confirm: None,
+            storage_copy_scroll: ScrollHandle::new(),
+            active_note_menu: None,
+            note_menu_sequence: 0,
             drafts: DraftStore::new(),
             note_title,
             note_content,
@@ -323,6 +329,8 @@ impl StudyApp {
             self.show_detached = false;
             self.storage_report = None;
             self.storage_confirm = None;
+            self.storage_copy_scroll = ScrollHandle::new();
+            self.active_note_menu = None;
             self.note_editor = None;
             self.recoverable_draft = None;
             self.note_saving = false;
@@ -494,8 +502,8 @@ impl StudyApp {
                 "import" => rfd::FileDialog::new().set_title("导入 Markdown 笔记").add_filter("Markdown", &["md", "markdown"]).pick_files().map(Work::ImportPaths),
                 "import-folder" => rfd::FileDialog::new().set_title("导入目录中的 Markdown").pick_folder().map(|p| Work::ImportPaths(vec![p])),
                 "relink" => rfd::FileDialog::new().add_filter("Markdown", &["md", "markdown"]).pick_file().zip(note).map(|(path, note_id)| Work::Apply(Command::Relink { note_id, path })),
-                "backup" => rfd::FileDialog::new().set_file_name(format!("StudyApp-{}.sqlite3", Local::now().format("%Y%m%d-%H%M%S"))).save_file().map(|p| Work::Apply(Command::Backup(p))),
-                "restore" => rfd::FileDialog::new().set_title("选择 StudyApp 备份（恢复前自动保留当前资料）").add_filter("SQLite 备份", &["sqlite3", "sqlite", "db"]).pick_file().and_then(|p| {
+                "backup" => rfd::FileDialog::new().set_file_name(format!("WW-StudyApp-{}.sqlite3", Local::now().format("%Y%m%d-%H%M%S"))).save_file().map(|p| Work::Apply(Command::Backup(p))),
+                "restore" => rfd::FileDialog::new().set_title("选择 WW-StudyApp 备份（恢复前自动保留当前资料）").add_filter("SQLite 备份", &["sqlite3", "sqlite", "db"]).pick_file().and_then(|p| {
                     let confirmed = rfd::MessageDialog::new().set_title("恢复资料库").set_description("将用选中的备份恢复当前资料库。恢复前会自动保存当前资料的备份；源 Markdown 文件不会改变。").set_buttons(rfd::MessageButtons::OkCancel).show();
                     (confirmed == rfd::MessageDialogResult::Ok).then_some(Work::Apply(Command::Restore(p)))
                 }),
@@ -690,9 +698,9 @@ impl StudyApp {
                             .text_2xl()
                             .font_weight(FontWeight::BOLD)
                             .text_color(rgb(GREEN))
-                            .child("拾光学习"),
+                            .child("WW-StudyApp"),
                     )
-                    .child(muted("STUDYAPP  /  本地资料库")),
+                    .child(muted("本地资料库")),
             )
             .children(
                 items

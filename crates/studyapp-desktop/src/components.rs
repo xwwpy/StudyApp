@@ -7,6 +7,42 @@ pub const LIGHT: u32 = 0xEAF4ED;
 pub const BORDER: u32 = 0xE3E9E3;
 pub const BG: u32 = 0xF5F7F3;
 
+/// Native children paint above GPUI. Place sidebar tooltips to the pointer's
+/// left in window coordinates, keeping the editor's pixels unobscured.
+pub fn sidebar_tooltip(text: String, window: &mut Window, cx: &mut App) -> AnyView {
+    let position = window.mouse_position() + point(px(-8.), px(16.));
+    cx.new(|_| SidebarTooltip { text, position }).into()
+}
+
+struct SidebarTooltip {
+    text: String,
+    position: Point<Pixels>,
+}
+
+impl Render for SidebarTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        anchored()
+            .position(self.position)
+            .anchor(Anchor::TopRight)
+            .snap_to_window()
+            .child(
+                div()
+                    .id("sidebar-tooltip-content")
+                    .test_support()
+                    .w(px(220.))
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(0xFFFFFF))
+                    .text_color(rgb(INK))
+                    .text_sm()
+                    .shadow_md()
+                    .child(self.text.clone()),
+            )
+    }
+}
+
 pub fn column() -> Div {
     div().flex().flex_col().gap_4()
 }

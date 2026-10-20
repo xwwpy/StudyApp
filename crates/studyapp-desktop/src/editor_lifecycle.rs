@@ -302,8 +302,10 @@ impl StudyApp {
     /// Load a read-only document into the same persistent browser surface.
     /// Reading and writing therefore share highlighting and viewport limits.
     pub fn prepare_document_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut show =
-            self.page == Page::Notes && self.confirmation.is_none() && self.draft_discard.is_none();
+        let mut show = self.page == Page::Notes
+            && self.confirmation.is_none()
+            && self.draft_discard.is_none()
+            && self.active_note_menu.is_none();
         if self.note_editor.is_none() {
             let version = self.snapshot.as_ref().and_then(|s| {
                 s.versions.iter().rev().find(|v| {

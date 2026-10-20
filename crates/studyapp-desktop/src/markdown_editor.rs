@@ -35,6 +35,11 @@ enum Message {
         #[serde(rename = "normalizedText")]
         normalized_text: String,
     },
+    FlushRejected {
+        generation: u64,
+        request: u64,
+        message: String,
+    },
     Save {
         generation: u64,
     },
@@ -250,9 +255,11 @@ impl MarkdownEditor {
                         revision,
                         normalized_text,
                     } => {
-                        if generation != self.document.generation()
-                            || self.pending.as_ref().is_none_or(|(id, _)| *id != request)
-                        {
+                        if !self.document.matches_flush_response(
+                            generation,
+                            request,
+                            self.pending.as_ref().map(|(id, _)| *id),
+                        ) {
                             return Ok(());
                         }
                         if self.recovering {
@@ -271,6 +278,29 @@ impl MarkdownEditor {
                         self.pending = None;
                         self.readonly = true;
                         cx.emit(MarkdownEvent::Flushed(request));
+                    }
+                    Message::FlushRejected {
+                        generation,
+                        request,
+                        message,
+                    } => {
+                        if self.document.matches_flush_response(
+                            generation,
+                            request,
+                            self.pending.as_ref().map(|(id, _)| *id),
+                        ) {
+                            self.pending = None;
+                            self.recovering = false;
+                            self.readonly = self.resume_readonly;
+                            self.evaluate(&format!(
+                                "window.studyappEditor.setReadonly({});",
+                                self.readonly
+                            ))?;
+                            // A safe refusal cancels the caller's save intent,
+                            // while preserving an editable, synchronized draft.
+                            cx.emit(MarkdownEvent::Error(message));
+                            cx.notify();
+                        }
                     }
                     Message::Save { generation } => {
                         if generation == self.document.generation() && !self.readonly {
@@ -366,6 +396,20 @@ impl MarkdownEditor {
         self.evaluate(&format!("window.studyappEditor.test({action});"))
     }
     #[cfg(feature = "ui-test")]
+    pub(crate) fn inject_unfinished_character(&self) -> anyhow::Result<()> {
+        // Omitting request keeps the intermediate unpaired UTF-16 snapshot in
+        // JavaScript; serializing it through test-result IPC would be invalid.
+        self.evaluate(
+            "void (async () => {
+                const { text } = await window.studyappEditor.test({ type: 'snapshot' });
+                await window.studyappEditor.test({
+                    type: 'replace', from: text.length, to: text.length,
+                    text: String.fromCharCode(0xD83E)
+                });
+            })();",
+        )
+    }
+    #[cfg(feature = "ui-test")]
     pub(crate) fn inject_test_error(&self, stale: bool) {
         let generation = self.document.generation() + u64::from(stale);
         self.sender
@@ -376,6 +420,14 @@ impl MarkdownEditor {
                 .to_string(),
             )
             .unwrap();
+    }
+
+    #[cfg(all(windows, feature = "ui-test"))]
+    pub(crate) fn native_state(&self) -> anyhow::Result<serde_json::Value> {
+        self.host
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WebView 尚未创建"))?
+            .native_state()
     }
 
     #[cfg(all(windows, feature = "ui-test"))]
@@ -408,6 +460,7 @@ impl Render for MarkdownEditor {
         let weak = cx.weak_entity();
         column()
             .id("continuous-markdown-editor")
+            .test_support()
             .flex_1()
             .min_h_0()
             .min_w_0()

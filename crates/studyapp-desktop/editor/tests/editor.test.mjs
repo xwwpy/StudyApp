@@ -55,6 +55,24 @@ async function setup(text = "", testEnabled = true) {
 async function action(page, value) { return page.evaluate(value => window.studyappEditor.test(value), value); }
 async function state(page) { return action(page, { type: "snapshot" }); }
 async function select(page, anchor, head = anchor) { return action(page, { type: "select", anchor, head }); }
+function replayRawChanges(raw, messages, preferredEol) {
+  for (const [index, message] of messages.entries()) {
+    assert.ok(message.changes.length <= 4096, `emitted ${message.changes.length} patches`);
+    assert.equal(message.baseRevision, index);
+    assert.equal(message.revision, index + 1);
+    const starts = [0];
+    for (const match of raw.matchAll(/\r\n|\r|\n/g)) starts.push(match.index + match[0].length);
+    const edits = message.changes.map(change => ({
+      from: starts[change.fromLine - 1] + change.fromColumn - 1,
+      to: starts[change.toLine - 1] + change.toColumn - 1,
+      text: change.text.replace(/\n/g, preferredEol)
+    }));
+    for (const edit of edits.reverse()) raw = raw.slice(0, edit.from) + edit.text + raw.slice(edit.to);
+    assert.ok(raw.isWellFormed(), "native revision must remain scalar-valid");
+    assert.ok(Buffer.byteLength(raw) <= 10 * 1024 * 1024, "native revision exceeds the byte budget");
+  }
+  return raw;
+}
 
 test("bundled editor starts with one continuous editable Markdown surface", async () => {
   const { page, errors } = await setup("# 连续编辑\n\n正文包含 **粗体** 和 *强调*。\n\n- 第一项\n- 第二项\n\n结尾");
@@ -135,6 +153,161 @@ test("toolbar formats selections spanning paragraphs and supports task interacti
   assert.ok((await state(page)).text.includes("- [x] 待办"));
   await page.evaluate(() => window.studyappEditor.command("undo"));
   assert.ok((await state(page)).text.includes("- [ ] 待办"));
+  await page.close();
+});
+
+test("split native UTF-16 input publishes one scalar-safe patch and exact byte budget", async () => {
+  const { page } = await setup("甲\r\n乙");
+  await action(page, { type: "replace", from: 1, text: "\uD83E" });
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "change").length), 0,
+    "a lone high surrogate must never be sent to Rust JSON");
+  await action(page, { type: "replace", from: 2, text: "\uDDE0" });
+  assert.equal((await state(page)).text, "甲🧠\n乙");
+  const messages = await page.evaluate(() => window.messages.filter(m => m.type === "change"));
+  assert.deepEqual(messages, [{
+    type: "change", generation: 41, baseRevision: 0, revision: 1,
+    changes: [{ fromLine: 1, fromColumn: 2, toLine: 1, toColumn: 2, text: "🧠" }]
+  }]);
+  assert.equal((await state(page)).utf8Bytes, Buffer.byteLength("甲🧠\n乙"));
+  assert.equal((await state(page)).rawBytes, Buffer.byteLength("甲🧠\r\n乙"));
+  await page.evaluate(() => window.studyappEditor.flush({ request: 91 }));
+  const flush = await page.evaluate(() => window.messages.find(m => m.type === "flush"));
+  assert.equal(flush.revision, 1);
+  assert.equal(flush.normalizedText, "甲🧠\n乙");
+  await page.close();
+});
+
+test("flush waits for split native input and a new document drops pending old-generation text", async () => {
+  const { page } = await setup("");
+  await action(page, { type: "replace", from: 0, text: "\uD83E" });
+  await page.evaluate(() => {
+    window.flushPending = window.studyappEditor.flush({ request: 92 });
+    setTimeout(() => window.studyappEditor.test({ type: "replace", from: 1, text: "\uDDE0" }), 80);
+  });
+  await page.evaluate(() => window.flushPending);
+  assert.equal((await state(page)).text, "🧠");
+  assert.equal(await page.evaluate(() => window.messages.find(m => m.type === "flush").normalizedText), "🧠");
+  await page.evaluate(() => window.studyappEditor.load({ generation: 42, text: "", readonly: false }));
+  await action(page, { type: "replace", from: 0, text: "\uD83E" });
+  await page.evaluate(() => window.studyappEditor.load({ generation: 43, text: "新文档", readonly: false }));
+  await action(page, { type: "replace", from: 3, text: "。" });
+  const last = await page.evaluate(() => window.messages.filter(m => m.type === "change").at(-1));
+  assert.equal(last.generation, 43);
+  assert.equal(last.baseRevision, 0);
+  assert.deepEqual(last.changes, [{ fromLine: 1, fromColumn: 4, toLine: 1, toColumn: 4, text: "。" }]);
+  await page.close();
+});
+
+test("composed native Unicode edits stay within the bridge patch cap and preserve mixed EOLs", async () => {
+  const lines = Array.from({ length: 2048 }, (_, index) => `line ${index}`);
+  const separators = lines.map((_, index) => index % 5 === 0 ? "\n" : index % 7 === 0 ? "\r" : "\r\n");
+  const original = "head\r\n" + lines.map((line, index) => line + separators[index]).join("") + "tail";
+  const { page } = await setup(original);
+  await action(page, { type: "replace", from: 1, text: "\uD83E" });
+  const pending = (await state(page)).text;
+  await select(page, pending.indexOf("line 0"), pending.lastIndexOf("\ntail"));
+  await page.evaluate(() => window.studyappEditor.command("bold"));
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "change").length), 0);
+  await action(page, { type: "replace", from: 2, text: "\uDDE0" });
+  const messages = await page.evaluate(() => window.messages.filter(m => m.type === "change"));
+  assert.ok(messages.length > 0);
+  const raw = replayRawChanges(original, messages, "\r\n");
+  const expected = "h🧠ead\r\n" + lines.map((line, index) => `**${line}**` + separators[index]).join("") + "tail";
+  assert.equal(raw, expected);
+  assert.equal((await state(page)).rawBytes, Buffer.byteLength(expected));
+  await page.evaluate(() => window.studyappEditor.flush({ request: 96 }));
+  const flush = await page.evaluate(() => window.messages.find(m => m.type === "flush"));
+  assert.equal(flush.revision, messages.length);
+  assert.equal(flush.normalizedText, expected.replace(/\r\n?|\n/g, "\n"));
+  await page.close();
+});
+
+test("composed native patch batches respect the raw byte limit at every intermediate revision", async () => {
+  const limit = 10 * 1024 * 1024;
+  const lines = Array.from({ length: 2048 }, (_, index) => `line ${index}`);
+  const separators = lines.map((_, index) => index % 5 === 0 ? "\n" : index % 7 === 0 ? "\r" : "\r\n");
+  const suffix = lines.map((line, index) => line + separators[index]).join("") + "tail";
+  const prefix = "x".repeat(limit - 3 - Buffer.byteLength(suffix) - 2);
+  const original = prefix + "\r\n" + suffix;
+  const { page } = await setup(original);
+  await action(page, { type: "replace", from: (await state(page)).text.length, text: "\uD83E" });
+  await action(page, { type: "replace", from: 0, to: 8193, text: "" });
+  const pending = (await state(page)).text;
+  await select(page, pending.indexOf("line 0"), pending.lastIndexOf("\ntail"));
+  await page.evaluate(() => window.studyappEditor.command("bold"));
+  await action(page, { type: "replace", from: (await state(page)).text.length, text: "\uDDE0" });
+  const messages = await page.evaluate(() => window.messages.filter(m => m.type === "change"));
+  const raw = replayRawChanges(original, messages, "\r\n");
+  const expected = prefix.slice(8193) + "\r\n" + lines.map((line, index) => `**${line}**` + separators[index]).join("") + "tail🧠";
+  assert.ok(raw === expected, "batched revisions must preserve the complete mixed-EOL document");
+  assert.equal(Buffer.byteLength(raw), limit);
+  assert.equal((await state(page)).rawBytes, limit);
+  assert.equal((await state(page)).readonly, false);
+  await page.evaluate(() => window.studyappEditor.flush({ request: 97 }));
+  const flush = await page.evaluate(() => window.messages.find(m => m.type === "flush"));
+  assert.equal(flush.revision, messages.length);
+  assert.ok(flush.normalizedText === expected.replace(/\r\n?|\n/g, "\n"));
+  await page.close();
+});
+
+test("undo and redo across separate surrogate history groups publish only complete characters", async () => {
+  const { page } = await setup("甲乙");
+  await action(page, { type: "replace", from: 1, text: "\uD83E" });
+  await page.waitForTimeout(600);
+  await action(page, { type: "replace", from: 2, text: "\uDDE0" });
+  await page.evaluate(() => window.studyappEditor.command("undo"));
+  assert.equal((await state(page)).text, "甲\uD83E乙");
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "change").length), 1);
+  await page.evaluate(() => window.studyappEditor.command("undo"));
+  assert.equal((await state(page)).text, "甲乙");
+  await page.evaluate(() => window.studyappEditor.command("redo"));
+  assert.equal((await state(page)).text, "甲\uD83E乙");
+  await page.evaluate(() => window.studyappEditor.command("redo"));
+  assert.equal((await state(page)).text, "甲🧠乙");
+  const messages = await page.evaluate(() => window.messages.filter(m => m.type === "change"));
+  assert.equal(messages.length, 3);
+  assert.deepEqual(messages.map(m => m.revision), [1, 2, 3]);
+  assert.deepEqual(messages[1].changes, [{ fromLine: 1, fromColumn: 2, toLine: 1, toColumn: 4, text: "" }]);
+  assert.equal((await state(page)).rawBytes, Buffer.byteLength("甲🧠乙"));
+  await page.close();
+});
+
+test("incomplete native Unicode input never receives a save acknowledgement", async () => {
+  const { page } = await setup("保留");
+  await page.evaluate(() => {
+    const original = window.ipc.postMessage;
+    window.ipc.postMessage = json => {
+      original(json);
+      if (JSON.parse(json).type === "error") setTimeout(() => window.studyappEditor.setReadonly(true), 0);
+    };
+  });
+  await action(page, { type: "replace", from: 2, text: "\uD83E" });
+  await action(page, { type: "replace", from: 3, text: "后续" });
+  await page.evaluate(() => window.studyappEditor.flush({ request: 93 }));
+  assert.equal((await state(page)).text, "保留后续");
+  assert.equal(await page.evaluate(() => window.messages.some(m => m.type === "flush")), false);
+  assert.deepEqual(await page.evaluate(() => window.messages.filter(m => m.type === "change").flatMap(m => m.changes)),
+    [{ fromLine: 1, fromColumn: 3, toLine: 1, toColumn: 3, text: "后续" }]);
+  assert.equal(await page.evaluate(() => window.messages.some(m => m.type === "flushRejected" && m.generation === 41 && m.request === 93)), true);
+  assert.equal((await state(page)).readonly, false);
+  await action(page, { type: "replace", from: 4, text: "🧠" });
+  await page.evaluate(() => window.studyappEditor.flush({ request: 94 }));
+  assert.equal(await page.evaluate(() => window.messages.find(m => m.type === "flush").normalizedText), "保留后续🧠");
+  await page.close();
+});
+
+test("over-limit native emoji rolls back only its incomplete units and leaves editing usable", async () => {
+  const original = "x".repeat(10 * 1024 * 1024 - 3);
+  const { page } = await setup(original);
+  await action(page, { type: "replace", from: original.length, text: "\uD83E" });
+  await action(page, { type: "replace", from: original.length + 1, text: "\uDDE0" });
+  assert.ok((await state(page)).text === original, "over-limit pair must restore the valid document");
+  assert.equal((await state(page)).rawBytes, original.length);
+  assert.equal((await state(page)).readonly, false);
+  await action(page, { type: "replace", from: 0, to: 1, text: "" });
+  await action(page, { type: "replace", from: original.length - 1, text: "🧠" });
+  await page.evaluate(() => window.studyappEditor.flush({ request: 95 }));
+  assert.equal(await page.evaluate(() => window.messages.find(m => m.type === "flush").normalizedText.endsWith("🧠")), true);
   await page.close();
 });
 

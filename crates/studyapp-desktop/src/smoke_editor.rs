@@ -109,6 +109,50 @@ pub async fn exercise(
     let rendered = bridge(window, &editor, json!({"type":"snapshot"}), cx).await;
     assert_eq!(rendered["text"], first);
     assert_eq!(rendered["source"], false);
+    #[cfg(windows)]
+    {
+        let count = window
+            .update(cx, |_, _, cx| {
+                editor.read(cx).inject_unfinished_character().unwrap();
+                view.read(cx).snapshot.as_ref().unwrap().notes.len()
+            })
+            .unwrap();
+        pause(cx).await;
+        window
+            .update(cx, |_, window, cx| window.click("save-note", cx))
+            .unwrap();
+        crate::smoke_library::until(window, view, "incomplete Unicode save refused without freezing editor", |app, cx| {
+            !app.note_saving && app.note_intent.is_none()
+                && app.notice.as_ref().is_some_and(|notice| matches!(notice, Err(message) if message.contains("字符输入未完成")))
+                && app.note_content.read(cx).error().is_none()
+        }, cx).await;
+        let recovered = bridge(window, &editor, json!({"type":"snapshot"}), cx).await;
+        assert_eq!(recovered["text"], first);
+        assert_eq!(recovered["readonly"], false);
+        window
+            .update(cx, |_, _, cx| {
+                assert_eq!(view.read(cx).snapshot.as_ref().unwrap().notes.len(), count)
+            })
+            .unwrap();
+        bridge(
+            window,
+            &editor,
+            json!({"type":"replace","from":0,"to":0,"text":"继续输入"}),
+            cx,
+        )
+        .await;
+        bridge(
+            window,
+            &editor,
+            json!({"type":"replace","from":0,"to":4,"text":""}),
+            cx,
+        )
+        .await;
+        assert_eq!(
+            bridge(window, &editor, json!({"type":"snapshot"}), cx).await["text"],
+            first
+        );
+    }
     window
         .update(cx, |_, _, cx| editor.read(cx).inject_test_error(true))
         .unwrap();
@@ -389,6 +433,9 @@ pub async fn close_with_draft(window: AnyWindowHandle, view: &Entity<StudyApp>, 
             view.read(cx).note_content.clone()
         })
         .unwrap();
+    #[cfg(windows)]
+    crate::smoke_visibility::type_into(window, &editor, "关闭窗口前的末次输入 🧠", cx).await;
+    #[cfg(not(windows))]
     bridge(
         window,
         &editor,

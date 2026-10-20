@@ -44,6 +44,8 @@ pub fn prepare(database: &Path) -> anyhow::Result<()> {
 pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathBuf, cx: &mut App) {
     cx.spawn(async move |cx| {
         cx.background_executor().timer(Duration::from_secs(2)).await;
+        #[cfg(all(windows, feature = "ui-test"))]
+        Box::pin(crate::smoke_visibility::first_open(window, &view, &database, cx)).await;
         for (index, page) in [Page::Today, Page::Notes, Page::Reviews, Page::Stats, Page::Settings].into_iter().enumerate() {
             let result = window.update(cx, |_, window, cx| {
                 view.update(cx, |app, cx| {
@@ -188,21 +190,25 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
                 let snapshot = view.read(cx).snapshot.as_ref().unwrap();
                 assert_eq!(snapshot.versions.iter().filter(|v| v.note_id == managed_id).count(), 2);
                 window.click(("nav", 4_usize), cx);
-                // Scroll the actual settings surface to expose the sync card.
-                window.dispatch_event(ScrollWheelEvent { position: point(px(800.), px(450.)), delta: ScrollDelta::Pixels(point(px(0.), px(-760.))), ..Default::default() }.to_platform_input(), cx);
-                window.render_frame(cx);
+                // Scroll outside nested lists to expose the sync card.
+                #[cfg(windows)]
+                crate::smoke_library::reveal_scrolled(window, "save-sync-settings".into(), "page-scroll", cx);
                 window.click(("sync-target", 1_usize), cx);
                 let panel = view.read(cx).sync_panel.clone();
                 panel.update(cx, |panel, cx| panel.folder.update(cx, |s, cx| s.set_value(sync_folder.to_string_lossy().into_owned(), window, cx)));
+                #[cfg(windows)]
+                crate::smoke_library::reveal_scrolled(window, "save-sync-settings".into(), "page-scroll", cx);
                 window.click("save-sync-settings", cx);
             }).expect("configure folder sync through interface");
             cx.background_executor().timer(Duration::from_secs(1)).await;
             window.update(cx, |_, window, cx| {
+                #[cfg(windows)]
+                crate::smoke_library::reveal_scrolled(window, "test-sync".into(), "page-scroll", cx);
                 window.click("test-sync", cx);
             }).expect("test folder connection");
             cx.background_executor().timer(Duration::from_secs(1)).await;
             window.update(cx, |_, window, cx| {
-                assert!(view.read(cx).sync_panel.read(cx).status.message.contains("连接测试成功"));
+                assert!(view.read(cx).sync_panel.read(cx).status.message.contains("连接测试成功"), "{:?}", view.read(cx).sync_panel.read(cx).status);
                 window.click("sync-now", cx);
             }).expect("sync notes through interface");
             cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -216,6 +222,8 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
             }).expect("synced markdown verified");
             #[cfg(windows)]
             Box::pin(crate::smoke_library::exercise(window, &view, &database, cx)).await;
+            #[cfg(windows)]
+            Box::pin(crate::smoke_interactions::exercise(window, &view, &database, cx)).await;
         }
         let report = database.with_file_name("smoke-result.txt");
         #[cfg(feature = "ui-test")]

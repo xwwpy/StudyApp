@@ -7,6 +7,8 @@ pub struct Settings {
     pub interval_minutes: u32,
     pub answer_minutes: u32,
     pub review_days: Vec<u32>,
+    #[serde(default)]
+    pub show_file_paths: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -170,6 +172,12 @@ pub enum Command {
         path: PathBuf,
     },
     SaveSettings(Settings),
+    SaveLearningSettings {
+        interval_minutes: u32,
+        answer_minutes: u32,
+        review_days: Vec<u32>,
+    },
+    SetShowFilePaths(bool),
     SetPaused(bool),
     Submit {
         session_id: String,

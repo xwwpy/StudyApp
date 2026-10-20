@@ -211,6 +211,103 @@ mod windows_host {
             Ok(())
         }
 
+        /// Inspect the HWND and controller, rather than the DOM: script execution
+        /// and CDP screenshots also succeed while the native surface is hidden.
+        #[cfg(feature = "ui-test")]
+        pub fn native_state(&self) -> Result<serde_json::Value> {
+            use windows::{
+                Win32::{
+                    Foundation::{HWND, POINT, RECT},
+                    Graphics::Gdi::ClientToScreen,
+                    UI::{
+                        Input::KeyboardAndMouse::GetFocus,
+                        WindowsAndMessaging::{
+                            GA_ROOT, GWL_STYLE, GetAncestor, GetClassNameW, GetClientRect,
+                            GetForegroundWindow, GetWindowLongW, GetWindowRect, IsChild,
+                            IsWindowVisible, WS_VISIBLE, WindowFromPoint,
+                        },
+                    },
+                },
+                core::BOOL,
+            };
+            let child = self.webview.hwnd();
+            let parent = HWND(self._parent.raw.hwnd.get() as *mut _);
+            let mut rect = RECT::default();
+            let mut parent_rect = RECT::default();
+            let mut origin = POINT::default();
+            let mut controller_visible = BOOL::default();
+            // SAFETY: inspection runs on the creating thread and the host keeps
+            // both native handles alive throughout the test.
+            let (
+                visible,
+                own_visible,
+                parent_visible,
+                focus,
+                focused,
+                hit,
+                hit_is_editor,
+                hit_root,
+                hit_class,
+                foreground,
+            ) = unsafe {
+                GetWindowRect(child, &mut rect)?;
+                GetClientRect(parent, &mut parent_rect)?;
+                ensure!(
+                    ClientToScreen(parent, &mut origin).as_bool(),
+                    "无法定位父窗口"
+                );
+                self.webview
+                    .controller()
+                    .IsVisible(&mut controller_visible)?;
+                let focus = GetFocus();
+                let hit = WindowFromPoint(POINT {
+                    x: (rect.left + rect.right) / 2,
+                    y: (rect.top + rect.bottom) / 2,
+                });
+                let mut class = [0_u16; 256];
+                let class_length = GetClassNameW(hit, &mut class) as usize;
+                (
+                    IsWindowVisible(child).as_bool(),
+                    GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0,
+                    IsWindowVisible(parent).as_bool(),
+                    focus.0 as usize,
+                    focus == child || IsChild(child, focus).as_bool(),
+                    hit.0 as usize,
+                    hit == child || IsChild(child, hit).as_bool(),
+                    GetAncestor(hit, GA_ROOT).0 as usize,
+                    String::from_utf16_lossy(&class[..class_length]),
+                    GetForegroundWindow().0 as usize,
+                )
+            };
+            let width = rect.right - rect.left;
+            let height = rect.bottom - rect.top;
+            let inside_parent = width > 0
+                && height > 0
+                && rect.left >= origin.x
+                && rect.top >= origin.y
+                && rect.right <= origin.x + parent_rect.right
+                && rect.bottom <= origin.y + parent_rect.bottom;
+            Ok(serde_json::json!({
+                "hwnd": child.0 as usize,
+                "parentHwnd": parent.0 as usize,
+                "visible": visible,
+                "ownVisible": own_visible,
+                "parentVisible": parent_visible,
+                "controllerVisible": controller_visible.as_bool(),
+                "bounds": {"x":rect.left, "y":rect.top, "width":width, "height":height},
+                "parentBounds": {"x":origin.x, "y":origin.y, "width":parent_rect.right, "height":parent_rect.bottom},
+                "insideParent": inside_parent,
+                "focusHwnd": focus,
+                "focused": focused,
+                "hitHwnd": hit,
+                "hitIsEditor": hit_is_editor,
+                "hitRootHwnd": hit_root,
+                "hitClass": hit_class,
+                "foregroundHwnd": foreground,
+                "logicalBounds": self.bounds.get(),
+            }))
+        }
+
         /// Captures the actual native child WebView, which GPUI render_to_image
         /// cannot include. Poll/await the receiver while the message loop runs.
         #[cfg(feature = "ui-test")]

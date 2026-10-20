@@ -1,9 +1,9 @@
-use crate::components::*;
+use crate::{components::*, note_actions::NoteDrag};
 use gpui_kit::{
     component::{
-        Disableable, Selectable, Sizable,
+        Disableable, Placement, Selectable, Sizable,
         button::{Button, ButtonVariants},
-        input::{Input, InputState},
+        input::{Input, InputEvent, InputState},
     },
     *,
 };
@@ -99,10 +99,20 @@ impl EventEmitter<FolderEvent> for FolderPanel {}
 impl FolderPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("目录名称"));
-        cx.subscribe(
-            &name,
-            |_, _, _: &gpui_kit::component::input::InputEvent, cx| cx.notify(),
-        )
+        cx.subscribe(&name, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. })
+                && matches!(
+                    this.action,
+                    Some(FolderAction::Create { .. } | FolderAction::Rename { .. })
+                )
+            {
+                // submit clears the action before emitting, so a repeated
+                // Enter cannot submit the same form twice.
+                this.submit(cx);
+            } else {
+                cx.notify();
+            }
+        })
         .detach();
         Self {
             snapshot: None,
@@ -285,6 +295,68 @@ impl FolderPanel {
         cx.notify();
     }
 
+    fn can_drop_note(&self, drag: &NoteDrag, destination: Option<String>) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            drag.move_action(destination)
+                .resolve(snapshot, self.busy)
+                .is_ok()
+        })
+    }
+
+    fn drop_note(&mut self, drag: &NoteDrag, destination: Option<String>, cx: &mut Context<Self>) {
+        if !self.can_drop_note(drag, destination.clone()) {
+            return;
+        }
+        cx.emit(FolderEvent::Command(Command::MoveNote {
+            note_id: drag.note_id.clone(),
+            folder_id: destination,
+        }));
+        cx.notify();
+    }
+
+    fn note_drop_target(
+        &self,
+        id: SharedString,
+        destination: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let hover_panel = cx.entity().downgrade();
+        let hover_destination = destination.clone();
+        let check_panel = cx.entity().downgrade();
+        let check_destination = destination.clone();
+        div()
+            .id(id)
+            .w_full()
+            .min_w_0()
+            .flex_shrink_0()
+            .rounded_md()
+            .border_1()
+            .border_color(rgba(0))
+            .drag_over::<NoteDrag>(move |style, drag, _, cx| {
+                if hover_panel.upgrade().is_some_and(|panel| {
+                    panel
+                        .read(cx)
+                        .can_drop_note(drag, hover_destination.clone())
+                }) {
+                    style.bg(rgb(LIGHT)).border_color(rgb(GREEN))
+                } else {
+                    style
+                }
+            })
+            .can_drop(move |value, _, cx| {
+                value.downcast_ref::<NoteDrag>().is_some_and(|drag| {
+                    check_panel.upgrade().is_some_and(|panel| {
+                        panel
+                            .read(cx)
+                            .can_drop_note(drag, check_destination.clone())
+                    })
+                })
+            })
+            .on_drop(cx.listener(move |this, drag: &NoteDrag, _, cx| {
+                this.drop_note(drag, destination.clone(), cx);
+            }))
+    }
+
     fn submit(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
@@ -324,6 +396,14 @@ impl FolderPanel {
                     if !valid_destination(&self.rows, &folder_id, destination.as_deref()) {
                         return Err("该位置无法作为上级目录，请重新选择。".into());
                     }
+                    if snapshot
+                        .folders
+                        .iter()
+                        .find(|folder| folder.id == folder_id)
+                        .is_none_or(|folder| folder.parent_id == destination)
+                    {
+                        return Err("目录已在此位置，请选择其他目录。".into());
+                    }
                     Command::MoveFolder {
                         folder_id,
                         parent_id: destination,
@@ -333,12 +413,15 @@ impl FolderPanel {
                     note_id,
                     destination,
                 } => {
-                    if destination
-                        .as_ref()
-                        .is_some_and(|id| !self.rows.iter().any(|row| &row.id == id))
-                    {
-                        return Err("目标目录已移除，请重新选择。".into());
-                    }
+                    let note = snapshot
+                        .notes
+                        .iter()
+                        .find(|note| note.id == note_id)
+                        .ok_or("笔记已移除，请重新选择。")?;
+                    NoteDrag::new(note, snapshot)
+                        .move_action(destination.clone())
+                        .resolve(snapshot, self.busy)
+                        .map_err(str::to_owned)?;
                     Command::MoveNote {
                         note_id,
                         folder_id: destination,
@@ -390,13 +473,23 @@ impl FolderPanel {
                         "新建于：{}",
                         self.destination_name(parent_id.as_deref())
                     )))
-                    .child(Input::new(&self.name).small().disabled(self.busy));
+                    .child(
+                        div()
+                            .id("folder-name-input")
+                            .test_support()
+                            .child(Input::new(&self.name).small().disabled(self.busy)),
+                    );
                 can_submit &= !self.name.read(cx).value().trim().is_empty();
             }
             FolderAction::Rename { folder_id } => {
                 form = form
                     .child(muted(format!("重命名：{}", self.folder_name(folder_id))))
-                    .child(Input::new(&self.name).small().disabled(self.busy));
+                    .child(
+                        div()
+                            .id("folder-name-input")
+                            .test_support()
+                            .child(Input::new(&self.name).small().disabled(self.busy)),
+                    );
                 can_submit &= !self.name.read(cx).value().trim().is_empty();
             }
             FolderAction::Delete { folder_id } => {
@@ -419,9 +512,6 @@ impl FolderPanel {
             } => {
                 submit_label = "移到此处";
                 let moving_folder = matches!(action, FolderAction::MoveFolder { .. });
-                let subtree_height = moving_folder
-                    .then(|| moving_subtree_height(&self.rows, folder_id))
-                    .flatten();
                 let current = self.snapshot.as_ref().and_then(|snapshot| {
                     if moving_folder {
                         snapshot
@@ -449,6 +539,20 @@ impl FolderPanel {
                         .map(|note| format!("移动笔记：{}", note.title))
                         .unwrap_or_else(|| "移动笔记".into())
                 };
+                let choices = self
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| {
+                        if moving_folder {
+                            folder_destinations(&snapshot.folders, folder_id)
+                        } else {
+                            note_destinations(
+                                &snapshot.folders,
+                                current.flatten().map(String::as_str),
+                            )
+                        }
+                    })
+                    .unwrap_or_default();
                 let mut destinations = column()
                     .id("folder-destination-scroll")
                     .test_support()
@@ -456,37 +560,32 @@ impl FolderPanel {
                     .h(px(132.))
                     .flex_shrink_0()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .child(
-                        Button::new("folder-destination-root")
-                            .small()
-                            .ghost()
-                            .w_full()
-                            .label("未分类 / 根目录")
-                            .selected(destination.is_none())
-                            .disabled(self.busy)
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.choose_destination(None, cx)),
-                            ),
-                    );
-                for row in self.rows.iter().filter(|row| {
-                    !moving_folder
-                        || subtree_height
-                            .is_some_and(|height| accepts_destination(row, folder_id, height))
-                }) {
-                    let id = row.id.clone();
+                    .overflow_y_scroll();
+                for choice in choices {
+                    let id = choice.id;
+                    let element_id = id
+                        .as_deref()
+                        .map(|id| format!("folder-destination-{id}"))
+                        .unwrap_or_else(|| "folder-destination-root".into());
+                    let tooltip_id = SharedString::from(format!("{element_id}-tip"));
+                    let tip = choice.path.clone();
                     destinations = destinations.child(
-                        Button::new(SharedString::from(format!("folder-destination-{id}")))
-                            .small()
-                            .ghost()
+                        div()
+                            .id(tooltip_id)
                             .w_full()
-                            .label(row.path.clone())
-                            .tooltip(row.path.clone())
-                            .selected(destination.as_ref() == Some(&id))
-                            .disabled(self.busy)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.choose_destination(Some(id.clone()), cx)
-                            })),
+                            .tooltip(move |window, cx| sidebar_tooltip(tip.clone(), window, cx))
+                            .child(
+                                Button::new(SharedString::from(element_id))
+                                    .small()
+                                    .ghost()
+                                    .w_full()
+                                    .label(choice.path.clone())
+                                    .selected(destination == &id)
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.choose_destination(id.clone(), cx)
+                                    })),
+                            ),
                     );
                 }
                 form = form
@@ -567,6 +666,7 @@ impl Render for FolderPanel {
                             .ghost()
                             .label("＋ 新建")
                             .tooltip("在当前选中目录内创建，最多八层")
+                            .tooltip_placement(Placement::Left)
                             .disabled(!can_create)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let parent_id = this.filter.folder_id().map(str::to_owned);
@@ -600,15 +700,19 @@ impl Render for FolderPanel {
                     .on_click(cx.listener(|this, _, _, cx| this.set_filter(FolderFilter::All, cx))),
             )
             .child(
-                Button::new("folders-root")
-                    .small()
-                    .ghost()
-                    .w_full()
-                    .label(format!("未分类  {}", self.root_count))
-                    .selected(self.filter == FolderFilter::Root)
-                    .disabled(self.busy)
-                    .on_click(
-                        cx.listener(|this, _, _, cx| this.set_filter(FolderFilter::Root, cx)),
+                self.note_drop_target("folder-drop-root".into(), None, cx)
+                    .test_support()
+                    .child(
+                        Button::new("folders-root")
+                            .small()
+                            .ghost()
+                            .w_full()
+                            .label(format!("未分类  {}", self.root_count))
+                            .selected(self.filter == FolderFilter::Root)
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_filter(FolderFilter::Root, cx)
+                            })),
                     ),
             );
         for folder in self.rows.iter().filter(|row| {
@@ -649,21 +753,26 @@ impl Render for FolderPanel {
             } else {
                 entry = entry.child(div().w(px(24.)).flex_shrink_0());
             }
+            let tip = format!("{} · 直接包含 {count} 份笔记", folder.path);
             tree = tree.child(
-                entry.child(
-                    Button::new(SharedString::from(format!("folder-row-{id}")))
-                        .small()
-                        .ghost()
-                        .flex_1()
-                        .min_w_0()
-                        .label(format!("{}  {count}", folder.name))
-                        .tooltip(format!("{} · 直接包含 {count} 份笔记", folder.path))
-                        .selected(selected_id.as_ref() == Some(&id))
-                        .disabled(self.busy)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_filter(FolderFilter::Folder(id.clone()), cx)
-                        })),
-                ),
+                self.note_drop_target(format!("folder-drop-{id}").into(), Some(id.clone()), cx)
+                    .test_support()
+                    .tooltip(move |window, cx| sidebar_tooltip(tip.clone(), window, cx))
+                    .child(
+                        entry.child(
+                            Button::new(SharedString::from(format!("folder-row-{id}")))
+                                .small()
+                                .ghost()
+                                .flex_1()
+                                .min_w_0()
+                                .label(format!("{}  {count}", folder.name))
+                                .selected(selected_id.as_ref() == Some(&id))
+                                .disabled(self.busy)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_filter(FolderFilter::Folder(id.clone()), cx)
+                                })),
+                        ),
+                    ),
             );
         }
         if self.rows.is_empty() {
@@ -731,6 +840,7 @@ impl Render for FolderPanel {
                             } else {
                                 "先移出全部笔记和子目录，才能删除"
                             })
+                            .tooltip_placement(Placement::Left)
                             .disabled(!can_delete)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.action = Some(FolderAction::Delete {
@@ -871,6 +981,43 @@ fn valid_destination(rows: &[FolderRow], moving: &str, destination: Option<&str>
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderDestination {
+    pub id: Option<String>,
+    pub path: String,
+}
+
+pub fn note_destinations(folders: &[NoteFolder], current: Option<&str>) -> Vec<FolderDestination> {
+    let mut destinations = Vec::new();
+    if current.is_some() {
+        destinations.push(FolderDestination {
+            id: None,
+            path: "未分类 / 根目录".into(),
+        });
+    }
+    destinations.extend(
+        folder_rows(folders)
+            .into_iter()
+            .filter(|row| Some(row.id.as_str()) != current)
+            .map(|row| FolderDestination {
+                id: Some(row.id),
+                path: row.path,
+            }),
+    );
+    destinations
+}
+
+fn folder_destinations(folders: &[NoteFolder], moving: &str) -> Vec<FolderDestination> {
+    let Some(source) = folders.iter().find(|folder| folder.id == moving) else {
+        return Vec::new();
+    };
+    let rows = folder_rows(folders);
+    note_destinations(folders, source.parent_id.as_deref())
+        .into_iter()
+        .filter(|destination| valid_destination(&rows, moving, destination.id.as_deref()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -934,6 +1081,64 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn note_move_destinations_include_root_and_nested_paths_but_not_current_folder() {
+        let folders = [
+            folder("parent", "课程", None),
+            folder("child", "数学", Some("parent")),
+            folder("other", "研究", None),
+        ];
+        let destinations = note_destinations(&folders, Some("other"));
+        assert!(
+            destinations
+                .iter()
+                .any(|d| d.id.is_none() && d.path == "未分类 / 根目录")
+        );
+        assert!(
+            destinations
+                .iter()
+                .any(|d| d.id.as_deref() == Some("child") && d.path == "课程 / 数学")
+        );
+        assert!(
+            !destinations
+                .iter()
+                .any(|d| d.id.as_deref() == Some("other"))
+        );
+        assert_eq!(destinations.len(), 3);
+    }
+
+    #[::core::prelude::v1::test]
+    fn unclassified_notes_do_not_offer_their_current_destination() {
+        let destinations = note_destinations(&[folder("a", "课程", None)], None);
+        assert_eq!(
+            destinations,
+            [FolderDestination {
+                id: Some("a".into()),
+                path: "课程".into()
+            }]
+        );
+        assert!(note_destinations(&[], None).is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn folder_picker_excludes_current_parent_self_and_descendants() {
+        let folders = [
+            folder("parent", "Parent", None),
+            folder("moving", "Moving", Some("parent")),
+            folder("child", "Child", Some("moving")),
+            folder("other", "Other", None),
+        ];
+        let destinations = folder_destinations(&folders, "moving");
+        assert_eq!(
+            destinations
+                .iter()
+                .map(|d| d.id.as_deref())
+                .collect::<Vec<_>>(),
+            [None, Some("other")]
+        );
+        assert!(folder_destinations(&folders, "missing").is_empty());
+    }
+
+    #[::core::prelude::v1::test]
     fn names_are_trimmed_and_unique_only_among_siblings() {
         let folders = [
             folder("a", "Research", None),
@@ -951,5 +1156,164 @@ mod tests {
             validated_name("  新目录  ", &folders, None, None).unwrap(),
             "新目录"
         );
+    }
+}
+
+#[cfg(all(test, feature = "ui-test"))]
+mod ui_tests {
+    use super::{FolderAction, FolderEvent, FolderPanel};
+    use gpui_kit::{Focusable, TestAppContext, VisualTestContext};
+    use std::sync::Arc;
+    use studyapp_core::{Command, NoteFolder, Snapshot};
+
+    fn panel_snapshot() -> Arc<Snapshot> {
+        Arc::new(Snapshot {
+            settings: studyapp_core::Settings::default(),
+            notes: Vec::new(),
+            folders: vec![NoteFolder {
+                id: "existing".into(),
+                name: "Existing".into(),
+                parent_id: None,
+            }],
+            versions: Arc::new(Vec::new()),
+            sessions: Vec::new(),
+            reviews: Vec::new(),
+            review_events: Vec::new(),
+            timer: studyapp_core::TimerState {
+                paused: true,
+                active_seconds: 0,
+                target_seconds: 60,
+                started_at: 0,
+                spans: Vec::new(),
+            },
+            data_path: "C:/test-library".into(),
+        })
+    }
+
+    #[cfg(feature = "ui-test")]
+    fn draw(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            _ = window.draw(cx);
+        });
+    }
+
+    #[cfg(feature = "ui-test")]
+    #[gpui_kit::test]
+    fn enter_creates_and_renames_each_folder_exactly_once(cx: &mut TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            let mut panel = FolderPanel::new(window, cx);
+            panel.accept(panel_snapshot(), window, cx);
+            panel.edit_name(
+                FolderAction::Create { parent_id: None },
+                "New".into(),
+                window,
+                cx,
+            );
+            panel
+        });
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let observed = commands.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&panel, move |_, event: &FolderEvent, _| {
+                if let FolderEvent::Command(command) = event {
+                    observed.borrow_mut().push(command.clone());
+                }
+            })
+            .detach();
+        });
+        draw(cx);
+        cx.simulate_keystrokes("enter enter");
+        assert_eq!(
+            commands.borrow().len(),
+            1,
+            "Enter did not submit exactly once"
+        );
+        assert!(
+            matches!(&commands.borrow()[0], Command::CreateFolder { name, parent_id: None } if name == "New")
+        );
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.edit_name(
+                    FolderAction::Rename {
+                        folder_id: "existing".into(),
+                    },
+                    "Renamed".into(),
+                    window,
+                    cx,
+                );
+            })
+        });
+        draw(cx);
+        cx.simulate_keystrokes("enter enter");
+        assert_eq!(
+            commands.borrow().len(),
+            2,
+            "Rename Enter did not submit exactly once"
+        );
+        assert!(
+            matches!(&commands.borrow()[1], Command::RenameFolder { folder_id, name } if folder_id == "existing" && name == "Renamed")
+        );
+    }
+
+    #[cfg(feature = "ui-test")]
+    #[gpui_kit::test]
+    fn enter_keeps_invalid_or_busy_name_form_open(cx: &mut TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            let mut panel = FolderPanel::new(window, cx);
+            panel.accept(panel_snapshot(), window, cx);
+            panel.edit_name(
+                FolderAction::Create { parent_id: None },
+                "Existing".into(),
+                window,
+                cx,
+            );
+            panel
+        });
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let observed = commands.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&panel, move |_, event: &FolderEvent, _| {
+                if let FolderEvent::Command(command) = event {
+                    observed.borrow_mut().push(command.clone());
+                }
+            })
+            .detach();
+        });
+        draw(cx);
+        cx.simulate_keystrokes("enter");
+        assert!(commands.borrow().is_empty());
+        cx.read(|cx| {
+            assert!(
+                panel.read(cx).error.is_some(),
+                "Invalid name was not validated"
+            );
+            assert!(panel.read(cx).action.is_some());
+        });
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel
+                    .name
+                    .update(cx, |input, cx| input.set_value("Valid", window, cx));
+                panel.set_busy(true, cx);
+            })
+        });
+        draw(cx);
+        cx.simulate_keystrokes("enter");
+        assert!(commands.borrow().is_empty());
+        cx.read(|cx| assert!(panel.read(cx).action.is_some()));
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.set_busy(false, cx);
+                panel.name.focus_handle(cx).focus(window, cx);
+            })
+        });
+        draw(cx);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(commands.borrow().len(), 1);
     }
 }

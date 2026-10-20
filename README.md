@@ -1,14 +1,14 @@
-# 拾光学习 · StudyApp
+# WW-StudyApp
 
-使用 GPUI Kit 0.7.3 构建的 Windows 中文学习桌面应用。创建或导入自己的 Markdown 笔记，定时确认学习内容，安排间隔复习，并将笔记文件同步到自己的 WebDAV、文件夹或兼容 NAS。无需 StudyApp 账户即可使用。
+使用 GPUI Kit 0.7.3 构建的 Windows 中文学习桌面应用。创建或导入自己的 Markdown 笔记，定时确认学习内容，安排间隔复习，并将笔记文件同步到自己的 WebDAV、文件夹或兼容 NAS。无需 WW-StudyApp 账户即可使用。
 
-当前版本为 **0.4.0**，采用本地优先存储。支持 Typora 风格的连续原位编辑、即时排版和常见编程语言高亮、版本历史、拖入导入，以及用户自有存储的笔记同步。**同步仅传输最新 Markdown，不传输学习记录、复习计划或完整版本历史**。微信登录和 StudyApp 账户云服务仍为预留接口，见 [同步指南](docs/sync-guide.md) 与 [扩展边界](docs/cloud-contract.md)。
+当前版本为 **0.5.0**，采用本地优先存储。支持 Typora 风格的连续原位编辑、即时排版和常见编程语言高亮、版本历史、拖入导入，以及用户自有存储的笔记同步。笔记可拖到目录或通过右键菜单分类；文件路径默认隐藏，可在设置中开启并保存。**同步仅传输最新 Markdown，不传输学习记录、复习计划或完整版本历史**。微信登录和 WW-StudyApp 账户云服务仍为预留接口，见 [同步指南](docs/sync-guide.md) 与 [扩展边界](docs/cloud-contract.md)。
 
-![StudyApp 今日学习原生界面](docs/images/dashboard.png)
+![WW-StudyApp 今日学习原生界面](docs/images/dashboard.png)
 
 ## 启动
 
-从 [GitHub Releases](https://github.com/xwwpy/StudyApp/releases) 下载可用的 Windows x64 ZIP，解压后运行 `studyapp.exe`。ZIP 是免安装程序包，默认资料保存在用户应用数据目录，而非解压目录。发布程序**未进行代码签名**；尚无自动更新器。版本对应的标签为 `v0.4.0`；只有该标签的发布工作流成功，Release 才会出现对应下载。
+从 [GitHub Releases](https://github.com/xwwpy/StudyApp/releases) 下载可用的 `WW-StudyApp-0.5.0-windows-x86_64.zip`，解压后运行 `WW-StudyApp.exe`。ZIP 是免安装程序包，默认资料保存在用户应用数据目录，而非解压目录。发布程序**未进行代码签名**；尚无自动更新器。版本对应的标签为 `v0.5.0`；只有该标签的发布工作流成功，Release 才会出现对应下载。应用显示名称与发布程序名称改为 WW-StudyApp，已有资料库、配置、凭据和同步目录标识沿用原名称，可继续使用。
 
 支持 Windows 10/11 x64，编辑器需要 [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。Windows 常见安装已包含；缺失时按页面安装 Evergreen Runtime。编辑器资源完全离线，不需要 Node.js 或外部网站。使用 Windows 图形渲染；远程桌面、显卡驱动及受限运行环境可能影响窗口创建。若系统提示缺少 MSVC 运行库，安装微软 [Visual C++ x64 Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)。Linux CI 测试学习核心和同步库，不提供 Linux 桌面程序。
 
@@ -18,6 +18,8 @@
 cargo build --locked -p studyapp-desktop
 cargo run --locked -p studyapp-desktop
 ```
+
+开发构建的二进制名称仍是 `studyapp.exe`；打包时复制为 `WW-StudyApp.exe`。
 
 单独指定资料库目录：
 
@@ -48,13 +50,19 @@ cargo run --locked -p studyapp-desktop
 
 「取消管理」停止该笔记的文件扫描、学习内容自动归属和同步，将其从笔记库列表移除；原文件、历史、学习与复习记录保留；可用「查看已取消管理」阅读、导出历史或调整目录。已存在的远端同 ID 文件不会被重新导入；再次明确导入同一路径可恢复管理。同步运行时暂时不能取消管理、恢复备份或切换资料库，避免在途上传与这些操作交错。
 
-笔记库左侧支持新建目录、子目录、重命名和移动目录，最多 8 层，同级目录不能重名。选中目录时新建笔记会保存到该目录；现有笔记可用「移动到目录」调整。目录是资料库中的分类，不会移动跟踪的外部文件；删除目录要求该目录完全为空。目录分类随资料库和备份保存，目前不会通过仅 Markdown 的同步传输。
+笔记库左侧支持新建目录、子目录、重命名和移动目录，最多 8 层，同级目录不能重名。新建和重命名时，在名称输入框按 **Enter** 即可提交；重复 Enter 不会重复创建，名称校验和维护期间的限制仍然生效。选中目录时新建笔记会保存到该目录。
+
+将列表中的笔记拖到左侧目录或「未分类」即可调整分类；可接受的目标在悬停时突出显示。也可右键笔记，选择「移动到目录」：可滚动的目的地菜单列出完整目录路径和适用的「未分类」，不包含笔记当前目录；原有「移动到目录」按钮使用相同规则。移动目录时还会排除自身、子孙目录和超出深度限制的位置。资料库切换后产生的过期拖放或菜单动作会被拒绝，维护期间不能移动。
+
+笔记右键菜单还提供「在文件资源管理器中显示」和「复制文件路径」，无需先开启路径显示。原文件不存在时会提示，保留的笔记历史仍可查看和导出。「设置」中的「显示文件路径」默认关闭，升级后的旧设置也默认关闭；开启后笔记列表、详情、编辑区及空间管理显示文件位置，保存后重启仍沿用该资料库的选择。
+
+目录是资料库中的分类，移动笔记只改分类元数据，不移动源文件，也不改变其历史。已取消管理的笔记仍可调整目录；删除目录要求它完全没有笔记或子目录。目录分类随资料库和备份保存，目前不会通过仅 Markdown 的同步传输。
 
 「变更历史」中的版本列表与差异正文分别滚动，差异按可见行渲染，不再截断到 1,500 行；超长行按显示宽度分段。选择旧版本后「复制此版本后编辑」创建独立笔记，不覆盖最新版本。
 
 设置中的「更改保存位置并迁移」会先确认输入、持久保存草稿，再将资料复制到新的空目录。成功后下次正常启动继续使用新位置，原资料库保留；失败时继续使用原资料库。带 `--data-dir` 的独立运行只迁移当前会话，不修改全局默认路径。「打开其他资料库」用于切换已有资料库，也会记住选择。
 
-「空间管理」按当前资料库统计数据库/历史、托管副本、保留文件、备份和辅助文件。按文件逻辑长度统计，硬链接可能重复计数，程序安装目录和 WebView2 共享缓存不在统计范围。每个托管副本需单独确认删除；不会删除外部源文件、未知文件或整个目录。副本删除会停止管理，历史和学习记录保留，仍可从「历史与恢复」导出或复制。正在编辑或待恢复草稿关联的副本不能清理。
+「空间管理」按当前资料库统计数据库/历史、托管副本、保留文件、备份和辅助文件。托管副本列表在自身范围内滚动，滚到顶部或底部时也不会带动外层设置页；在列表之外滚轮仍控制设置页。按文件逻辑长度统计，硬链接可能重复计数，程序安装目录和 WebView2 共享缓存不在统计范围。每个托管副本需单独确认删除；不会删除外部源文件、未知文件或整个目录。副本删除会停止管理，历史和学习记录保留，仍可从「历史与恢复」导出或复制。正在编辑或待恢复草稿关联的副本不能清理。
 
 数据库升级到 schema 3，并兼容读取 schema 1/2。旧版程序不能打开升级后的数据库；升级前请导出备份。取消管理的笔记随备份保留状态，恢复备份不会重建其磁盘文件。
 
@@ -62,7 +70,7 @@ cargo run --locked -p studyapp-desktop
 
 在「设置 → 笔记文件同步」选择一个目标，保存设置后测试连接，再点击「立即同步」。可选自动同步，间隔 5–1440 分钟；关闭同步仍保留本地资料和远端文件。网络工作在后台进行。
 
-- **文件夹 / NAS**：选择已存在的绝对路径，应用使用其 `StudyApp/notes/<UUID>.md` 子目录。NAS 文件系统须支持操作系统文件锁、硬链接和文件替换；连接测试不能证明全部写入能力。替换前会在 `StudyApp/notes/.retained` 保留原文及暂存内容，目标又被创建时拒绝覆盖；保留目录不会自动清理。文件锁协调 StudyApp 实例，不能为不遵守锁的第三方编辑器提供原子比较与替换保证；存在这种并发写入时应改用正确实现条件请求的 WebDAV。
+- **文件夹 / NAS**：选择已存在的绝对路径，应用使用其 `StudyApp/notes/<UUID>.md` 子目录。NAS 文件系统须支持操作系统文件锁、硬链接和文件替换；连接测试不能证明全部写入能力。替换前会在 `StudyApp/notes/.retained` 保留原文及暂存内容，目标又被创建时拒绝覆盖；保留目录不会自动清理。文件锁协调 WW-StudyApp 实例，不能为不遵守锁的第三方编辑器提供原子比较与替换保证；存在这种并发写入时应改用正确实现条件请求的 WebDAV。
 - **WebDAV**：填写最终 HTTPS 目录地址、用户名和密码或应用密码；TLS 校验启用，拒绝重定向，当前不使用系统 HTTP 代理。服务需支持 MKCOL、Depth:1 PROPFIND、GET、PUT，更新已有对象需返回**强 ETag**并正确执行条件请求。缺少强 ETag 时拒绝覆盖；新对象使用 create-only 请求。HTTP 仅用于显式启用的回环测试构造器，生产设置只接受 HTTPS。
 
 只同步最新 Markdown；学习记录、复习数据、历史快照仍保存在本地 SQLite 中，由「导出备份」保存。双方都修改时先保留本地冲突副本，再接收远端；外部源文件的远端修改创建托管副本。同步不传播删除，也不会清空目录。失败项不推进同步基线，本地在同步期间改变会提示重试。服务兼容性和迁移步骤见 [同步指南](docs/sync-guide.md)。
@@ -99,12 +107,12 @@ $smoke = Join-Path $env:TEMP ('studyapp-smoke-' + [guid]::NewGuid().ToString('N'
 
 ```powershell
 cargo build --locked --release -p studyapp-desktop
-.\scripts\package.ps1 -Version 0.4.0
+.\scripts\package.ps1 -Version 0.5.0
 ```
 
 编辑器开发另需 Node.js 22+：在 `crates/studyapp-desktop/editor` 运行 `npm ci`、`npm run check`、`npm run build`、`npm test` 和 `npm run bundle:check`。源码、锁文件与确定性资源一同提交，普通 Rust 构建无需 Node.js。
 
-脚本生成 `dist/StudyApp-0.4.0-windows-x86_64.zip` 与 `.zip.sha256`，包含程序、README、MIT LICENSE、发布说明、同步指南、锁文件及第三方许可证/源代码下载链接。输出已存在时拒绝覆盖，可用 `-OutputDirectory` 指定新目录；不会删除文件。`-BinaryPath` 允许验证打包其他已构建程序。SHA256 可用 `Get-FileHash -Algorithm SHA256` 核对。
+脚本生成 `dist/WW-StudyApp-0.5.0-windows-x86_64.zip` 与 `.zip.sha256`，包含 `WW-StudyApp.exe`、README、MIT LICENSE、发布说明、同步指南、锁文件及第三方许可证/源代码下载链接。为修复原生编辑窗口空白，仓库维护了 GPUI Windows 绘制层补丁，其完整修改源码、许可证及来源说明也包含在包内。输出已存在时拒绝覆盖，可用 `-OutputDirectory` 指定新目录；不会删除文件。`-BinaryPath` 允许验证打包其他已构建程序。SHA256 可用 `Get-FileHash -Algorithm SHA256` 核对。
 
 ## CI/CD 与依赖
 
@@ -116,4 +124,4 @@ cargo build --locked --release -p studyapp-desktop
 
 [Release](https://github.com/xwwpy/StudyApp/blob/main/.github/workflows/release.yml) 仅由 `v*` 标签触发，验证标签等于所有工作区包版本，通过 Windows/Linux 学习核心与同步测试，以及格式、Windows 工作区测试、Clippy、依赖审计和原生 UI 冒烟后构建 Windows release ZIP 和 SHA256，使用最小权限发布 GitHub Release。Actions 固定完整提交，只有发布 job 拥有仓库写权限。工作流定义不代表已在 GitHub 执行成功；实际验证见 [verification.md](docs/verification.md)。
 
-源码采用 [MIT](LICENSE)；依赖遵循各自许可。用户自有存储同步无需部署 StudyApp 服务端；微信登录及账户级全量数据云服务仍需独立后端、密钥和端到端验证。当前没有自动更新器或代码签名。
+源码采用 [MIT](LICENSE)；依赖遵循各自许可。用户自有存储同步无需部署 WW-StudyApp 服务端；微信登录及账户级全量数据云服务仍需独立后端、密钥和端到端验证。当前没有自动更新器或代码签名。

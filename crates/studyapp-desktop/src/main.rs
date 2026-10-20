@@ -10,13 +10,19 @@ mod folders_ui;
 mod history_preview;
 mod imports;
 mod markdown_editor;
+mod note_actions;
+mod note_commands;
 mod note_editor;
 mod notes_view;
 mod smoke;
 #[cfg(feature = "ui-test")]
 mod smoke_editor;
 #[cfg(all(windows, feature = "ui-test"))]
+mod smoke_interactions;
+#[cfg(all(windows, feature = "ui-test"))]
 mod smoke_library;
+#[cfg(all(windows, feature = "ui-test"))]
+mod smoke_visibility;
 mod storage_backend;
 mod storage_ui;
 mod sync_runtime;
@@ -65,9 +71,9 @@ fn paths() -> anyhow::Result<(PathBuf, Option<PathBuf>, bool)> {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("StudyApp: {error:#}");
+        eprintln!("WW-StudyApp: {error:#}");
         rfd::MessageDialog::new()
-            .set_title("StudyApp 启动失败")
+            .set_title("WW-StudyApp 启动失败")
             .set_description(format!("{error:#}"))
             .set_level(rfd::MessageLevel::Error)
             .show();
@@ -94,7 +100,7 @@ fn run() -> anyhow::Result<()> {
             theme.colors.ring = rgb(components::GREEN).into();
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
-                    title: Some("拾光学习 · StudyApp".into()),
+                    title: Some("WW-StudyApp".into()),
                     ..Default::default()
                 }),
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -108,7 +114,7 @@ fn run() -> anyhow::Result<()> {
             let (window, view) = open_window(options, cx, |window, cx| {
                 cx.new(|cx| app::StudyApp::new(worker, window, cx))
             })
-            .expect("创建 StudyApp 窗口失败");
+            .expect("创建 WW-StudyApp 窗口失败");
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();

@@ -80,8 +80,9 @@ fn open_library(path: &std::path::Path, now: i64) -> anyhow::Result<(std::fs::Fi
         .read(true)
         .write(true)
         .open(path.with_extension("lock"))?;
-    lock.try_lock()
-        .map_err(|_| anyhow::anyhow!("该资料库正在另一个 StudyApp 窗口中使用，请先关闭那个窗口"))?;
+    lock.try_lock().map_err(|_| {
+        anyhow::anyhow!("该资料库正在另一个 WW-StudyApp 窗口中使用，请先关闭那个窗口")
+    })?;
     let engine = Engine::open(path, now)?;
     Ok((lock, engine))
 }

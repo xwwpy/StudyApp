@@ -13,7 +13,7 @@ if (Test-Path -LiteralPath $data) { throw 'Smoke directory must be fresh; no exi
 $stdout = "$data.stdout.log"
 $stderr = "$data.stderr.log"
 $process = Start-Process -FilePath $binary -ArgumentList @('--smoke-test', '--data-dir', ('"' + $data + '"')) -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-if (-not $process.WaitForExit(90000)) { $process.Kill(); throw 'Native smoke exceeded 90 seconds' }
+if (-not $process.WaitForExit(150000)) { $process.Kill(); throw 'Native smoke exceeded 150 seconds' }
 if (Test-Path -LiteralPath $data -PathType Container) {
     Copy-Item -LiteralPath $stdout -Destination (Join-Path $data 'smoke.stdout.log')
     Copy-Item -LiteralPath $stderr -Destination (Join-Path $data 'smoke.stderr.log')
@@ -27,6 +27,14 @@ if (-not (Test-Path -LiteralPath $report)) { throw 'Smoke report missing' }
 if ((Get-Content -LiteralPath $report -Raw) -notmatch '^PASS:') { throw 'Smoke report did not pass' }
 $libraryReport = Join-Path $data 'library-smoke-result.txt'
 if ((Get-Content -LiteralPath $libraryReport -Raw) -notmatch '^PASS:') { throw 'Library and history smoke report did not pass' }
+$interactionsReport = Join-Path $data 'interactions-smoke-result.txt'
+if ((Get-Content -LiteralPath $interactionsReport -Raw) -notmatch '^PASS:') { throw 'Note interactions and scroll smoke report did not pass' }
+foreach ($nativeImage in @('native-first-reader.bmp', 'native-first-editor.bmp', 'native-after-history.bmp', 'native-after-menu.bmp', 'native-after-settings.bmp', 'native-after-resize.bmp')) {
+    $nativePath = Join-Path $data $nativeImage
+    if (-not (Test-Path -LiteralPath $nativePath) -or (Get-Item -LiteralPath $nativePath).Length -lt 1000) {
+        throw "Native screen capture missing or empty: $nativeImage"
+    }
+}
 $draft = Get-Content -LiteralPath (Join-Path $data 'note-draft.json') -Raw | ConvertFrom-Json
 if ($draft.content -cne '关闭窗口前的末次输入 🧠') { throw 'Normal window close did not persist the last editor input' }
 foreach ($index in 0..4) {

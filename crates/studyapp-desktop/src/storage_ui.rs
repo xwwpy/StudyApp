@@ -1,5 +1,6 @@
 use crate::{app::StudyApp, components::*, editor_lifecycle::NoteIntent, worker::Work};
 use gpui_kit::{
+    base::{Scrollbar, ScrollbarMode},
     component::{
         Disableable, Sizable,
         button::{Button, ButtonVariants},
@@ -17,6 +18,24 @@ fn size_label(bytes: u64) -> String {
     } else {
         format!("{:.1} MiB", bytes as f64 / (1024. * 1024.))
     }
+}
+
+fn storage_copy_list(scroll: &ScrollHandle) -> Stateful<Div> {
+    column()
+        .id("storage-copy-list")
+        .relative()
+        .max_h(px(340.))
+        .pr_4()
+        .overflow_y_scroll()
+        .track_scroll(scroll)
+        // GPUI dispatches the built-in scrolling before this bubble callback.
+        // Consume every wheel event here, even after the offset reaches an end.
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .child(
+            Scrollbar::vertical(scroll)
+                .id("storage-copy-scrollbar")
+                .mode(ScrollbarMode::Always),
+        )
 }
 
 impl StudyApp {
@@ -97,6 +116,10 @@ impl StudyApp {
 
     pub fn storage_view(&self, cx: &mut Context<Self>) -> Div {
         let blocked = self.storage_busy || self.sync_panel.read(cx).status.busy;
+        let show_file_paths = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.settings.show_file_paths);
         card().child(
             row().child(heading("空间管理")).child(div().flex_1()).child(
                 Button::new("refresh-storage").small().disabled(self.storage_busy)
@@ -113,17 +136,18 @@ impl StudyApp {
                 .child(muted(format!("数据库与历史 {} · 托管副本 {} · 保留文件 {} · 备份 {} · 缓存与配置 {}",
                     size_label(report.database_bytes), size_label(report.managed_bytes),
                     size_label(report.retained_bytes), size_label(report.backup_bytes), size_label(report.auxiliary_bytes))))
-                .child(column().id("storage-copy-list").test_support().max_h(px(340.)).overflow_y_scroll()
+                .child(storage_copy_list(&self.storage_copy_scroll).test_support()
                     .when(report.copies.is_empty(), |v| v.child(muted("没有可清理的托管副本。")))
                     .children(report.copies.iter().map(|copy| {
                         let id = copy.note_id.clone();
                         let confirm_id = id.clone();
                         let history_id = id.clone();
+                        let path_id = SharedString::from(format!("storage-copy-path-{id}"));
                         let in_draft = self.note_editor.as_ref().or(self.recoverable_draft.as_ref())
                             .is_some_and(|d| d.note_id.as_ref() == Some(&id));
                         column().gap_2().p_3().rounded_lg().bg(rgb(BG))
-                            .child(row().child(div().flex_1().child(copy.title.clone()))
-                                .child(muted(size_label(copy.bytes)))
+                            .child(row().child(div().flex_1().min_w_0().truncate().child(copy.title.clone()))
+                                .child(muted(size_label(copy.bytes)).flex_shrink_0())
                                 .child(Button::new(SharedString::from(format!("copy-history-{id}")))
                                     .small().ghost().label("历史与恢复").disabled(blocked || self.note_editor.is_some())
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -140,7 +164,8 @@ impl StudyApp {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.storage_confirm = Some(id.clone()); cx.notify();
                                     }))))
-                            .child(muted(display_path(&copy.path)).text_xs().truncate())
+                            .when(show_file_paths, |v| v.child(muted(display_path(&copy.path))
+                                .id(path_id).test_support().text_xs().truncate()))
                             .when(copy.detached, |v| v.child(muted("已取消管理")))
                             .when(in_draft, |v| v.child(muted("请先保存或删除该笔记的草稿，再清理副本。")))
                             .when_some(copy.reason.as_ref(), |v, reason| v.child(muted(reason.clone())))
@@ -157,5 +182,94 @@ impl StudyApp {
                             })
                     })))
         })
+    }
+}
+
+#[cfg(all(test, feature = "ui-test"))]
+mod tests {
+    use super::storage_copy_list;
+    use gpui_kit::{
+        Context, InteractiveElement, IntoElement, ParentElement, Render, ScrollDelta, ScrollHandle,
+        ScrollWheelEvent, StatefulInteractiveElement, Styled, TestAppContext, VisualTestContext,
+        Window, div, point, px,
+    };
+
+    struct NestedStorage {
+        outer: ScrollHandle,
+        inner: ScrollHandle,
+    }
+
+    impl Render for NestedStorage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("page-scroll")
+                .w(px(400.))
+                .h(px(500.))
+                .overflow_y_scroll()
+                .track_scroll(&self.outer)
+                .child(
+                    storage_copy_list(&self.inner)
+                        .w(px(350.))
+                        .children((0..20).map(|_| div().h(px(50.)).flex_shrink_0())),
+                )
+                .child(div().h(px(1000.)).flex_shrink_0())
+        }
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            _ = window.draw(cx);
+        });
+    }
+
+    fn wheel(cx: &mut VisualTestContext, x: f32, y: f32, delta: f32) {
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(x), px(y)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+            ..Default::default()
+        });
+        draw(cx);
+    }
+
+    #[gpui_kit::test]
+    fn storage_wheel_is_contained_while_scrolling_and_at_both_boundaries(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let inner = ScrollHandle::new();
+        let outer = ScrollHandle::new();
+        let (_, cx) = cx.add_window_view(|_, _| NestedStorage {
+            inner: inner.clone(),
+            outer: outer.clone(),
+        });
+        draw(cx);
+        assert!(inner.max_offset().y > px(0.));
+        assert!(outer.max_offset().y > px(0.));
+
+        wheel(cx, 100., 100., -80.);
+        assert_eq!(inner.offset().y, px(-80.));
+        assert_eq!(outer.offset().y, px(0.), "inner wheel moved Settings");
+
+        wheel(cx, 100., 100., -10000.);
+        assert_eq!(inner.offset().y, -inner.max_offset().y);
+        wheel(cx, 100., 100., -80.);
+        assert_eq!(outer.offset().y, px(0.), "bottom boundary moved Settings");
+
+        wheel(cx, 100., 100., 10000.);
+        assert_eq!(inner.offset().y, px(0.));
+        // Put Settings in the middle while keeping the top of the list visible.
+        outer.set_offset(point(px(0.), px(-40.)));
+        draw(cx);
+        wheel(cx, 100., 100., 80.);
+        assert_eq!(inner.offset().y, px(0.));
+        assert_eq!(outer.offset().y, px(-40.), "top boundary moved Settings");
+
+        // The narrow right-hand strip is outside the nested list.
+        wheel(cx, 380., 100., -80.);
+        assert_eq!(inner.offset().y, px(0.));
+        assert_eq!(
+            outer.offset().y,
+            px(-120.),
+            "Settings did not scroll outside list"
+        );
     }
 }

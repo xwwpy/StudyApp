@@ -22,7 +22,7 @@ async fn pause(cx: &AsyncApp) {
         .await;
 }
 
-async fn until(
+pub(crate) async fn until(
     window: AnyWindowHandle,
     view: &Entity<StudyApp>,
     description: &str,
@@ -45,7 +45,7 @@ async fn until(
     }
 }
 
-async fn settled(window: AnyWindowHandle, view: &Entity<StudyApp>, cx: &mut AsyncApp) {
+pub(crate) async fn settled(window: AnyWindowHandle, view: &Entity<StudyApp>, cx: &mut AsyncApp) {
     until(
         window,
         view,
@@ -106,7 +106,7 @@ fn send(window: AnyWindowHandle, view: &Entity<StudyApp>, command: Command, cx: 
         .unwrap();
 }
 
-async fn create_note(
+pub(crate) async fn create_note(
     window: AnyWindowHandle,
     view: &Entity<StudyApp>,
     title: &str,
@@ -151,7 +151,12 @@ async fn create_note(
 }
 
 /// Scroll only as far as needed, using the same hit testing as a native click.
-fn click_scrolled(window: &mut Window, id: SharedString, scroll: &str, cx: &mut App) {
+pub(crate) fn click_scrolled(window: &mut Window, id: SharedString, scroll: &str, cx: &mut App) {
+    reveal_scrolled(window, id.clone(), scroll, cx);
+    window.click(id, cx);
+}
+
+pub(crate) fn reveal_scrolled(window: &mut Window, id: SharedString, scroll: &str, cx: &mut App) {
     for _ in 0..35 {
         window.render_frame(cx);
         let viewport = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
@@ -164,7 +169,6 @@ fn click_scrolled(window: &mut Window, id: SharedString, scroll: &str, cx: &mut 
                 .as_ref()
                 .is_some_and(|container| container.bounds().contains(&target.bounds().center()))
         {
-            window.click(id, cx);
             return;
         }
         let scroll = if container.is_some_and(|container| {
@@ -185,13 +189,32 @@ fn click_scrolled(window: &mut Window, id: SharedString, scroll: &str, cx: &mut 
         } else {
             -160.
         };
-        window.scroll(
-            SharedString::from(scroll.to_owned()),
-            ScrollDelta::Pixels(point(px(0.), px(delta))),
-            cx,
-        );
+        if scroll == "page-scroll" {
+            scroll_settings(window, delta, cx);
+        } else {
+            window.scroll(
+                SharedString::from(scroll.to_owned()),
+                ScrollDelta::Pixels(point(px(0.), px(delta))),
+                cx,
+            );
+        }
     }
     panic!("could not reveal native button {id}");
+}
+
+/// Scroll in the outer page's padding, where nested file lists cannot consume it.
+pub(crate) fn scroll_settings(window: &mut Window, delta: f32, cx: &mut App) {
+    let page = window.find("page-scroll").bounds();
+    window.dispatch_event(
+        ScrollWheelEvent {
+            position: point(page.origin.x + px(5.), page.center().y),
+            delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+            ..Default::default()
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.render_frame(cx);
 }
 
 pub async fn exercise(

@@ -52,4 +52,4 @@ Files: workflows, package script, README, release notes, verification, screensho
 - [x] Run frontend build/tests, Rust fmt/tests/clippy, native smoke and release-package smoke. Report measured typing latency and test boundaries.
 - [x] Add frontend tests/bundle reproducibility/license validation to CI and release gates, and include editor license notices.
 - [x] Document continuous editing behavior, WebView2 runtime requirement, supported highlighting and lifecycle actions; bump to 0.4.0.
-- [ ] Commit/push, verify CI, publish and verify a release without rewriting the existing v0.3.0 tag.
+- [x] Commit/push, verify CI, publish and verify a release without rewriting the existing v0.3.0 tag. v0.4.0 targets `7ac3856`; CI, security, release gates and the downloaded release executable passed. Evidence and hashes are recorded in `docs/verification.md`.

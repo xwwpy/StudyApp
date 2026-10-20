@@ -18,6 +18,12 @@
 
 远端首轮 CI 的 Windows 全量测试暴露旧 WebDAV fixture 的非阻塞 socket 继承差异：服务器在请求字节尚未到达时 `read_exact` 得到 `WouldBlock`。新增延迟请求用例在本机先复现失败；接受连接后显式恢复阻塞模式并保留读写超时，16 项同步测试和 165 项全量测试均通过。生产同步逻辑未改变。
 
+提交 `7ac3856` 的 [main CI](https://github.com/xwwpy/StudyApp/actions/runs/39390827520) 已通过：Windows/Linux 核心与同步测试、编辑器类型/构建/浏览器检查，以及 Windows 全量测试、Clippy 和原生窗口回归全部成功。同提交的[安全与许可证检查](https://github.com/xwwpy/StudyApp/actions/runs/39390827422)通过。
+
+[v0.4.0 发布流水线](https://github.com/xwwpy/StudyApp/actions/runs/39391858333)全部成功，并于 2026-10-20 发布 [StudyApp 0.4.0](https://github.com/xwwpy/StudyApp/releases/tag/v0.4.0)。发布门禁重新执行两平台业务测试、浏览器检查、全量 Rust 测试、Clippy、安全审计、许可证检查和原生窗口回归，随后优化构建并打包。`windows-release-smoke` 归档保留截图和运行报告。
+
+从 GitHub 重新下载最终 ZIP 后，文件大小为 14,447,732 字节，SHA256 `8f0f96a5446e2b8959d3e021752bae3822908edad5d99b4f9e959924c3cb0313`，同时匹配下载的 `.sha256` 和 GitHub 资产摘要。下载包解压到全新的 `.scratch/published-v040-046696f66c7443b891c16732bc5a2779` 并启动，其中的正式 EXE 通过五页渲染及离线 WebView2 ready 检查；完整交互断言由上述 CI 的 ui-test 构建验证。发布后的文档提交仅补充验收证据与迁移说明，未修改标签或应用代码。
+
 发布包本地验收：最终优化 EXE 已打包为 `StudyApp-0.4.0-windows-x86_64.zip`（14,447,461 字节、959 个条目），SHA256 `93b1c885c037e1a25c432e7ac2b4365e5592d6a6cb4b1ee9aa0d4cbd9b71e6d1`。ZIP 不含资料库、草稿、同步凭据或 PDB；在新的 `.scratch/package-v040-ac2103e5136e4e39bd97c95d4a7379ad` 解压后实际启动，五页渲染和离线 WebView2 ready 验证通过。GitHub Release 由 CI 独立构建，发布资产以其校验文件为准。
 
 限制：编辑面需要 WebView2 Runtime；系统实际输入法硬件操作没有全矩阵验收，IME 由浏览器 CDP 和正常 native flush 路径验证。原始 HTML/图片/公式/Mermaid 不执行或完整渲染；不声称复刻 Typora 全部功能。单文件 10 MiB，极大单行/复杂嵌套仍可能较慢。真实 WebDAV/NAS、微信、代码签名与自动更新的既有边界不变。历史章节记录对应旧版，不应用于评价 0.4.0 编辑行为。

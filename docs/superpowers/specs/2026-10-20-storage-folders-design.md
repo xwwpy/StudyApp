@@ -23,6 +23,6 @@ Test folder identity/persistence/cycles/backup validation; storage migration res
 
 - Core folders: 9 new regression cases, 70 core tests total.
 - Storage backend and worker: 21 tests, including Windows junction rejection, failed deletion retry, migration publication failure, restart preferences and explicit-directory isolation.
-- Full workspace: 164 tests; format and all-target/all-feature Clippy pass.
+- Full workspace: 165 tests; format and all-target/all-feature Clippy pass. The additional sync regression covers delayed request bytes in the Windows WebDAV fixture.
 - Native evidence: `.scratch/library-v040-67c714e7892448379d7ca03ebdccd84d`, including actual wheel movement to the last history row at 1000x700, 200-character title, native DOM input after history and saved bytes, draft-folder deletion fallback, single-copy deletion, source byte preservation and migration of a durable draft. Reviews corrected storage-busy save deadlock and orphaned draft folders before this run.
 - Space totals are logical file lengths inside the selected library; hard links can count more than once. Install files and shared WebView cache are outside this statistic. Original libraries and failed migration destinations are retained.

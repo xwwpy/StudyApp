@@ -153,8 +153,14 @@ fn fixture(replies: Vec<Reply>) -> (String, std::thread::JoinHandle<Vec<String>>
                     Err(e) => panic!("fixture accept: {e}"),
                 }
             };
+            // Windows inherits the listener's nonblocking mode on accepted
+            // sockets. Requests may arrive after accept; read_exact must wait.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
             let mut bytes = Vec::new();
             let mut byte = [0];
@@ -209,6 +215,30 @@ fn fixture(replies: Vec<Reply>) -> (String, std::thread::JoinHandle<Vec<String>>
         requests
     });
     (url, thread)
+}
+
+#[test]
+fn webdav_fixture_waits_for_delayed_request_bytes() {
+    use std::io::{Read, Write};
+    let (url, server) = fixture(vec![(200, vec![], "ok".into())]);
+    let address = url
+        .strip_prefix("http://")
+        .unwrap()
+        .strip_suffix("/dav/")
+        .unwrap();
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    // Force accept before the request arrives, as can happen on a loaded CI host.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    stream
+        .write_all(b"GET /dav/ HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.ends_with("\r\n\r\nok"));
+    assert_eq!(server.join().unwrap().len(), 1);
 }
 
 #[test]

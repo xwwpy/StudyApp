@@ -4,7 +4,7 @@
 
 2026-10-20，Windows x64 / Rust 1.98.0 / GPUI Kit 0.7.3 / WebView2：
 
-- 格式检查、全目标全特性 Clippy `-D warnings` 通过；`cargo test --locked --workspace --all-features` **164 项通过**（核心 70、桌面 79、同步 15）。
+- 格式检查、全目标全特性 Clippy `-D warnings` 通过；`cargo test --locked --workspace --all-features` **165 项通过**（核心 70、桌面 79、同步 16）。
 - 前端类型检查与离线资源可重复构建通过。23 个浏览器回归覆盖单编辑面、跨段键盘选区/撤销、所有语言高亮、任务键盘勾选、表格、恶意 HTML/链接/图片、CDP 输入法组合与 flush、过期 flush、源码模式、超限粘贴、4096 patch 上限、混合 EOL 精确字节预算、生产环境无 test API。
 - 原生窗口测试使用独立 EXE，未停止用户正在运行的旧程序。证据目录 `.scratch/continuous-v040-8e1c2574ef3a4721993690090f76abc7`：真实 WebView IPC、跨段格式/撤销、CRLF 保留、桥接错误恢复、旧代际错误忽略、只读恢复仍只读、版本保存、草稿恢复/删除、取消管理/重新导入、文件夹同步，以及正常关闭前的最后输入落盘通过。五页 GPUI 截图与单独 WebView 截图保留；GPUI GPU 截图本身不包含子 HWND。
 - 存储与目录扩展的最终原生证据：`.scratch/library-v040-67c714e7892448379d7ca03ebdccd84d`。1000×700 窗口、200 字标题、1,676 个差异显示行：实际滚轮使偏移改变，滚到末尾后最后一行可见，差异视口 267.2×209.6 逻辑像素；返回编辑后 WebView2 `Input.insertText` 的真实 DOM 输入通过 IPC 保存到文件。目录筛选/移动、删除新草稿所属空目录后的未分类回退、维护期间保存互斥、逐份确认清理、源文件字节不变、迁移并恢复已落盘草稿、再切回原库及关闭前末次输入均通过。
@@ -15,6 +15,8 @@
 - `cargo-audit 0.22.2` 使用更新后的官方 RustSec 公告库（`999ec89d5d3f10f20be14750ec8c2d8b44e0ac9b`）：0 个已知漏洞，9 项停止维护警告和 glib VariantStrIter 的 unsound 警告保留；glib 来自 Wry 的非 Windows 平台依赖，不在发布的 Windows 编译目标中。未添加忽略规则。`cargo-deny 0.20.2` 的许可证、依赖策略、来源检查通过。
 - npm 官方安全公告审计：0 个已知漏洞。锁文件使用官方 registry 来源与完整性哈希；37 份实际打包依赖许可证由构建校验并纳入打包。全新目录从官方 registry 安装后，类型检查和离线资源字节一致性再次通过。
 - 独立审查发现并修复：无落盘 ACK 的关闭/切库、草稿删除失败的 owner 丢失、过期结果错误解除输入冻结、只读恢复解锁、JSON 转义导致 IPC 容量不足、旧代际错误影响新文档、跨库同步绕过取消管理，以及前端嵌套格式/多行链接/表格边界问题。
+
+远端首轮 CI 的 Windows 全量测试暴露旧 WebDAV fixture 的非阻塞 socket 继承差异：服务器在请求字节尚未到达时 `read_exact` 得到 `WouldBlock`。新增延迟请求用例在本机先复现失败；接受连接后显式恢复阻塞模式并保留读写超时，16 项同步测试和 165 项全量测试均通过。生产同步逻辑未改变。
 
 发布包本地验收：最终优化 EXE 已打包为 `StudyApp-0.4.0-windows-x86_64.zip`（14,447,461 字节、959 个条目），SHA256 `93b1c885c037e1a25c432e7ac2b4365e5592d6a6cb4b1ee9aa0d4cbd9b71e6d1`。ZIP 不含资料库、草稿、同步凭据或 PDB；在新的 `.scratch/package-v040-ac2103e5136e4e39bd97c95d4a7379ad` 解压后实际启动，五页渲染和离线 WebView2 ready 验证通过。GitHub Release 由 CI 独立构建，发布资产以其校验文件为准。
 

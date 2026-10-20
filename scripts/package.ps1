@@ -45,9 +45,11 @@ try {
     if (Test-Path -LiteralPath (Join-Path $repoRoot 'docs/verification.md') -PathType Leaf) {
         Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/verification.md') -Destination (Join-Path $staging 'docs/verification.md')
     }
-    if (Test-Path -LiteralPath (Join-Path $repoRoot 'docs/images/dashboard.png') -PathType Leaf) {
-        [IO.Directory]::CreateDirectory((Join-Path $staging 'docs/images')) | Out-Null
-        Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/images/dashboard.png') -Destination (Join-Path $staging 'docs/images/dashboard.png')
+    foreach ($image in @('dashboard.png', 'note-editor.png')) {
+        if (Test-Path -LiteralPath (Join-Path $repoRoot "docs/images/$image") -PathType Leaf) {
+            [IO.Directory]::CreateDirectory((Join-Path $staging 'docs/images')) | Out-Null
+            Copy-Item -LiteralPath (Join-Path $repoRoot "docs/images/$image") -Destination (Join-Path $staging "docs/images/$image")
+        }
     }
     # Several upstream crates omit standard license text from their published archives.
     # Preserve a shared Apache-2.0 text as well as all crate-specific notices supplied.

@@ -359,10 +359,38 @@ async fn resize_pane(
                 .bounds()
                 .size
                 .width;
-            assert!(
-                (f32::from(after - before) - delta).abs() < 2.,
+            let committed = &view.read(cx).layout;
+            let preferred_width = match pane {
+                "navigation-pane" => committed.navigation_width,
+                "folders-pane" => committed.folders_width,
+                "notes-pane" => committed.notes_width,
+                _ => unreachable!("unknown resize fixture pane"),
+            };
+            let requested = (f32::from(before) + delta).round();
+            assert_eq!(
+                preferred_width, requested as u32,
                 "{pane} candidate was not committed on release"
             );
+            // Hosted Windows desktops can cap the window at 1024 px despite
+            // resize(1440). The saved preference must still commit exactly;
+            // the rendered note pane must leave 280 px for the document.
+            let rendered = if pane == "notes-pane" {
+                let navigation = window.find("navigation-pane").bounds().size.width;
+                let folders = window.find("folders-pane").bounds().size.width;
+                requested.min(
+                    f32::from(window.viewport_size().width - navigation - folders)
+                        - 32.
+                        - 3. * 6.
+                        - 280.,
+                )
+            } else {
+                requested
+            };
+            assert!(
+                (f32::from(after) - rendered).abs() < 2.,
+                "{pane} rendered {after:?}, expected {rendered} from saved width {preferred_width}"
+            );
+            assert!(window.find("document-pane").bounds().size.width >= px(279.));
             view.read(cx).layout.clone()
         })
         .unwrap();
@@ -723,9 +751,14 @@ pub async fn exercise(
     cx: &mut AsyncApp,
 ) {
     settled(window, view, cx).await;
+    let workspace_width = if std::env::var_os("WW_STUDYAPP_SMOKE_NARROW_WORKSPACE").is_some() {
+        1024.
+    } else {
+        1440.
+    };
     window
         .update(cx, |_, window, cx| {
-            window.resize(size(px(1440.), px(1000.)));
+            window.resize(size(px(workspace_width), px(1000.)));
             view.update(cx, |app, cx| {
                 app.page = Page::Notes;
                 app.history = false;

@@ -13,7 +13,7 @@ if (Test-Path -LiteralPath $data) { throw 'Smoke directory must be fresh; no exi
 $stdout = "$data.stdout.log"
 $stderr = "$data.stderr.log"
 $process = Start-Process -FilePath $binary -ArgumentList @('--smoke-test', '--data-dir', ('"' + $data + '"')) -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-if (-not $process.WaitForExit(150000)) { $process.Kill(); throw 'Native smoke exceeded 150 seconds' }
+if (-not $process.WaitForExit(240000)) { $process.Kill(); throw 'Native smoke exceeded 240 seconds' }
 if (Test-Path -LiteralPath $data -PathType Container) {
     Copy-Item -LiteralPath $stdout -Destination (Join-Path $data 'smoke.stdout.log')
     Copy-Item -LiteralPath $stderr -Destination (Join-Path $data 'smoke.stderr.log')

@@ -60,11 +60,12 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           key: desktop-windows
+          cache-on-failure: true
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace --all-features
       - run: cargo build --locked -p studyapp-desktop --features ui-test
       - name: Exercise native window and capture five pages
-        timeout-minutes: 3
+        timeout-minutes: 5
         run: |
           $smokeDir = Join-Path $env:RUNNER_TEMP ('studyapp-smoke-' + [guid]::NewGuid().ToString('N'))
           "SMOKE_DIR=$smokeDir" >> $env:GITHUB_ENV

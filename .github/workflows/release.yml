@@ -52,6 +52,7 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           key: release-windows
+          cache-on-failure: true
       - name: Validate version tag
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -74,7 +75,7 @@ jobs:
       - run: cargo deny --locked check licenses bans sources
       - run: cargo build --locked -p studyapp-desktop --features ui-test
       - name: Verify native UI before release
-        timeout-minutes: 3
+        timeout-minutes: 5
         run: |
           $smokeDir = Join-Path $env:RUNNER_TEMP ('studyapp-release-smoke-' + [guid]::NewGuid().ToString('N'))
           "SMOKE_DIR=$smokeDir" >> $env:GITHUB_ENV

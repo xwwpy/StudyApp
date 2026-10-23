@@ -88,10 +88,14 @@ impl Render for FolderDragPreview {
                     .gap_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(GREEN))
-                    .bg(rgb(LIGHT))
+                    .border_color(crate::theme::color(GREEN))
+                    .bg(crate::theme::color(LIGHT))
                     .shadow_md()
-                    .child(Icon::new(IconName::Folder).small().text_color(rgb(GREEN)))
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .small()
+                            .text_color(crate::theme::color(GREEN)),
+                    )
                     .child(
                         div()
                             .min_w_0()
@@ -138,6 +142,11 @@ enum FolderAction {
 /// destination picker. All mutations are events; this component performs no IO.
 pub struct FolderPanel {
     snapshot: Option<Arc<Snapshot>>,
+    index: Arc<studyapp_desktop::library_tree::LibraryIndex>,
+    revealed_note: Option<String>,
+    row_sort: studyapp_core::LibrarySort,
+    search_query: Option<String>,
+    search_folders: HashSet<String>,
     rows: Vec<FolderRow>,
     counts: HashMap<String, usize>,
     all_count: usize,
@@ -174,6 +183,11 @@ impl FolderPanel {
         .detach();
         Self {
             snapshot: None,
+            index: Arc::new(Default::default()),
+            revealed_note: None,
+            row_sort: Default::default(),
+            search_query: None,
+            search_folders: HashSet::new(),
             rows: Vec::new(),
             counts: HashMap::new(),
             all_count: 0,
@@ -187,6 +201,10 @@ impl FolderPanel {
             active_menu: None,
             menu_sequence: 0,
         }
+    }
+
+    pub fn library_index(&self) -> Arc<studyapp_desktop::library_tree::LibraryIndex> {
+        self.index.clone()
     }
 
     pub fn filter(&self) -> &FolderFilter {
@@ -203,6 +221,32 @@ impl FolderPanel {
 
     pub fn modal_open(&self) -> bool {
         self.action.is_some()
+    }
+
+    pub fn can_create_folder(&self) -> bool {
+        !self.busy
+            && self.action.is_none()
+            && self.snapshot.is_some()
+            && self.filter.folder_id().is_none_or(|id| {
+                self.rows
+                    .iter()
+                    .find(|row| row.id == id)
+                    .is_none_or(|row| row.depth + 1 < MAX_FOLDER_DEPTH)
+            })
+    }
+
+    /// The library plus menu uses the exact selected folder as the destination.
+    /// Recheck depth and busy state at activation, since a menu may remain open.
+    pub fn begin_create_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.can_create_folder() {
+            let parent_id = self.filter.folder_id().map(str::to_owned);
+            self.edit_name(
+                FolderAction::Create { parent_id },
+                String::new(),
+                window,
+                cx,
+            );
+        }
     }
 
     pub fn overlay_open(&self) -> bool {
@@ -269,6 +313,26 @@ impl FolderPanel {
         cx.notify();
     }
 
+    /// Note clicks already choose an exact note in the host. Align destination
+    /// context silently: emitting Filter here would asynchronously replace that
+    /// exact choice with the first note in the folder.
+    pub fn align_note_context(&mut self, note_id: &str, cx: &mut Context<Self>) -> bool {
+        let Some(note) = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.notes.iter().find(|n| n.id == note_id))
+        else {
+            return false;
+        };
+        self.filter = match &note.folder_id {
+            Some(id) if self.rows.iter().any(|f| &f.id == id) => FolderFilter::Folder(id.clone()),
+            Some(_) => FolderFilter::All,
+            None => FolderFilter::Root,
+        };
+        cx.notify();
+        true
+    }
+
     pub fn set_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
         if self.busy != busy {
             self.busy = busy;
@@ -277,6 +341,13 @@ impl FolderPanel {
     }
 
     pub fn accept(&mut self, snapshot: Arc<Snapshot>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.index.needs_update(&snapshot) {
+            self.search_query = None;
+            self.index = Arc::new(studyapp_desktop::library_tree::LibraryIndex::build(
+                &snapshot,
+            ));
+            self.rows = folder_rows_sorted(&snapshot.folders, self.row_sort, &self.index);
+        }
         let had_overlay = self.overlay_open();
         let library_changed = self
             .snapshot
@@ -290,7 +361,7 @@ impl FolderPanel {
                     })
             });
         if folders_changed {
-            self.rows = folder_rows(&snapshot.folders);
+            self.rows = folder_rows_sorted(&snapshot.folders, self.row_sort, &self.index);
             self.collapsed
                 .retain(|id| snapshot.folders.iter().any(|folder| &folder.id == id));
         }
@@ -485,7 +556,9 @@ impl FolderPanel {
                         .read(cx)
                         .can_drop_note(drag, hover_destination.clone())
                 }) {
-                    style.bg(rgb(LIGHT)).border_color(rgb(GREEN))
+                    style
+                        .bg(crate::theme::color(LIGHT))
+                        .border_color(crate::theme::color(GREEN))
                 } else {
                     style
                 }
@@ -496,7 +569,9 @@ impl FolderPanel {
                         .read(cx)
                         .can_drop_folder(drag, folder_hover_destination.as_deref())
                 }) {
-                    style.bg(rgb(LIGHT)).border_color(rgb(GREEN))
+                    style
+                        .bg(crate::theme::color(LIGHT))
+                        .border_color(crate::theme::color(GREEN))
                 } else {
                     style
                 }
@@ -756,7 +831,7 @@ impl FolderPanel {
             .gap_2()
             .p_2()
             .rounded_lg()
-            .bg(rgb(BG))
+            .bg(crate::theme::color(BG))
             .max_h(px(420.))
             .min_h_0()
             .min_w_0()
@@ -909,7 +984,7 @@ impl FolderPanel {
         form.children(
             self.error
                 .as_ref()
-                .map(|message| muted(message.clone()).text_color(rgb(0xAA4F34))),
+                .map(|message| muted(message.clone()).text_color(crate::theme::color(0xAA4F34))),
         )
         .child(
             row()
@@ -937,65 +1012,92 @@ impl FolderPanel {
     }
 }
 
-impl Render for FolderPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected_id = self.filter.folder_id().map(str::to_owned);
-        let can_create = !self.busy
-            && self.action.is_none()
-            && self.snapshot.is_some()
-            && selected_id.as_ref().is_none_or(|id| {
-                self.rows
+impl FolderPanel {
+    fn prepare_library(
+        &mut self,
+        query: &str,
+        sort: studyapp_core::LibrarySort,
+        selected_note: Option<&str>,
+    ) {
+        if self.search_query.as_deref() != Some(query) {
+            self.search_folders = if query.is_empty() {
+                HashSet::new()
+            } else {
+                self.index.matching_folders(query)
+            };
+            self.search_query = Some(query.to_owned());
+        }
+        if let Some(snapshot) = &self.snapshot {
+            if self.row_sort != sort {
+                self.row_sort = sort;
+                self.rows = folder_rows_sorted(&snapshot.folders, sort, &self.index);
+            }
+            if selected_note != self.revealed_note.as_deref() {
+                if let Some(note) = snapshot
+                    .notes
                     .iter()
-                    .find(|row| &row.id == id)
-                    .is_none_or(|row| row.depth + 1 < MAX_FOLDER_DEPTH)
-            });
+                    .find(|n| Some(n.id.as_str()) == selected_note)
+                    && let Some(folder) = self
+                        .rows
+                        .iter()
+                        .find(|f| Some(&f.id) == note.folder_id.as_ref())
+                {
+                    self.collapsed.remove(&folder.id);
+                    for ancestor in &folder.ancestors {
+                        self.collapsed.remove(ancestor);
+                    }
+                }
+                self.revealed_note = selected_note.map(str::to_owned);
+            }
+        }
+    }
+
+    pub fn visible_notes(
+        &mut self,
+        query: &str,
+        sort: studyapp_core::LibrarySort,
+        selected_note: Option<&str>,
+        detached: bool,
+    ) -> Vec<usize> {
+        self.prepare_library(query, sort, selected_note);
+        let Some(snapshot) = &self.snapshot else {
+            return Vec::new();
+        };
+        self.index
+            .ordered_notes(sort)
+            .iter()
+            .copied()
+            .filter(|&position| {
+                let note = &snapshot.notes[position];
+                note.detached == detached
+                    && self.index.matches(&note.id, query)
+                    && self.index.note_visible(&note.id, &self.collapsed, query)
+            })
+            .collect()
+    }
+
+    pub fn library_tree(
+        &mut self,
+        mut note_rows: HashMap<Option<String>, Vec<AnyElement>>,
+        query: &str,
+        sort: studyapp_core::LibrarySort,
+        selected_note: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        self.prepare_library(query, sort, selected_note);
+        let selected_id = self.filter.folder_id().map(str::to_owned);
         let mut panel = column()
             .id("note-folders")
+            .flex_1()
             .gap_0()
             .w_full()
             .h_full()
             .min_h_0()
-            .min_w_0()
-            .child(
-                row()
-                    .h(px(46.))
-                    .px_2()
-                    .flex_shrink_0()
-                    .border_b_1()
-                    .border_color(rgb(BORDER))
-                    .gap_1()
-                    .child(Icon::new(IconName::Folder).small().text_color(rgb(GREEN)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("笔记目录"),
-                    )
-                    .child(
-                        Button::new("folder-create")
-                            .small()
-                            .ghost()
-                            .label("＋")
-                            .accessibility_label("新建目录")
-                            .tooltip("在当前选中目录内创建，最多八层")
-                            .tooltip_placement(Placement::Left)
-                            .disabled(!can_create)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let parent_id = this.filter.folder_id().map(str::to_owned);
-                                this.edit_name(
-                                    FolderAction::Create { parent_id },
-                                    String::new(),
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    ),
-            );
+            .min_w_0();
         let mut tree = column()
-            .id("folder-tree-scroll")
+            .id("note-list-scroll")
             .test_support()
-            .gap_1()
+            .gap_0()
             .p_2()
             .flex_1()
             .min_h_0()
@@ -1030,13 +1132,20 @@ impl Render for FolderPanel {
                             })),
                     ),
             );
-        for folder in self.rows.iter().filter(|row| {
-            !row.ancestors
-                .iter()
-                .any(|ancestor| self.collapsed.contains(ancestor))
-        }) {
+        tree = tree.children(note_rows.remove(&None).unwrap_or_default());
+        for folder in self
+            .rows
+            .iter()
+            .filter(|row| folder_is_visible(row, &self.collapsed, !query.is_empty()))
+        {
             let id = folder.id.clone();
-            let expanded = !self.collapsed.contains(&id);
+            let notes_folder_id = id.clone();
+            let expanded = folder_is_expanded(
+                &id,
+                &self.collapsed,
+                &self.search_folders,
+                !query.is_empty(),
+            );
             let count = self.counts.get(&id).copied().unwrap_or(0);
             let chosen = selected_id.as_ref() == Some(&id);
             let library = self
@@ -1057,14 +1166,14 @@ impl Render for FolderPanel {
             let mut entry = row().gap_0().min_w_0().flex_shrink_0().children(
                 (0..folder.depth.min(MAX_FOLDER_DEPTH)).map(|_| {
                     div()
-                        .w(px(10.))
-                        .h(px(28.))
+                        .w(px(14.))
+                        .h(px(32.))
                         .flex_shrink_0()
                         .border_l_1()
-                        .border_color(rgb(0xDCE5DC))
+                        .border_color(crate::theme::color(BORDER))
                 }),
             );
-            if folder.has_children {
+            if folder.has_children || self.index.folder_has_notes(&id) {
                 let collapse_id = id.clone();
                 entry = entry.child(
                     Button::new(SharedString::from(format!("folder-expand-{id}")))
@@ -1105,7 +1214,9 @@ impl Render for FolderPanel {
                     })
                     .aria_selected(chosen)
                     .when(chosen, |style| {
-                        style.bg(rgb(LIGHT)).border_color(rgb(0xBDD7C8))
+                        style
+                            .bg(crate::theme::color(LIGHT))
+                            .border_color(crate::theme::color(0xBDD7C8))
                     })
                     .tooltip(move |window, cx| sidebar_tooltip(tip.clone(), window, cx))
                     .child(
@@ -1130,7 +1241,7 @@ impl Render for FolderPanel {
                                                     IconName::FolderClosed
                                                 })
                                                 .small()
-                                                .text_color(rgb(GREEN)),
+                                                .text_color(crate::theme::color(GREEN)),
                                             )
                                             .child(
                                                 div()
@@ -1144,7 +1255,7 @@ impl Render for FolderPanel {
                                                 div()
                                                     .flex_shrink_0()
                                                     .text_xs()
-                                                    .text_color(rgb(MUTED))
+                                                    .text_color(crate::theme::color(MUTED))
                                                     .child(count.to_string()),
                                             ),
                                     )
@@ -1198,13 +1309,62 @@ impl Render for FolderPanel {
                         )
                     }),
             );
+            if expanded || !query.is_empty() {
+                tree = tree.child(
+                    column()
+                        .pl(px((folder.depth as f32 + 1.) * 14. + 18.))
+                        .border_l_1()
+                        .border_color(crate::theme::color(BORDER))
+                        .gap_0()
+                        .children(note_rows.remove(&Some(notes_folder_id)).unwrap_or_default()),
+                );
+            } else {
+                note_rows.remove(&Some(notes_folder_id));
+            }
         }
+        // Stale folder references are kept accessible as uncategorized content.
+        tree = tree.children(
+            note_rows
+                .into_iter()
+                .filter(|(id, _)| {
+                    id.as_ref()
+                        .is_none_or(|id| !self.rows.iter().any(|f| &f.id == id))
+                })
+                .flat_map(|(_, rows)| rows),
+        );
         if self.rows.is_empty() {
-            tree = tree.child(muted("新建目录，按主题整理笔记。").text_xs().p_2());
+            tree = tree.child(muted("使用 ＋ 新建或导入笔记。").text_xs().p_2());
         }
         panel = panel.child(tree);
         panel
     }
+}
+
+impl Render for FolderPanel {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.library_tree(
+            HashMap::new(),
+            "",
+            studyapp_core::LibrarySort::default(),
+            None,
+            cx,
+        )
+    }
+}
+
+/// Search narrows notes, while all folder destinations stay available for
+/// organization. User collapse state is restored as soon as search is cleared.
+fn folder_is_visible(folder: &FolderRow, collapsed: &HashSet<String>, searching: bool) -> bool {
+    searching || !folder.ancestors.iter().any(|id| collapsed.contains(id))
+}
+
+fn folder_is_expanded(
+    id: &str,
+    collapsed: &HashSet<String>,
+    matching: &HashSet<String>,
+    searching: bool,
+) -> bool {
+    !collapsed.contains(id) || (searching && matching.contains(id))
 }
 
 fn empty_folder(snapshot: &Snapshot, id: &str) -> bool {
@@ -1247,6 +1407,17 @@ fn validated_name(
 }
 
 fn folder_rows(folders: &[NoteFolder]) -> Vec<FolderRow> {
+    folder_rows_sorted(
+        folders,
+        studyapp_core::LibrarySort::default(),
+        &Default::default(),
+    )
+}
+fn folder_rows_sorted(
+    folders: &[NoteFolder],
+    sort: studyapp_core::LibrarySort,
+    index: &studyapp_desktop::library_tree::LibraryIndex,
+) -> Vec<FolderRow> {
     let ids: HashSet<&str> = folders.iter().map(|folder| folder.id.as_str()).collect();
     let mut children: HashMap<Option<&str>, Vec<&NoteFolder>> = HashMap::new();
     for folder in folders {
@@ -1254,7 +1425,13 @@ fn folder_rows(folders: &[NoteFolder]) -> Vec<FolderRow> {
         children.entry(parent).or_default().push(folder);
     }
     for siblings in children.values_mut() {
-        siblings.sort_by_cached_key(|folder| (folder.name.to_lowercase(), folder.id.clone()));
+        siblings.sort_by(|a, b| {
+            studyapp_desktop::library_tree::compare_entries(
+                sort,
+                (&a.name, index.folder_updated(&a.id), &a.id),
+                (&b.name, index.folder_updated(&b.id), &b.id),
+            )
+        });
     }
     let mut rows = Vec::with_capacity(folders.len());
     let mut seen = HashSet::new();
@@ -1396,6 +1573,54 @@ mod tests {
             name: name.into(),
             parent_id: parent.map(str::to_owned),
         }
+    }
+
+    #[::core::prelude::v1::test]
+    fn search_preserves_empty_drop_destinations_and_temporarily_expands_matching_ancestors() {
+        let rows = folder_rows(&[
+            folder("matching", "Matching", None),
+            folder("matching-child", "Child", Some("matching")),
+            folder("destination", "Empty destination", None),
+            folder(
+                "nested-destination",
+                "Nested empty destination",
+                Some("destination"),
+            ),
+        ]);
+        let collapsed = ["matching".to_owned(), "destination".to_owned()]
+            .into_iter()
+            .collect();
+        let matching = ["matching".to_owned(), "matching-child".to_owned()]
+            .into_iter()
+            .collect();
+        let visible = rows
+            .iter()
+            .filter(|row| folder_is_visible(row, &collapsed, true))
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(visible.len(), 4);
+        assert!(visible.contains(&"destination"));
+        assert!(
+            visible.contains(&"nested-destination"),
+            "Search keeps every logical drop target reachable"
+        );
+        assert!(folder_is_expanded("matching", &collapsed, &matching, true));
+        assert!(!folder_is_expanded(
+            "destination",
+            &collapsed,
+            &matching,
+            true
+        ));
+        assert!(
+            !folder_is_expanded("matching", &collapsed, &matching, false),
+            "Clearing search restores user collapse state"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| folder_is_visible(row, &collapsed, false))
+                .count(),
+            2
+        );
     }
 
     #[::core::prelude::v1::test]
@@ -1702,6 +1927,124 @@ mod ui_tests {
         })
     }
 
+    fn selection_snapshot() -> Arc<Snapshot> {
+        let mut snapshot = (*panel_snapshot()).clone();
+        snapshot.folders.push(NoteFolder {
+            id: "other".into(),
+            name: "Other".into(),
+            parent_id: None,
+        });
+        snapshot.notes = [
+            ("a", Some("existing")),
+            ("b", Some("other")),
+            ("root-note", None),
+        ]
+        .into_iter()
+        .map(|(id, folder)| studyapp_core::Note {
+            id: id.into(),
+            path: format!("/{id}.md"),
+            title: id.into(),
+            folder_id: folder.map(str::to_owned),
+            managed: true,
+            detached: false,
+            missing: false,
+            error: None,
+            created_at: 1,
+            updated_at: 1,
+            revision: 1,
+        })
+        .collect();
+        Arc::new(snapshot)
+    }
+
+    #[gpui_kit::test]
+    fn clicking_note_aligns_folder_context_without_emitting_a_reselection(cx: &mut TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let (host, cx) = cx.add_window_view(|window, cx| TestHost::new("New", window, cx));
+        let panel = cx.read(|cx| host.read(cx).panel.clone());
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.cancel_action(cx);
+                panel.accept(selection_snapshot(), window, cx);
+                panel.set_filter(FolderFilter::Folder("existing".into()), cx);
+            })
+        });
+        cx.run_until_parked();
+        let events = Rc::new(RefCell::new(0));
+        let observed = events.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&panel, move |_, event: &FolderEvent, _| {
+                if matches!(event, FolderEvent::Filter(_)) {
+                    *observed.borrow_mut() += 1;
+                }
+            })
+            .detach();
+        });
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                assert!(panel.align_note_context("b", cx));
+                assert_eq!(
+                    panel.filter().folder_id(),
+                    Some("other"),
+                    "New notes use clicked note's parent"
+                );
+                panel.accept(selection_snapshot(), window, cx);
+                let note = &panel.snapshot.as_ref().unwrap().notes[1];
+                assert!(
+                    panel.filter().matches(note),
+                    "Next worker snapshot must retain clicked B"
+                );
+                assert!(panel.align_note_context("root-note", cx));
+                assert_eq!(panel.filter(), &FolderFilter::Root);
+                assert!(!panel.align_note_context("missing", cx));
+                assert_eq!(panel.filter(), &FolderFilter::Root);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            *events.borrow(),
+            0,
+            "Folder reselection would override the clicked note"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn selected_note_reveals_ancestors_once_and_allows_explicit_collapse(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (host, cx) = cx.add_window_view(|window, cx| TestHost::new("New", window, cx));
+        let panel = cx.read(|cx| host.read(cx).panel.clone());
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.cancel_action(cx);
+                panel.accept(selection_snapshot(), window, cx);
+                panel.collapsed.insert("other".into());
+                let visible = panel.visible_notes("", Default::default(), None, false);
+                assert_eq!(
+                    visible.len(),
+                    2,
+                    "Collapsed note must be filtered before element construction"
+                );
+                _ = panel.library_tree(Default::default(), "", Default::default(), Some("b"), cx);
+                assert!(!panel.collapsed.contains("other"));
+                panel.collapsed.insert("other".into());
+                for _ in 0..3 {
+                    _ = panel.library_tree(
+                        Default::default(),
+                        "",
+                        Default::default(),
+                        Some("b"),
+                        cx,
+                    );
+                    assert!(
+                        panel.collapsed.contains("other"),
+                        "Hover rerender cannot undo explicit collapse"
+                    );
+                }
+            })
+        });
+    }
+
     #[cfg(feature = "ui-test")]
     fn draw(cx: &mut VisualTestContext) {
         cx.run_until_parked();
@@ -1777,7 +2120,7 @@ mod ui_tests {
         );
         assert_eq!(
             surfaces[0].background,
-            gpui_kit::rgb(crate::components::LIGHT).into()
+            crate::theme::color(crate::components::LIGHT).into()
         );
     }
 

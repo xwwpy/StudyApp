@@ -36,31 +36,6 @@ fn review_tip(review: &Review) -> String {
         optional_stamp(review.next_review_at, "本轮已完成")
     )
 }
-pub(crate) fn note_tip(snapshot: &Snapshot, id: &str) -> String {
-    let learned = snapshot
-        .sessions
-        .iter()
-        .filter(|s| s.status == SessionStatus::Learned && s.note_ids.iter().any(|n| n == id))
-        .map(|s| s.ended_at)
-        .max();
-    let reviews: Vec<_> = snapshot
-        .reviews
-        .iter()
-        .filter(|r| r.note_ids.iter().any(|n| n == id))
-        .collect();
-    format!(
-        "学习时间：{}\n上次复习：{}\n下次复习：{}",
-        optional_stamp(learned, "尚无学习记录"),
-        optional_stamp(
-            reviews.iter().filter_map(|r| r.last_review_at).max(),
-            "尚未复习"
-        ),
-        optional_stamp(
-            reviews.iter().filter_map(|r| r.next_review_at).min(),
-            "暂无待复习计划"
-        )
-    )
-}
 
 impl StudyApp {
     pub fn today(&self, snapshot: &Snapshot, _window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -105,8 +80,8 @@ impl StudyApp {
             )
             .child(
                 card()
-                    .bg(rgb(LIGHT))
-                    .border_color(rgb(0xD2E7D8))
+                    .bg(crate::theme::color(LIGHT))
+                    .border_color(crate::theme::color(0xD2E7D8))
                     .child(
                         row()
                             .child(
@@ -135,20 +110,20 @@ impl StudyApp {
                         div()
                             .text_3xl()
                             .font_family("Consolas")
-                            .text_color(rgb(GREEN))
+                            .text_color(crate::theme::color(GREEN))
                             .child(duration(remaining)),
                     )
                     .child(
                         div()
                             .w_full()
                             .h(px(6.))
-                            .bg(rgb(0xD3E5D8))
+                            .bg(crate::theme::color(0xD3E5D8))
                             .rounded_full()
                             .child(
                                 div()
                                     .w(relative(ratio))
                                     .h_full()
-                                    .bg(rgb(GREEN))
+                                    .bg(crate::theme::color(GREEN))
                                     .rounded_full(),
                             ),
                     )
@@ -247,7 +222,7 @@ impl StudyApp {
             EditorMode::Manual => "补记一次学习",
             EditorMode::Edit(_) => "更正学习记录",
         };
-        let mut view = card().border_color(rgb(GREEN)).child(
+        let mut view = card().border_color(crate::theme::color(GREEN)).child(
             row().child(heading(title)).child(div().flex_1()).child(
                 Button::new("cancel-editor")
                     .ghost()
@@ -427,7 +402,7 @@ impl StudyApp {
         row()
             .py_3()
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(crate::theme::color(BORDER))
             .child(pill(label, color))
             .child(
                 column()
@@ -689,17 +664,17 @@ impl StudyApp {
                                     .tooltip(move |window, cx| {
                                         Tooltip::new(tip.clone()).build(window, cx)
                                     })
-                                    .child(div().w(px(18.)).h(px(height)).rounded_t_md().bg(rgb(
-                                        if stat.learned_seconds > 0 {
+                                    .child(div().w(px(18.)).h(px(height)).rounded_t_md().bg(
+                                        crate::theme::color(if stat.learned_seconds > 0 {
                                             GREEN
                                         } else {
                                             BORDER
-                                        },
-                                    )))
+                                        }),
+                                    ))
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(rgb(MUTED))
+                                            .text_color(crate::theme::color(MUTED))
                                             .child(stat.date[8..].to_owned()),
                                     )
                             })),
@@ -740,7 +715,7 @@ impl StudyApp {
                                             .id(("heat", week * 7 + day))
                                             .size(px(18.))
                                             .rounded_sm()
-                                            .bg(rgb(color))
+                                            .bg(crate::theme::color(color))
                                             .tooltip(move |w, cx| {
                                                 Tooltip::new(tip.clone()).build(w, cx)
                                             })
@@ -773,12 +748,12 @@ impl StudyApp {
                                                 * 85.)
                                                 .max(2.)))
                                             .rounded_t_md()
-                                            .bg(rgb(0xB39869)),
+                                            .bg(crate::theme::color(0xB39869)),
                                     )
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(rgb(MUTED))
+                                            .text_color(crate::theme::color(MUTED))
                                             .child(stat.date[8..].to_owned()),
                                     )
                             }),
@@ -850,8 +825,10 @@ impl StudyApp {
     }
 
     pub fn settings(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
-        column().child(self.preference_controls(cx))
-            .child(card().child(heading("数据保存"))
+        use crate::settings_ui::SettingsSection;
+        let section = self.preferences_ui.section;
+        let content = column().gap_3().child(self.preference_controls(cx))
+            .children((section == SettingsSection::Storage).then(|| card().child(heading("数据保存"))
                 .child(row().child(pill("✓ 本地资料库", LIGHT)).child(muted("可在下方配置笔记文件同步")))
                 .child(muted(studyapp_desktop::presentation::display_path(&snapshot.data_path)))
                 .child(row().flex_wrap().child(Button::new("migrate-library").primary()
@@ -861,15 +838,28 @@ impl StudyApp {
                     .child(Button::new("switch-library").disabled(self.storage_busy).label("打开其他资料库").on_click(cx.listener(|this, _, _, cx| this.settings_picker("library", None, cx))))
                     .child(Button::new("backup").label("导出备份").on_click(cx.listener(|this, _, _, cx| this.settings_picker("backup", None, cx))))
                     .child(Button::new("restore").label("从备份恢复").on_click(cx.listener(|this, _, _, cx| this.settings_picker("restore", None, cx)))))
-                .child(muted("迁移会复制笔记、历史、草稿和同步设置到新的空目录，保留原资料，正常启动时记住新位置。恢复备份只恢复学习资料，保留当前配置。使用 --data-dir 的独立运行不修改默认位置。")))
-            .child(self.storage_view(cx))
-            .child(self.sync_panel.clone())
-            .child(card().child(heading("账户与微信登录"))
+                .child(muted("迁移会复制笔记、历史、草稿和同步设置到新的空目录，保留原资料，正常启动时记住新位置。恢复备份只恢复学习资料，保留当前配置。使用 --data-dir 的独立运行不修改默认位置。"))))
+            .children((section == SettingsSection::Storage).then(|| self.storage_view(cx)))
+            .children((section == SettingsSection::Sync).then(|| self.sync_panel.clone()))
+            .children((section == SettingsSection::AboutAccount).then(|| card().child(heading("账户与微信登录"))
                 .child(row().child(pill("本地访客", LIGHT)).child(Button::new("wechat-disabled").label("微信登录 · 尚未连接服务").disabled(true)))
-                .child(muted("无需登录即可使用本地功能及自己的文件同步服务。微信登录仍保留后续接入。")))
-            .child(card().child(heading("文件历史与隐私"))
+                .child(muted("无需登录即可使用本地功能及自己的文件同步服务。微信登录仍保留后续接入。"))))
+            .children((section == SettingsSection::AboutAccount).then(|| card().child(heading("文件历史与隐私"))
                 .child(muted("新建笔记保存在资料库 notes 目录，保存时自动生成版本；外部导入文件保持只读。运行时约每 3 秒检查文件改动，快速连续保存会合并为稳定版本。"))
                 .child(muted("离线期间只能比较上次快照与当前内容，无法还原中间的每一次保存。文件变化用于建议摘要，必须由你确认才会记为学习。"))
-                .child(muted("笔记预览不加载图片或执行 HTML；学习时长来自你的确认，不代表对实际专注的自动测量。")))
+                .child(muted("笔记预览不加载图片或执行 HTML；学习时长来自你的确认，不代表对实际专注的自动测量。"))));
+        column()
+            .h_full()
+            .min_h_0()
+            .child(div().flex_shrink_0().child(self.settings_header(cx)))
+            .child(
+                div()
+                    .id("settings-section-scroll")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(content),
+            )
     }
 }

@@ -433,14 +433,19 @@ fn publish(database: &Path, intent_id: &str, write: &Write) -> Result<Option<Str
     Ok(None)
 }
 
-pub(crate) fn recover(conn: &mut Connection, database: &Path, state: &mut State) -> Result<bool> {
+/// None means no intent; Some reports whether a committed recovery found a conflict.
+pub(crate) fn recover(
+    conn: &mut Connection,
+    database: &Path,
+    state: &mut State,
+) -> Result<Option<bool>> {
     let raw: Option<String> = conn
         .query_row("SELECT data FROM write_intents WHERE id=1", [], |row| {
             row.get(0)
         })
         .optional()?;
     let Some(raw) = raw else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut intent: Intent = serde_json::from_str(&raw).context("托管写入恢复记录损坏")?;
     validate_id(&intent.id)?;
@@ -492,5 +497,5 @@ pub(crate) fn recover(conn: &mut Connection, database: &Path, state: &mut State)
     tx.execute("DELETE FROM write_intents WHERE id=1", [])?;
     tx.commit()?;
     *state = intent.state;
-    Ok(conflict)
+    Ok(Some(conflict))
 }

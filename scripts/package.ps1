@@ -47,7 +47,7 @@ try {
     if (Test-Path -LiteralPath (Join-Path $repoRoot 'docs/verification.md') -PathType Leaf) {
         Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/verification.md') -Destination (Join-Path $staging 'docs/verification.md')
     }
-    foreach ($image in @('dashboard.png', 'note-editor.png', 'workspace.png')) {
+    foreach ($image in @('dashboard.png', 'note-editor.png', 'workspace.png', 'managed-images.png')) {
         if (Test-Path -LiteralPath (Join-Path $repoRoot "docs/images/$image") -PathType Leaf) {
             [IO.Directory]::CreateDirectory((Join-Path $staging 'docs/images')) | Out-Null
             Copy-Item -LiteralPath (Join-Path $repoRoot "docs/images/$image") -Destination (Join-Path $staging "docs/images/$image")

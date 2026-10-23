@@ -5,8 +5,12 @@ use crate::{
     drafts::{DraftStore, DraftUpdate, NoteDraft},
 };
 use gpui_kit::{
-    component::{Disableable, Sizable, button::ButtonVariants, input::Input},
-    prelude::FluentBuilder,
+    component::{
+        Disableable, Sizable,
+        button::{Button as MenuButton, ButtonVariants},
+        input::Input,
+        menu::{DropdownMenu, PopupMenuItem},
+    },
     *,
 };
 use studyapp_core::Command;
@@ -56,8 +60,10 @@ impl StudyApp {
                         self.close_requested = false;
                         self.note_content
                             .update(cx, |editor, cx| editor.set_readonly(false, cx));
-                        self.notice =
-                            Some(Err(format!("{error}；窗口及编辑内容已保留，请重试保存。")));
+                        self.push_notice(
+                            Err(format!("{error}；窗口及编辑内容已保留，请重试保存。")),
+                            cx,
+                        );
                     }
                 }
                 DraftUpdate::Discarded(path, token) => {
@@ -66,7 +72,7 @@ impl StudyApp {
                     }) {
                         self.draft_discard = None;
                         self.draft_failed = false;
-                        self.notice = Some(Ok("草稿已删除，原笔记和历史版本已保留。".into()));
+                        self.push_notice(Ok("草稿已删除，原笔记和历史版本已保留。".into()), cx);
                         self.finish_library_transition(window, cx);
                     }
                 }
@@ -79,13 +85,13 @@ impl StudyApp {
                             self.start_note_draft(draft, window, cx);
                         }
                         self.close_requested = false;
-                        self.notice = Some(Err(format!("{error}；草稿内容仍可恢复。")));
+                        self.push_notice(Err(format!("{error}；草稿内容仍可恢复。")), cx);
                     }
                 }
                 DraftUpdate::Error(path, error) if path == DraftStore::path(&self.last_library) => {
                     self.draft_loading = false;
                     self.draft_failed = true;
-                    self.notice = Some(Err(error));
+                    self.push_notice(Err(error), cx);
                 }
                 DraftUpdate::Error(_, _) => {}
             }
@@ -97,19 +103,23 @@ impl StudyApp {
         changed
     }
 
-    fn start_note_draft(
+    pub(crate) fn start_note_draft(
         &mut self,
         mut draft: NoteDraft,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if draft.note_id.is_some() || draft.asset_group.is_empty() {
+            draft.asset_group =
+                crate::media_ui::asset_group(draft.note_id.as_deref(), &draft.content);
+        }
         if draft.folder_id.as_ref().is_some_and(|id| {
             self.snapshot
                 .as_ref()
                 .is_none_or(|s| !s.folders.iter().any(|f| &f.id == id))
         }) {
             draft.folder_id = None;
-            self.notice = Some(Ok("草稿原目录已不存在，已转为未分类。".into()));
+            self.push_notice(Ok("草稿原目录已不存在，已转为未分类。".into()), cx);
         }
         self.confirmation = None;
         self.note_title
@@ -125,7 +135,7 @@ impl StudyApp {
     }
 
     pub fn open_note_editor(&mut self, copy: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.confirmation.is_some() || self.storage_busy {
+        if self.confirmation.is_some() || self.storage_busy || self.media_busy() {
             return;
         }
         self.page = Page::Notes;
@@ -147,9 +157,10 @@ impl StudyApp {
             || self.recoverable_draft.is_some()
             || self.draft_discard.is_some()
         {
-            self.notice = Some(Err(
-                "请先恢复未保存草稿，保存或保留草稿后再开始另一份笔记。".into(),
-            ));
+            self.push_notice(
+                Err("请先恢复未保存草稿，保存或保留草稿后再开始另一份笔记。".into()),
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -163,6 +174,11 @@ impl StudyApp {
                     && (!copy || self.selected_version.as_ref().is_none_or(|id| id == &v.id))
             })?;
             Some(NoteDraft {
+                asset_group: if copy {
+                    crate::media::new_group()
+                } else {
+                    crate::media_ui::asset_group(Some(&note.id), &version.content)
+                },
                 note_id: (!copy).then(|| note.id.clone()),
                 expected_hash: (!copy).then(|| version.hash.clone()),
                 folder_id: note.folder_id.clone(),
@@ -175,7 +191,18 @@ impl StudyApp {
             })
         });
         if let Some(draft) = draft {
-            self.start_note_draft(draft, window, cx);
+            if copy {
+                let source_path = self.snapshot.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .notes
+                        .iter()
+                        .find(|note| Some(&note.id) == self.selected_note.as_ref())
+                        .map(|note| std::path::PathBuf::from(&note.path))
+                });
+                self.begin_media_adoption(draft, source_path, window, cx);
+            } else {
+                self.start_note_draft(draft, window, cx);
+            }
         }
     }
 
@@ -185,7 +212,7 @@ impl StudyApp {
         }
         #[cfg(feature = "ui-test")]
         eprintln!("native new_note: requested");
-        if self.confirmation.is_some() || self.storage_busy {
+        if self.confirmation.is_some() || self.storage_busy || self.media_busy() {
             return;
         }
         self.page = Page::Notes;
@@ -195,12 +222,13 @@ impl StudyApp {
             || self.recoverable_draft.is_some()
             || self.draft_discard.is_some()
         {
-            self.notice = Some(Err("已有未保存的笔记，请先恢复或保存草稿。".into()));
+            self.push_notice(Err("已有未保存的笔记，请先恢复或保存草稿。".into()), cx);
             cx.notify();
             return;
         }
         self.start_note_draft(
             NoteDraft {
+                asset_group: crate::media::new_group(),
                 note_id: None,
                 expected_hash: None,
                 folder_id: self
@@ -221,6 +249,7 @@ impl StudyApp {
 
     pub fn recover_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.storage_busy
+            && !self.media_busy()
             && self.note_editor.is_none()
             && self.confirmation.is_none()
             && self.draft_discard.is_none()
@@ -249,7 +278,8 @@ impl StudyApp {
                 content: draft.content,
             }
         } else {
-            Command::CreateNoteInFolder {
+            Command::CreateNoteWithId {
+                note_id: draft.asset_group,
                 folder_id: draft.folder_id,
                 title: draft.title,
                 content: draft.content,
@@ -263,6 +293,70 @@ impl StudyApp {
 
     pub fn note_editor_view(&self, cx: &mut Context<Self>) -> Div {
         let draft = self.note_editor.as_ref().expect("visible note editor");
+        let busy = self.note_saving || self.storage_busy || self.media_busy();
+        let owner = cx.weak_entity();
+        let overflow = MenuButton::new("note-editor-menu")
+            .small()
+            .ghost()
+            .label("⋯")
+            .accessibility_label("笔记更多操作")
+            .tooltip("笔记更多操作")
+            .disabled(busy)
+            .dropdown_menu(move |mut menu, _, cx| {
+                let Some((_, _, busy)) = Self::library_menu_state(&owner, cx) else {
+                    return menu;
+                };
+                let can_copy = owner
+                    .update(cx, |this, _| {
+                        this.note_editor
+                            .as_ref()
+                            .is_some_and(|draft| draft.note_id.is_some())
+                    })
+                    .unwrap_or(false);
+                if can_copy {
+                    let copy = owner.clone();
+                    menu = menu.item(PopupMenuItem::new("另存新笔记").disabled(busy).on_click(
+                        move |_, window, cx| {
+                            let _ = copy.update(cx, |this, cx| {
+                                this.request_note_action(
+                                    crate::editor_lifecycle::NoteIntent::Save { copy: true },
+                                    window,
+                                    cx,
+                                )
+                            });
+                        },
+                    ));
+                }
+                let keep = owner.clone();
+                let discard = owner.clone();
+                menu.min_w(px(188.))
+                    .item(
+                        PopupMenuItem::new("保留草稿并返回")
+                            .disabled(busy)
+                            .on_click(move |_, window, cx| {
+                                let _ = keep.update(cx, |this, cx| {
+                                    this.request_note_action(
+                                        crate::editor_lifecycle::NoteIntent::Keep,
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            }),
+                    )
+                    .separator()
+                    .item(PopupMenuItem::new("删除草稿").disabled(busy).on_click(
+                        move |_, _, cx| {
+                            let _ = discard.update(cx, |this, cx| {
+                                if !this.note_saving && !this.storage_busy && !this.media_busy() {
+                                    this.confirmation = Some(
+                                        crate::editor_lifecycle::NoteConfirmation::DiscardDraft,
+                                    );
+                                    cx.notify();
+                                }
+                            });
+                        },
+                    ))
+            });
         let view = card()
             .id("note-editor")
             .flex_1()
@@ -271,78 +365,30 @@ impl StudyApp {
             .min_w_0()
             .child(
                 row()
-                    .flex_wrap()
-                    .child(heading(if draft.note_id.is_some() {
-                        "编辑 Markdown"
-                    } else {
-                        "新建 Markdown 笔记"
-                    }))
-                    .child(div().flex_1())
+                    .id("note-editor-toolbar")
+                    .flex_shrink_0()
+                    .child(div().id("note-title").flex_1().min_w_0().child(
+                        Input::new(&self.note_title).disabled(busy || draft.note_id.is_some()),
+                    ))
                     .child(
                         Button::new("save-note")
-                            .loading(self.note_saving)
+                            .loading(self.note_saving || self.media_busy())
                             .small()
                             .primary()
-                            .disabled(self.note_saving || self.storage_busy)
+                            .disabled(busy)
                             .label(if self.note_saving {
                                 "保存中…"
+                            } else if self.media_busy() {
+                                "图片处理中…"
                             } else {
-                                "保存版本 · Ctrl+S"
+                                "保存"
                             })
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.save_note(window, cx)),
                             ),
                     )
-                    .when(draft.note_id.is_some(), |r| {
-                        r.child(
-                            Button::new("save-note-copy")
-                                .small()
-                                .ghost()
-                                .disabled(self.note_saving || self.storage_busy)
-                                .label("另存新笔记")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.request_note_action(
-                                        crate::editor_lifecycle::NoteIntent::Save { copy: true },
-                                        window,
-                                        cx,
-                                    );
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("keep-note-draft")
-                            .small()
-                            .ghost()
-                            .disabled(self.note_saving || self.storage_busy)
-                            .label("保留草稿并返回")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.request_note_action(
-                                    crate::editor_lifecycle::NoteIntent::Keep,
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    )
-                    .child(
-                        Button::new("discard-note-draft")
-                            .small()
-                            .ghost()
-                            .disabled(
-                                self.note_saving
-                                    || self.storage_busy
-                                    || self.draft_discard.is_some(),
-                            )
-                            .label("删除草稿")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.confirmation =
-                                    Some(crate::editor_lifecycle::NoteConfirmation::DiscardDraft);
-                                cx.notify();
-                            })),
-                    ),
+                    .child(overflow),
             )
-            .child(muted(
-                "草稿自动保存在当前资料库；保存生成历史版本。修改笔记不会自动计为学习。",
-            ))
             .children(self.snapshot.as_ref().and_then(|snapshot| {
                 if !snapshot.settings.show_file_paths {
                     return None;
@@ -361,13 +407,9 @@ impl StudyApp {
                         })
                 })
             }))
-            .child(div().id("note-title").child(
-                Input::new(&self.note_title).disabled(self.note_saving || draft.note_id.is_some()),
-            ))
             .child(self.note_content.clone());
         column().flex_1().min_h_0().h_full().min_w_0().child(view)
     }
-
     pub fn export_note(&self, note_id: String, version_id: Option<String>) {
         let sender = self.worker.sender.clone();
         let library = self.last_library.clone();

@@ -5,6 +5,8 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use serde::Deserialize;
 use std::{
+    collections::BTreeMap,
+    path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -14,6 +16,17 @@ pub struct MarkdownChanged;
 #[derive(Clone)]
 pub enum MarkdownEvent {
     Save,
+    RequestEdit(usize),
+    RequestInsertImage,
+    PasteImage {
+        name: String,
+        mime: String,
+        base64: String,
+    },
+    ExternalDrag {
+        phase: String,
+        paths: Vec<PathBuf>,
+    },
     CancelResize,
     Shortcut(String),
     Flushed(u64),
@@ -45,6 +58,23 @@ enum Message {
     },
     Save {
         generation: u64,
+    },
+    RequestEdit {
+        generation: u64,
+        position: usize,
+    },
+    RequestInsertImage {
+        generation: u64,
+    },
+    PasteImage {
+        generation: u64,
+        name: String,
+        mime: String,
+        base64: String,
+    },
+    ExternalDrag {
+        phase: String,
+        paths: Vec<PathBuf>,
     },
     CancelResize {
         generation: u64,
@@ -79,11 +109,15 @@ pub struct MarkdownEditor {
     visible: bool,
     readonly: bool,
     resume_readonly: bool,
+    can_request_edit: bool,
+    theme: serde_json::Value,
     error: Option<String>,
     pending: Option<(u64, Instant)>,
     recovering: bool,
     request: u64,
     shortcuts: std::collections::BTreeMap<String, String>,
+    images: BTreeMap<String, String>,
+    occlusions: Vec<Bounds<Pixels>>,
     #[cfg(feature = "ui-test")]
     pub(crate) test_results: std::collections::HashMap<String, serde_json::Value>,
     _poll: Task<()>,
@@ -115,11 +149,15 @@ impl MarkdownEditor {
             visible: false,
             readonly: false,
             resume_readonly: false,
+            can_request_edit: false,
+            theme: serde_json::Value::Null,
             error: None,
             pending: None,
             recovering: false,
             request: 0,
             shortcuts: crate::shortcuts::default_bindings(),
+            images: BTreeMap::new(),
+            occlusions: Vec::new(),
             #[cfg(feature = "ui-test")]
             test_results: Default::default(),
             _poll: poll,
@@ -128,6 +166,71 @@ impl MarkdownEditor {
 
     pub fn value(&self) -> &str {
         self.document.text()
+    }
+    pub fn generation(&self) -> u64 {
+        self.document.generation()
+    }
+    pub fn revision(&self) -> u64 {
+        self.document.revision()
+    }
+    pub fn editable(&self) -> bool {
+        self.ready() && !self.readonly && self.pending.is_none() && !self.recovering
+    }
+
+    /// Image data comes only from the bounded native image resolver.
+    pub fn set_images(
+        &mut self,
+        generation: u64,
+        images: BTreeMap<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.document.generation() {
+            return;
+        }
+        if self.images == images {
+            return;
+        }
+        self.images = images;
+        if self.ready && self.error.is_none() {
+            self.send_images(cx);
+        }
+    }
+
+    fn send_images(&mut self, cx: &mut Context<Self>) {
+        let payload =
+            serde_json::json!({ "generation": self.document.generation(), "images": self.images });
+        if let Err(error) = self.evaluate(&format!("window.studyappEditor.setImages({payload});")) {
+            self.fail(format!("无法更新图片预览：{error:#}"), cx);
+        }
+    }
+
+    pub fn insert_markdown(
+        &mut self,
+        generation: u64,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            generation == self.document.generation() && self.editable(),
+            "当前笔记已切换或无法编辑；图片文件已保留"
+        );
+        let text = serde_json::to_string(text)?;
+        self.evaluate(&format!("window.studyappEditor.insertText({text});"))?;
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn set_occlusions(&mut self, bounds: Vec<Bounds<Pixels>>, cx: &mut Context<Self>) {
+        if self.occlusions == bounds {
+            return;
+        }
+        self.occlusions = bounds;
+        #[cfg(windows)]
+        if let Some(host) = &self.host
+            && let Err(error) = host.set_occlusions(self.occlusions.clone())
+        {
+            self.fail(format!("无法更新窗口遮挡区域：{error:#}"), cx);
+        }
     }
     pub fn ready(&self) -> bool {
         self.ready && self.error.is_none()
@@ -141,8 +244,10 @@ impl MarkdownEditor {
 
     pub fn set_value(&mut self, value: String, _window: &mut Window, cx: &mut Context<Self>) {
         self.document.reset(value);
+        self.images.clear();
         self.readonly = false;
         self.resume_readonly = false;
+        self.can_request_edit = false;
         self.pending = None;
         self.recovering = false;
         // A protocol failure can be recovered only by explicitly loading a
@@ -163,10 +268,54 @@ impl MarkdownEditor {
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
-        let payload = serde_json::json!({"generation": self.document.generation(), "text": self.document.text(), "readonly": self.readonly});
+        let payload = serde_json::json!({"generation": self.document.generation(), "text": self.document.text(), "readonly": self.readonly, "canRequestEdit": self.can_request_edit});
         let shortcuts = serde_json::to_string(&self.shortcuts).expect("string map serializes");
-        if let Err(error) = self.evaluate(&format!("window.studyappEditor.setShortcuts({shortcuts}); window.studyappEditor.load({payload});")) {
+        let theme = &self.theme;
+        if let Err(error) = self.evaluate(&format!("window.studyappEditor.setShortcuts({shortcuts}); window.studyappEditor.setTheme({theme}); window.studyappEditor.load({payload});")) {
             self.fail(format!("无法载入编辑器：{error:#}"), cx);
+        }
+        if self.error.is_none() {
+            self.send_images(cx);
+        }
+    }
+
+    pub fn set_theme(&mut self, theme: serde_json::Value, cx: &mut Context<Self>) {
+        if self.theme == theme {
+            return;
+        }
+        self.theme = theme;
+        if self.ready
+            && self.error.is_none()
+            && let Err(error) =
+                self.evaluate(&format!("window.studyappEditor.setTheme({});", self.theme))
+        {
+            self.fail(format!("无法更新编辑器外观：{error:#}"), cx);
+        }
+    }
+
+    pub fn set_can_request_edit(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.can_request_edit == enabled {
+            return;
+        }
+        self.can_request_edit = enabled;
+        if self.ready
+            && self.error.is_none()
+            && let Err(error) = self.evaluate(&format!(
+                "window.studyappEditor.setCanRequestEdit({enabled});"
+            ))
+        {
+            self.fail(format!("无法更新编辑入口：{error:#}"), cx);
+        }
+    }
+
+    pub fn restore_selection(&mut self, position: usize, cx: &mut Context<Self>) {
+        if self.ready
+            && !self.readonly
+            && let Err(error) = self.evaluate(&format!(
+                "window.studyappEditor.restoreSelection({position});"
+            ))
+        {
+            self.fail(format!("无法恢复编辑位置：{error:#}"), cx);
         }
     }
 
@@ -339,6 +488,46 @@ impl MarkdownEditor {
                             cx.emit(MarkdownEvent::Save);
                         }
                     }
+                    Message::RequestEdit {
+                        generation,
+                        position,
+                    } => {
+                        if generation == self.document.generation()
+                            && self.visible
+                            && self.readonly
+                            && self.can_request_edit
+                            && self.pending.is_none()
+                            && !self.recovering
+                        {
+                            cx.emit(MarkdownEvent::RequestEdit(position));
+                        }
+                    }
+                    Message::RequestInsertImage { generation } => {
+                        if generation == self.document.generation()
+                            && self.visible
+                            && self.editable()
+                        {
+                            cx.emit(MarkdownEvent::RequestInsertImage);
+                        }
+                    }
+                    Message::PasteImage {
+                        generation,
+                        name,
+                        mime,
+                        base64,
+                    } => {
+                        if generation == self.document.generation()
+                            && self.visible
+                            && self.editable()
+                        {
+                            cx.emit(MarkdownEvent::PasteImage { name, mime, base64 });
+                        }
+                    }
+                    // HostedEditor filters page-authored externalDrag messages;
+                    // only the operating system drop callback supplies paths.
+                    Message::ExternalDrag { phase, paths } => {
+                        cx.emit(MarkdownEvent::ExternalDrag { phase, paths });
+                    }
                     Message::CancelResize { generation } => {
                         if generation == self.document.generation() && self.visible {
                             cx.emit(MarkdownEvent::CancelResize);
@@ -433,7 +622,13 @@ impl MarkdownEditor {
             let _ = this.update(cx, |this, cx| {
                 this.creating = false;
                 match result {
-                    Ok(host) => { this.host = Some(host); cx.notify(); }
+                    Ok(host) => {
+                        if let Err(error) = host.set_occlusions(this.occlusions.clone()) {
+                            this.fail(format!("无法更新窗口遮挡区域：{error:#}"), cx);
+                        }
+                        this.host = Some(host);
+                        cx.notify();
+                    }
                     Err(error) => this.fail(format!("连续编辑器启动失败：{error:#}。请确认 Microsoft Edge WebView2 Runtime 已安装。"), cx),
                 }
             });

@@ -17,7 +17,7 @@ impl StudyApp {
         let note = match action.resolve(snapshot, self.storage_busy) {
             Ok(note) => note,
             Err(message) => {
-                self.notice = Some(Err(message.into()));
+                self.push_notice(Err(message.into()), cx);
                 cx.notify();
                 return;
             }
@@ -36,7 +36,7 @@ impl StudyApp {
             }
             NoteActionKind::CopyPath => {
                 cx.write_to_clipboard(ClipboardItem::new_string(display_path(&note.path)));
-                self.notice = Some(Ok("已复制文件路径".into()));
+                self.push_notice(Ok("已复制文件路径".into()), cx);
             }
             NoteActionKind::Reveal => {
                 let path = note.path.clone();
@@ -61,9 +61,10 @@ impl StudyApp {
                         if exists {
                             cx.reveal_path(std::path::Path::new(&display_path(&path)));
                         } else {
-                            this.notice = Some(Err(
-                                "原文件不存在或暂时无法访问；笔记历史仍可查看和导出。".into(),
-                            ));
+                            this.push_notice(
+                                Err("原文件不存在或暂时无法访问；笔记历史仍可查看和导出。".into()),
+                                cx,
+                            );
                         }
                         cx.notify();
                     });

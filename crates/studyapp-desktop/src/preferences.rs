@@ -70,6 +70,14 @@ struct InterfaceFile {
     interface: Interface,
 }
 #[derive(Serialize, Deserialize)]
+struct AppearanceFile {
+    appearance: studyapp_core::AppearanceSettings,
+}
+#[derive(Serialize, Deserialize)]
+struct ImagesFile {
+    images: studyapp_core::ImageSettings,
+}
+#[derive(Serialize, Deserialize)]
 struct ShortcutsFile {
     shortcuts: BTreeMap<String, String>,
 }
@@ -170,6 +178,18 @@ fn category_files(snapshot: &PreferenceSnapshot) -> Result<Vec<(&'static str, Ve
             "shortcuts.json",
             serde_json::to_vec_pretty(&ShortcutsFile {
                 shortcuts: snapshot.shortcuts.clone(),
+            })?,
+        ),
+        (
+            "appearance.json",
+            serde_json::to_vec_pretty(&AppearanceFile {
+                appearance: settings.appearance.clone(),
+            })?,
+        ),
+        (
+            "images.json",
+            serde_json::to_vec_pretty(&ImagesFile {
+                images: settings.images.clone(),
             })?,
         ),
         (
@@ -313,6 +333,17 @@ impl PreferencesStore {
         let directory = root.join("generations").join(revision);
         let learning: LearningFile = read_category(&directory.join("learning.json"))?;
         let interface: InterfaceFile = read_category(&directory.join("interface.json"))?;
+        // A missing category is a pre-theme generation. Never write during load.
+        let appearance = if directory.join("appearance.json").try_exists()? {
+            read_category::<AppearanceFile>(&directory.join("appearance.json"))?.appearance
+        } else {
+            studyapp_core::AppearanceSettings::default()
+        };
+        let images = if directory.join("images.json").try_exists()? {
+            read_category::<ImagesFile>(&directory.join("images.json"))?.images
+        } else {
+            studyapp_core::ImageSettings::default()
+        };
         let shortcuts: ShortcutsFile = read_category(&directory.join("shortcuts.json"))?;
         let sync: SyncFile = read_category(&directory.join("sync.json"))?;
         let credentials: CredentialPayload = read_json(&directory.join("credentials.json"))?;
@@ -324,8 +355,10 @@ impl PreferencesStore {
                 review_days: learning.learning.review_days,
                 show_file_paths: interface.interface.show_file_paths,
                 layout: interface.interface.layout,
+                appearance,
+                images,
             },
-            shortcuts: shortcuts.shortcuts,
+            shortcuts: crate::shortcuts::resolved_bindings(&shortcuts.shortcuts),
             sync: sync.sync,
         };
         current.settings.validate()?;
@@ -477,6 +510,98 @@ mod tests {
             sync: current.sync,
             password: None,
         }
+    }
+
+    #[test]
+    fn appearance_is_a_separate_atomic_category_and_round_trips_only_after_save() {
+        let (root, mut engine, mut runtime, mut store) = library();
+        let old_revision = store.snapshot().revision;
+        let initial = root.join("settings/generations").join(&old_revision);
+        assert!(initial.join("appearance.json").is_file());
+        let mut value = serde_json::to_value(store.snapshot().settings).unwrap();
+        value["appearance"] = serde_json::json!({"mode":"dark","font_size":16,"spacing":6});
+        let mut proposal = request(&store);
+        proposal.settings = serde_json::from_value(value).unwrap();
+        let prepared = store.prepare(proposal, &engine, &runtime).unwrap();
+        assert_eq!(store.snapshot().revision, old_revision);
+        assert_eq!(
+            serde_json::to_value(engine.snapshot().settings).unwrap()["appearance"]["mode"],
+            "system"
+        );
+        let (settings, synchronization) = store.publish(prepared).unwrap();
+        engine.install_prepared_settings(settings);
+        runtime.install_configuration(synchronization);
+        let (reopened, _) =
+            PreferencesStore::open(&root.join("studyapp.sqlite3"), &mut engine).unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.snapshot().settings).unwrap()["appearance"]["mode"],
+            "dark"
+        );
+        assert!(initial.join("appearance.json").is_file());
+    }
+
+    #[test]
+    fn legacy_generation_without_appearance_category_loads_defaults_without_rewriting() {
+        let (root, mut engine, _, store) = library();
+        let manifest = root.join("settings/manifest.json");
+        let before = std::fs::read(&manifest).unwrap();
+        let category = root
+            .join("settings/generations")
+            .join(store.snapshot().revision)
+            .join("appearance.json");
+        std::fs::remove_file(&category).unwrap();
+        let (reopened, _) =
+            PreferencesStore::open(&root.join("studyapp.sqlite3"), &mut engine).unwrap();
+        assert_eq!(
+            reopened.snapshot().settings.appearance,
+            studyapp_core::AppearanceSettings::default()
+        );
+        assert!(!category.exists());
+        assert_eq!(std::fs::read(manifest).unwrap(), before);
+    }
+
+    #[test]
+    fn damaged_appearance_is_rejected_and_preserved_instead_of_using_defaults() {
+        let (root, mut engine, _, store) = library();
+        let category = root
+            .join("settings/generations")
+            .join(store.snapshot().revision)
+            .join("appearance.json");
+        std::fs::write(&category, "{ invalid appearance retained").unwrap();
+        assert!(PreferencesStore::open(&root.join("studyapp.sqlite3"), &mut engine).is_err());
+        assert_eq!(
+            std::fs::read_to_string(category).unwrap(),
+            "{ invalid appearance retained"
+        );
+    }
+
+    #[test]
+    fn custom_image_root_and_storage_survive_category_save_and_restart() {
+        let (root, mut engine, mut runtime, mut store) = library();
+        let custom_root = root
+            .join("custom-image-assets")
+            .to_string_lossy()
+            .into_owned();
+        let expected = studyapp_core::ImageSettings {
+            root: Some(custom_root),
+            storage: studyapp_core::ImageStorage::Both,
+        };
+        let mut proposal = request(&store);
+        proposal.settings.images = expected.clone();
+        store.save(proposal, &mut engine, &mut runtime).unwrap();
+        let category = root
+            .join("settings/generations")
+            .join(store.snapshot().revision)
+            .join("images.json");
+        let written: ImagesFile = read_category(&category).unwrap();
+        assert_eq!(written.images, expected);
+        let mut unrelated = request(&store);
+        unrelated.settings.answer_minutes = 9;
+        store.save(unrelated, &mut engine, &mut runtime).unwrap();
+        let (reopened, _) =
+            PreferencesStore::open(&root.join("studyapp.sqlite3"), &mut engine).unwrap();
+        assert_eq!(reopened.snapshot().settings.images, expected);
+        assert_eq!(engine.snapshot().settings.images, expected);
     }
 
     #[test]

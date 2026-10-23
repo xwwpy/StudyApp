@@ -43,6 +43,101 @@ fn save(
 }
 
 #[test]
+fn retained_draft_id_survives_commit_restart_and_image_removal() {
+    let (dir, mut engine) = fixture();
+    let note_id = "36b79f08-5128-43ab-a1cb-13f318c455f7";
+    engine
+        .apply(
+            Command::CreateFolder {
+                name: "drafts".into(),
+                parent_id: None,
+            },
+            1001,
+        )
+        .unwrap();
+    let folder_id = engine.snapshot().folders[0].id.clone();
+    let content = format!("![image](studyapp-media:{note_id}/image.gif)");
+    engine
+        .apply(
+            Command::CreateNoteWithId {
+                note_id: note_id.into(),
+                folder_id: Some(folder_id.clone()),
+                title: "retained".into(),
+                content,
+            },
+            1002,
+        )
+        .unwrap();
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.notes[0].id, note_id);
+    assert_eq!(snapshot.notes[0].folder_id.as_ref(), Some(&folder_id));
+    let path = PathBuf::from(&snapshot.notes[0].path);
+    save(
+        &mut engine,
+        note_id,
+        &snapshot.versions.last().unwrap().hash,
+        "images removed",
+        1003,
+    )
+    .unwrap();
+    drop(engine);
+    let engine = Engine::open(&dir.join("learning.sqlite"), 2000).unwrap();
+    assert_eq!(engine.snapshot().notes[0].id, note_id);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "images removed");
+}
+
+#[test]
+fn retained_draft_id_rejects_collision_invalid_uuid_and_unknown_folder_without_overwrite() {
+    let (dir, mut engine) = fixture();
+    let (note_id, _, path) = create(&mut engine, "original");
+    for (id, folder_id) in [
+        (note_id, None),
+        ("../escape".into(), None),
+        (
+            "36b79f08-5128-43ab-a1cb-13f318c455f7".into(),
+            Some("unknown-folder".into()),
+        ),
+    ] {
+        assert!(
+            engine
+                .apply(
+                    Command::CreateNoteWithId {
+                        note_id: id,
+                        folder_id,
+                        title: "replacement".into(),
+                        content: "replacement".into(),
+                    },
+                    1002
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        assert_eq!(engine.snapshot().notes.len(), 1);
+    }
+    let occupied = "8529f643-e153-4a0b-983b-c32bb6d28da7";
+    let occupied_path = dir.join("notes").join(format!("{occupied}.md"));
+    std::fs::write(&occupied_path, "untracked original").unwrap();
+    assert!(
+        engine
+            .apply(
+                Command::CreateNoteWithId {
+                    note_id: occupied.into(),
+                    folder_id: None,
+                    title: "replacement".into(),
+                    content: "replacement".into(),
+                },
+                1003
+            )
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(occupied_path).unwrap(),
+        "untracked original"
+    );
+    assert_eq!(engine.snapshot().notes.len(), 1);
+}
+
+#[test]
 fn create_save_noop_and_restart_keep_versions_dates_and_managed_path() {
     let (dir, mut engine) = fixture();
     let (id, hash, path) = create(&mut engine, "# 初始\n");
@@ -434,6 +529,8 @@ fn synced_content_is_excluded_from_active_learning_and_history_exports_are_exact
                 review_days: vec![1],
                 show_file_paths: false,
                 layout: Default::default(),
+                appearance: Default::default(),
+                images: Default::default(),
             }),
             1000,
         )
@@ -611,6 +708,8 @@ fn synced_copy_keeps_its_title_is_offline_and_never_overwrites() {
                 review_days: vec![1],
                 show_file_paths: false,
                 layout: Default::default(),
+                appearance: Default::default(),
+                images: Default::default(),
             }),
             1002,
         )

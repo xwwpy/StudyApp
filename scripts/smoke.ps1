@@ -33,6 +33,10 @@ $interactionsReport = Join-Path $data 'interactions-smoke-result.txt'
 if ((Get-Content -LiteralPath $interactionsReport -Raw) -notmatch '^PASS:') { throw 'Note interactions and scroll smoke report did not pass' }
 $workspaceReport = Join-Path $data 'workspace-smoke-result.txt'
 if ((Get-Content -LiteralPath $workspaceReport -Raw) -notmatch '^PASS:') { throw 'Adjustable workspace smoke report did not pass' }
+$imageReport = Join-Path $data 'native-image-smoke-result.txt'
+if ((Get-Content -LiteralPath $imageReport -Raw) -notmatch '^PASS:') { throw 'Managed image smoke report did not pass' }
+$settingsReport = Join-Path $data 'settings-capture-smoke-result.txt'
+if ((Get-Content -LiteralPath $settingsReport -Raw) -notmatch '^PASS:') { throw 'Settings categories and shortcut recording smoke report did not pass' }
 foreach ($nativeImage in @('native-first-reader.bmp', 'native-first-editor.bmp', 'native-after-history.bmp', 'native-after-menu.bmp', 'native-after-settings.bmp', 'native-after-resize.bmp')) {
     $nativePath = Join-Path $data $nativeImage
     if (-not (Test-Path -LiteralPath $nativePath) -or (Get-Item -LiteralPath $nativePath).Length -lt 1000) {

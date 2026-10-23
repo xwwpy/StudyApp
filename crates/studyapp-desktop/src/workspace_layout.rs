@@ -6,13 +6,11 @@ use studyapp_core::{Command, LayoutSettings};
 const HANDLE_WIDTH: f32 = 6.;
 const WORKSPACE_PADDING: f32 = 32.;
 const DOCUMENT_MIN: f32 = 280.;
-const FOLDERS_MIN: f32 = 112.;
 const NOTES_MIN: f32 = 160.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pane {
     Navigation,
-    Folders,
     Notes,
 }
 
@@ -69,14 +67,11 @@ impl ResizeState {
                     self.pending.navigation_visible = true;
                     self.pending.navigation_width = width.round().clamp(128., 320.) as u32;
                 }
-                Pane::Folders if f32::from(position_x) <= self.pane_left + 32. => {
+                Pane::Notes if f32::from(position_x) <= self.pane_left + 32. => {
                     self.pending.folders_visible = false;
                 }
-                Pane::Folders => {
-                    self.pending.folders_visible = true;
-                    self.pending.folders_width = width.round().clamp(FOLDERS_MIN, 360.) as u32;
-                }
                 Pane::Notes => {
+                    self.pending.folders_visible = true;
                     self.pending.notes_width = width.round().clamp(NOTES_MIN, 440.) as u32
                 }
             }
@@ -84,7 +79,6 @@ impl ResizeState {
         let fitted = fit_layout(&self.pending, viewport);
         let width = match self.pane {
             Pane::Navigation => fitted.navigation,
-            Pane::Folders => fitted.folders,
             Pane::Notes => fitted.notes,
         };
         self.guide_x = px((self.pane_left + f32::from(width)).clamp(0., viewport.max(0.)));
@@ -92,34 +86,27 @@ impl ResizeState {
 }
 
 pub fn fit_layout(preferred: &LayoutSettings, viewport: f32) -> EffectiveLayout {
-    let handles = 1.
-        + u8::from(preferred.navigation_visible) as f32
-        + u8::from(preferred.folders_visible) as f32;
+    let handles =
+        u8::from(preferred.navigation_visible) as f32 + u8::from(preferred.folders_visible) as f32;
     let budget = (viewport - WORKSPACE_PADDING - handles * HANDLE_WIDTH - DOCUMENT_MIN).max(0.);
-    let folders_min = if preferred.folders_visible {
-        FOLDERS_MIN
+    let library_min = if preferred.folders_visible {
+        NOTES_MIN.min(budget)
     } else {
         0.
     };
     let navigation = if preferred.navigation_visible {
-        (preferred.navigation_width as f32).min((budget - folders_min - NOTES_MIN).max(0.))
+        (preferred.navigation_width as f32).min((budget - library_min).max(0.))
     } else {
         0.
     };
-    let remaining = (budget - navigation).max(0.);
-    let mut folders = if preferred.folders_visible {
-        preferred.folders_width as f32
+    let notes = if preferred.folders_visible {
+        (preferred.notes_width as f32).min((budget - navigation).max(0.))
     } else {
         0.
     };
-    let mut notes = preferred.notes_width as f32;
-    let excess = (folders + notes - remaining).max(0.);
-    notes -= excess.min((notes - NOTES_MIN).max(0.));
-    folders = folders.min((remaining - notes).max(folders_min).min(remaining));
-    notes = notes.min((remaining - folders).max(0.));
     EffectiveLayout {
         navigation: px(navigation),
-        folders: px(folders),
+        folders: px(0.),
         notes: px(notes),
     }
 }
@@ -159,7 +146,7 @@ impl StudyApp {
         self.persist_layout(cx);
     }
 
-    fn persist_layout(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn persist_layout(&mut self, cx: &mut Context<Self>) {
         if self.page == crate::app::Page::Settings {
             self.stage_layout(cx);
             return;
@@ -172,7 +159,6 @@ impl StudyApp {
     pub fn resize_handle(&self, pane: Pane, cx: &mut Context<Self>) -> impl IntoElement {
         let id = match pane {
             Pane::Navigation => "resize-navigation",
-            Pane::Folders => "resize-folders",
             Pane::Notes => "resize-notes",
         };
         div()
@@ -191,8 +177,8 @@ impl StudyApp {
                 self.storage_busy || self.preferences_ui.busy || self.preferences_ui.replacing,
                 |view| view.cursor_default(),
             )
-            .hover(|style| style.bg(rgb(LIGHT)))
-            .child(div().w(px(1.)).h_full().bg(rgb(BORDER)))
+            .hover(|style| style.bg(crate::theme::color(LIGHT)))
+            .child(div().w(px(1.)).h_full().bg(crate::theme::color(BORDER)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -214,17 +200,7 @@ impl StudyApp {
                         + WORKSPACE_PADDING / 2.;
                     let (initial_width, pane_left) = match pane {
                         Pane::Navigation => (visible.navigation, 0.),
-                        Pane::Folders => (visible.folders, workspace_left),
-                        Pane::Notes => (
-                            visible.notes,
-                            workspace_left
-                                + f32::from(visible.folders)
-                                + if this.layout.folders_visible {
-                                    HANDLE_WIDTH
-                                } else {
-                                    0.
-                                },
-                        ),
+                        Pane::Notes => (visible.notes, workspace_left),
                     };
                     let mut state = ResizeState::new(
                         pane,
@@ -377,118 +353,51 @@ mod tests {
         fit_layout,
     };
     use gpui_kit::px;
-
     #[test]
-    fn normal_workspace_preserves_preferred_widths() {
-        let preferences = LayoutSettings::default();
-        let actual = fit_layout(&preferences, 1280.);
+    fn unified_library_has_one_width_and_reserves_document_space() {
+        let preferred = LayoutSettings::default();
+        let actual = fit_layout(&preferred, 1280.);
         assert_eq!(actual.navigation, px(160.));
-        assert_eq!(actual.folders, px(144.));
-        assert_eq!(actual.notes, px(200.));
-    }
-
-    #[test]
-    fn narrow_window_reserves_document_without_mutating_preferences() {
-        let preferences = LayoutSettings {
-            navigation_width: 320,
-            folders_width: 360,
-            notes_width: 440,
-            navigation_visible: true,
-            folders_visible: true,
-        };
-        let actual = fit_layout(&preferences, 1000.);
-        let occupied = f32::from(actual.navigation + actual.folders + actual.notes);
-        assert!(1000. - occupied - WORKSPACE_PADDING - 3. * HANDLE_WIDTH >= DOCUMENT_MIN);
-        assert!(actual.folders >= px(112.));
-        assert!(actual.notes >= px(160.));
-        let restored = fit_layout(&preferences, 1600.);
-        assert_eq!(restored.folders, px(360.));
-        assert_eq!(restored.notes, px(440.));
-    }
-
-    #[test]
-    fn hidden_navigation_uses_no_width_and_small_bounds_never_go_negative() {
-        let preferences = LayoutSettings {
-            navigation_visible: false,
-            ..Default::default()
-        };
-        for width in [0., 320., 600., 1000.] {
-            let actual = fit_layout(&preferences, width);
-            assert_eq!(actual.navigation, px(0.));
-            assert!(actual.folders >= px(0.));
-            assert!(actual.notes >= px(0.));
-        }
-    }
-
-    #[test]
-    fn candidate_resize_never_mutates_original_layout() {
-        let original = LayoutSettings::default();
-        let mut state = ResizeState::new(Pane::Folders, px(310.), 144., 166., &original);
-        state.update_candidate(px(370.), 1280.);
-        assert_eq!(original, LayoutSettings::default());
-        assert_eq!(state.original, original);
-        assert_eq!(state.pending.folders_width, 204);
-        state.update_candidate(px(310.), 1280.);
-        assert_eq!(state.pending, original);
-    }
-
-    #[test]
-    fn each_collapsible_pane_uses_its_own_left_edge_and_retains_restored_width() {
-        let original = LayoutSettings::default();
-        for (pane, left, width) in [(Pane::Navigation, 0., 160.), (Pane::Folders, 182., 144.)] {
-            let mut state = ResizeState::new(pane, px(left + width), width, left, &original);
-            state.update_candidate(px(left + 31.), 1280.);
-            match pane {
-                Pane::Navigation => assert!(!state.pending.navigation_visible),
-                Pane::Folders => assert!(!state.pending.folders_visible),
-                Pane::Notes => unreachable!(),
-            }
-            assert_eq!(state.pending.navigation_width, original.navigation_width);
-            assert_eq!(state.pending.folders_width, original.folders_width);
-            assert_eq!(state.guide_x, px(left));
-            state.update_candidate(px(left + width), 1280.);
-            assert_eq!(state.pending, original);
-        }
-    }
-
-    #[test]
-    fn hidden_panes_have_neither_width_nor_separator_budget() {
+        assert_eq!(actual.folders, px(0.));
+        assert_eq!(actual.notes, px(280.));
         for navigation_visible in [false, true] {
             for folders_visible in [false, true] {
                 let preferred = LayoutSettings {
+                    navigation_width: 320,
+                    notes_width: 440,
                     navigation_visible,
                     folders_visible,
                     ..Default::default()
                 };
-                for viewport in [0., 320., 600., 1000., 1600.] {
-                    let actual = fit_layout(&preferred, viewport);
-                    if !navigation_visible {
-                        assert_eq!(actual.navigation, px(0.));
-                    }
-                    if !folders_visible {
-                        assert_eq!(actual.folders, px(0.));
-                    }
-                    let used = f32::from(actual.navigation + actual.folders + actual.notes);
+                for width in [0., 320., 600., 1000., 1600.] {
+                    let layout = fit_layout(&preferred, width);
                     let handles =
-                        1. + u8::from(navigation_visible) as f32 + u8::from(folders_visible) as f32;
+                        u8::from(navigation_visible) as f32 + u8::from(folders_visible) as f32;
                     assert!(
-                        used <= (viewport
-                            - WORKSPACE_PADDING
-                            - handles * HANDLE_WIDTH
-                            - DOCUMENT_MIN)
-                            .max(0.)
+                        f32::from(layout.navigation + layout.notes)
+                            <= (width - WORKSPACE_PADDING - handles * HANDLE_WIDTH - DOCUMENT_MIN)
+                                .max(0.)
                     );
+                    assert_eq!(layout.folders, px(0.));
+                    if !folders_visible {
+                        assert_eq!(layout.notes, px(0.));
+                    }
                 }
             }
         }
-        let visible = LayoutSettings {
-            navigation_visible: false,
-            ..Default::default()
-        };
-        let hidden = LayoutSettings {
-            folders_visible: false,
-            ..visible.clone()
-        };
-        assert!(fit_layout(&hidden, 650.).notes > fit_layout(&visible, 650.).notes);
+    }
+    #[test]
+    fn resize_is_transactional_and_library_hides_at_its_own_left_edge() {
+        let original = LayoutSettings::default();
+        let mut state = ResizeState::new(Pane::Notes, px(462.), 280., 182., &original);
+        state.update_candidate(px(500.), 1280.);
+        assert_eq!(state.original, original);
+        assert_eq!(state.pending.notes_width, 318);
+        state.update_candidate(px(213.), 1280.);
+        assert!(!state.pending.folders_visible);
+        assert_eq!(state.pending.notes_width, original.notes_width);
+        assert_eq!(state.guide_x, px(182.));
+        state.update_candidate(px(462.), 1280.);
+        assert_eq!(state.pending, original);
     }
 }

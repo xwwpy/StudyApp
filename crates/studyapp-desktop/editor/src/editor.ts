@@ -2,24 +2,29 @@ import { ChangeSet, Compartment, EditorSelection, EditorState, Extension, Text, 
 import { drawSelection, EditorView, keymap, placeholder, ViewUpdate } from "@codemirror/view";
 import {
   addCursorAbove, addCursorBelow, copyLineDown, copyLineUp, cursorMatchingBracket,
-  deleteGroupBackward, deleteGroupForward, deleteLine, history, indentLess, indentMore,
+  deleteGroupBackward, deleteGroupForward, deleteLine, history,
   indentSelection, insertBlankLine, moveLineDown, moveLineUp, redoSelection, selectAll,
   selectLine, selectParentSyntax, toggleBlockComment, toggleComment, toggleTabFocusMode, undoSelection
 } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { syntaxHighlighting } from "@codemirror/language";
 import { codeHighlighting, fencedLanguage } from "./languages";
-import { renderedMarkdown } from "./decorations";
-import { formatCommand } from "./formatting";
+import { imageMapChanged, updateImages, renderedMarkdown } from "./decorations";
+import { formatCommand, indentMarkdown } from "./formatting";
 import { documentBudget, documentLimits, MAX_DOCUMENT_BYTES, MAX_TRANSACTION_PATCHES, stringBytes } from "./limits";
 import { incompleteScalars, scalarText, splitsScalar } from "./unicode";
 import { eventBinding, resolveBindings, typingKeymap } from "./shortcuts";
 
-interface Load { generation: number; text: string; readonly: boolean; }
+interface Load { generation: number; text: string; readonly: boolean; canRequestEdit?: boolean; }
 interface TestAction { type: string; request?: string | number; from?: number; to?: number; text?: string; anchor?: number; head?: number; name?: string; edits?: number; }
 interface Bridge {
   load(value: Load): void;
   setReadonly(value: boolean): void;
+  setCanRequestEdit(value:boolean):void;
+  restoreSelection(position: number): void;
+  setImages(value: {generation:number;images:Record<string,unknown>}): void;
+  insertText(text:string): boolean;
+  setTheme(tokens: Record<string, unknown>): void;
   setSource(value: boolean): void;
   setShortcuts(bindings: Record<string, string>): void;
   command(name: string): boolean;
@@ -42,6 +47,7 @@ let generation = 0;
 let revision = 0;
 let source = false;
 let loaded = false;
+let canRequestEdit = false;
 let loadEpoch = 0;
 let pendingFlush = false;
 let unpublished: { base: EditorState; changes: ChangeSet } | undefined;
@@ -157,8 +163,8 @@ const editorCommands: Readonly<Record<string, (view: EditorView) => boolean>> = 
   "insert-blank-line": insertBlankLine,
   "select-line": selectLine,
   "select-parent-syntax": selectParentSyntax,
-  "indent-less": indentLess,
-  "indent-more": indentMore,
+  "indent-less": view => indentMarkdown(view, true),
+  "indent-more": view => indentMarkdown(view),
   "indent-selection": indentSelection,
   "delete-line": deleteLine,
   "matching-bracket": cursorMatchingBracket,
@@ -173,8 +179,9 @@ function command(name: string): boolean {
   if (typeof name !== "string" || !loaded || view.composing || pendingFlush) return false;
   name = name.startsWith("editor.") ? name.slice(7) : name;
   if (name === "source") { setSource(!source); return true; }
-  if (name === "save") { post({ type: "save", generation, revision }); return true; }
+  if (name === "save" && !view.state.readOnly) { post({ type: "save", generation, revision }); return true; }
   if (view.state.readOnly) return false;
+  if (name === "insert-image") { post({type:"requestInsertImage",generation}); return true; }
   const result = Object.hasOwn(editorCommands, name) ? editorCommands[name](view) : formatCommand(view, name);
   if (result) view.focus();
   return result;
@@ -239,8 +246,33 @@ function extensions(readonly: boolean, rawText = ""): Extension[] {
     EditorView.contentAttributes.of({ "aria-label": "笔记正文", spellcheck: "false", tabindex: "0" }),
     EditorView.updateListener.of(publishChanges),
     shortcutsMode.of(shortcutExtensions(bindings)),
-    keymap.of(typingKeymap),
+    keymap.of([...typingKeymap, {key: "Tab", run: view => indentMarkdown(view), shift: view => indentMarkdown(view, true)}]),
     EditorView.domEventHandlers({
+      click(event, editor) {
+        if (!loaded || !canRequestEdit || !editor.state.readOnly || pendingFlush || event.button !== 0 ||
+            (event.target as Element).closest("button,input,select,a,.md-language-control,.cm-panels,.cm-tooltip")) return false;
+        if (!(event.target as Element).closest(".cm-content")) return false;
+        const position = editor.posAtCoords({x:event.clientX,y:event.clientY});
+        if (position !== null) post({type:"requestEdit",generation,position});
+        return false;
+      },
+      paste(event) {
+        const files = [...(event.clipboardData?.files ?? [])].filter(file => /^image\/(?:png|jpeg|gif|webp|bmp)$/.test(file.type));
+        if (!files.length) return false;
+        event.preventDefault();
+        if (view.state.readOnly || pendingFlush) return true;
+        const epoch = loadEpoch;
+        for (const file of files) {
+          if (file.size > 10*1024*1024) { warning("图片超过 10 MiB，请先缩小图片"); continue; }
+          const reader = new FileReader();
+          reader.addEventListener("load", () => {
+            if (epoch !== loadEpoch || view.state.readOnly || pendingFlush || typeof reader.result !== "string") return;
+            post({type:"pasteImage",generation,name:file.name,mime:file.type,base64:reader.result.slice(reader.result.indexOf(",")+1)});
+          });
+          reader.readAsDataURL(file);
+        }
+        return true;
+      },
       dragover(event) { if (event.dataTransfer?.types.includes("Files")) { event.preventDefault(); return true; } return false; },
       drop(event) { if (event.dataTransfer?.files.length) { event.preventDefault(); return true; } return false; }
     }),
@@ -269,9 +301,11 @@ function load(value: Load): void {
   }
   if (stringBytes(value.text) > MAX_DOCUMENT_BYTES) { error("笔记超过 10 MiB，当前内容已保留。"); return; }
   loaded = false;
+  updateImages({});
   unpublished = undefined;
   loadEpoch++;
   generation = value.generation;
+  canRequestEdit = value.canRequestEdit === true;
   revision = 0;
   pendingFlush = false;
   status.textContent = "";
@@ -328,12 +362,28 @@ toolbar.addEventListener("mousedown", event => {
   // Keep the exact cross-paragraph selection while formatting with the toolbar.
   if ((event.target as Element).closest("button")) event.preventDefault();
 });
+const formatToggle = document.querySelector<HTMLButtonElement>("#format-toggle")!;
+const formatMenu = document.querySelector<HTMLElement>("#format-menu")!;
+function closeFormatMenu(): void { formatMenu.hidden = true; formatToggle.setAttribute("aria-expanded", "false"); }
+formatToggle.addEventListener("click", () => { formatMenu.hidden = !formatMenu.hidden; formatToggle.setAttribute("aria-expanded", String(!formatMenu.hidden)); });
+document.addEventListener("mousedown", event => { if (!(event.target as Element).closest("#toolbar")) closeFormatMenu(); });
+formatMenu.addEventListener("keydown", event => {
+  const buttons = [...formatMenu.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
+  const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+  if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); closeFormatMenu(); view.focus(); }
+  if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+    event.preventDefault();
+    const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length-1 : (index+(event.key === "ArrowDown" ? 1 : -1)+buttons.length)%buttons.length;
+    buttons[next]?.focus();
+  }
+});
 toolbar.addEventListener("click", event => {
   const button = (event.target as Element).closest<HTMLButtonElement>("button[data-command]");
-  if (button && !button.disabled) command(button.dataset.command!);
+  if (button && !button.disabled) { command(button.dataset.command!); closeFormatMenu(); }
 });
 document.addEventListener("keydown", event => {
   // Native divider capture can coexist with WebView keyboard focus. Forward
+  if ((event.target as Element).closest(".md-language-control")) return;
   // Escape before CodeMirror consumes it, without changing editor semantics.
   if (event.key === "Escape" && !event.isComposing && event.keyCode !== 229 && !view.composing && !event.repeat) {
     post({ type: "cancelResize", generation });
@@ -342,7 +392,7 @@ document.addEventListener("keydown", event => {
 document.addEventListener("keydown", event => {
   // Toolbar focus uses exactly the same configured bindings. Focused content
   // was already handled by the compartment; don't dispatch a second time.
-  if (!view.hasFocus) handleShortcut(event, activeShortcutLookup);
+  if (!(event.target as Element).closest(".md-language-control") && !view.hasFocus) handleShortcut(event, activeShortcutLookup);
 });
 document.addEventListener("click", event => {
   if ((event.target as Element).closest("a")) event.preventDefault();
@@ -350,12 +400,91 @@ document.addEventListener("click", event => {
 window.addEventListener("error", event => error(`编辑器错误：${event.message}`));
 window.addEventListener("unhandledrejection", () => error("编辑器操作未完成，请保留当前内容并重试"));
 
-const bridge: Bridge = { load, setReadonly, setSource, setShortcuts, command, flush };
+function setImages(value: {generation:number;images:Record<string,unknown>}): void {
+  if (!loaded || value?.generation !== generation || !value.images || typeof value.images !== "object" || Array.isArray(value.images)) return;
+  updateImages(value.images);
+  view.dispatch({effects:imageMapChanged.of()});
+}
+function insertText(text:string): boolean {
+  if (typeof text !== "string" || !loaded || view.state.readOnly || pendingFlush || view.composing) return false;
+  view.dispatch({...view.state.replaceSelection(text.replace(/\r\n?/g,"\n")),annotations:Transaction.userEvent.of("input.paste")});
+  view.focus(); return true;
+}
+function restoreSelection(position: number): void {
+  if (!loaded || view.state.readOnly || !Number.isSafeInteger(position)) return;
+  let caret = Math.max(0, Math.min(view.state.doc.length, position));
+  if (splitsScalar(view.state.doc, caret)) caret--;
+  view.dispatch({selection:EditorSelection.cursor(caret),scrollIntoView:true});
+  view.focus();
+}
+function setTheme(tokens: Record<string, unknown>): void {
+  if (!tokens || typeof tokens !== "object" || Array.isArray(tokens)) return;
+  const root = document.documentElement;
+  if (tokens.mode === "light" || tokens.mode === "dark") root.dataset.theme = tokens.mode;
+  for (const name of ["background","surface","text","muted","border","accent","selection","codeBackground","codeText"]) {
+    const value = tokens[name];
+    if (typeof value === "string" && /^#[a-f0-9]{6}$/i.test(value)) {
+      root.style.setProperty(`--editor-${name.replace(/[A-Z]/g, match => "-"+match.toLowerCase())}`,value);
+    }
+  }
+  // Syntax colors must contrast with the resolved code surface, including
+  // custom palettes whose surface can differ substantially from their body.
+  const style = getComputedStyle(root);
+  const background = style.getPropertyValue("--editor-code-background").trim();
+  const luminance = (hex: string) => {
+    const channels = [1,3,5].map(offset => parseInt(hex.slice(offset,offset+2),16)/255)
+      .map(value => value <= .04045 ? value/12.92 : ((value+.055)/1.055)**2.4);
+    return channels[0]*.2126 + channels[1]*.7152 + channels[2]*.0722;
+  };
+  const contrast = (first: string, second: string) => {
+    const a = luminance(first), b = luminance(second);
+    return (Math.max(a,b)+.05)/(Math.min(a,b)+.05);
+  };
+  const fallback = contrast(background,"#ffffff") >= contrast(background,"#000000") ? "#ffffff" : "#000000";
+  const foreground = style.getPropertyValue("--editor-code-text").trim() || style.getPropertyValue("--editor-text").trim();
+  root.style.setProperty("--editor-code-text",contrast(background,foreground) >= 4.5 ? foreground : fallback);
+  const darkSurface = luminance(background) < .18;
+  for (const [name, light, dark] of [
+    ["keyword","#854191","#d6a4e8"], ["string","#28683e","#9bcea1"],
+    ["number","#91531a","#efbd83"], ["comment","#586b79","#b1bdc9"],
+    ["type","#7c5a19","#e7ce8b"], ["property","#17677b","#8dcbd9"],
+    ["tag","#9b4446","#f0aaad"], ["function","#24648c","#99caec"],
+    ["punctuation","#536473","#c3cbd5"]
+  ]) {
+    const color = darkSurface ? dark : light;
+    root.style.setProperty(`--editor-syntax-${name}`,contrast(background,color) >= 4.5 ? color : fallback);
+  }
+  if (typeof tokens.fontSize === "number" && Number.isFinite(tokens.fontSize) && tokens.fontSize >= 12 && tokens.fontSize <= 24) root.style.setProperty("--editor-font-size",`${tokens.fontSize}px`);
+  if (typeof tokens.spacing === "number" && Number.isFinite(tokens.spacing) && tokens.spacing >= 1.3 && tokens.spacing <= 2.4) root.style.setProperty("--editor-line-height",String(tokens.spacing));
+  view.requestMeasure();
+}
+const bridge: Bridge = { load, setReadonly, setCanRequestEdit: value => {canRequestEdit = value === true;}, restoreSelection, setTheme, setImages, insertText, setSource, setShortcuts, command, flush };
 if (window.__STUDYAPP_EDITOR_TEST__ === true) {
+  const observedKeys: Array<{key:string;code:string;binding:string|undefined;keyCode:number;prevented:boolean}> = [];
+  document.addEventListener("keydown", event => {
+    const observed = {key:event.key,code:event.code,binding:eventBinding(event),keyCode:event.keyCode,prevented:false};
+    observedKeys.push(observed);
+    if (observedKeys.length > 8) observedKeys.shift();
+    queueMicrotask(() => {observed.prevented = event.defaultPrevented;});
+  }, true);
   const snapshot = () => ({
     generation, revision, text: view.state.doc.toString(), normalizedText: view.state.doc.toString(),
     utf8Bytes: view.state.field(documentBudget).bytes, rawBytes: view.state.field(documentBudget).rawBytes,
     source, readonly: view.state.readOnly, composing: view.composing,
+    canRequestEdit,
+    bindings, editorFocused:view.hasFocus,
+    activeElement:document.activeElement?.tagName+"."+document.activeElement?.className,
+    observedKeys, pendingFlush,
+    bodyClickPosition: view.posAtCoords({x:75 / devicePixelRatio,y:105 / devicePixelRatio}),
+    theme: {
+      mode: document.documentElement.dataset.theme,
+      background: getComputedStyle(document.documentElement).getPropertyValue("--editor-background").trim(),
+      surface: getComputedStyle(document.documentElement).getPropertyValue("--editor-surface").trim(),
+      text: getComputedStyle(document.documentElement).getPropertyValue("--editor-text").trim(),
+      contentBackground: getComputedStyle(view.scrollDOM).backgroundColor
+    },
+    images: view.contentDOM.querySelectorAll("img.md-image").length,
+    imagePlaceholders: view.contentDOM.querySelectorAll(".md-image-placeholder").length,
     selection: { anchor: view.state.selection.main.anchor, head: view.state.selection.main.head },
     renderedLines: view.contentDOM.querySelectorAll(".cm-line").length,
     domNodes: view.dom.querySelectorAll("*").length,

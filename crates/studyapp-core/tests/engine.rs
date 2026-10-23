@@ -21,6 +21,8 @@ fn short(engine: &mut Engine, now: i64) {
                 review_days: vec![1, 3],
                 show_file_paths: false,
                 layout: Default::default(),
+                appearance: Default::default(),
+                images: Default::default(),
             }),
             now,
         )
@@ -431,6 +433,8 @@ fn failed_sql_write_rolls_back_memory_and_database() {
                     review_days: vec![2],
                     show_file_paths: false,
                     layout: Default::default(),
+                    appearance: Default::default(),
+                    images: Default::default(),
                 }),
                 1000
             )
@@ -525,6 +529,8 @@ fn activity_ten_second_tick_splits_boundary_and_settings_take_next_cycle() {
                 review_days: vec![2],
                 show_file_paths: false,
                 layout: Default::default(),
+                appearance: Default::default(),
+                images: Default::default(),
             }),
             1299,
         )

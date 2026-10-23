@@ -1,4 +1,4 @@
-import { defaultKeymap, indentWithTab } from "@codemirror/commands";
+import { defaultKeymap } from "@codemirror/commands";
 import type { KeyBinding } from "@codemirror/view";
 
 // Kept in sync with the native allowlist by the registry parity test.
@@ -14,6 +14,15 @@ export const shortcutDefaults: Readonly<Record<string, string>> = Object.freeze(
   "editor.bold": "Ctrl+B",
   "editor.italic": "Ctrl+I",
   "editor.heading": "",
+  "editor.heading-1": "Ctrl+1",
+  "editor.heading-2": "Ctrl+2",
+  "editor.heading-3": "Ctrl+3",
+  "editor.heading-4": "Ctrl+4",
+  "editor.heading-5": "Ctrl+5",
+  "editor.heading-6": "Ctrl+6",
+  "editor.paragraph": "Ctrl+0",
+  "editor.ordered": "",
+  "editor.insert-image": "",
   "editor.code": "",
   "editor.bullet": "",
   "editor.task": "",
@@ -122,6 +131,12 @@ export function resolveBindings(value: Record<string, string>): Record<string, s
     if (!Object.hasOwn(shortcutDefaults, action)) throw new Error(`未知快捷键操作：${action}`);
     resolved[action] = normalizeBinding(binding);
   }
+  // Added defaults must not invalidate an older user's custom digit bindings.
+  // An explicitly supplied new heading binding still participates in conflicts.
+  const explicit = new Set(Object.values(value).flatMap(binding => normalizeBinding(binding).split(";").filter(Boolean)));
+  for (const action of ["editor.paragraph", ...Array.from({length:6},(_,i) => `editor.heading-${i+1}`)]) {
+    if (!Object.hasOwn(value,action) && explicit.has(resolved[action])) resolved[action] = "";
+  }
   const used = new Map<string, string>();
   for (const [action, binding] of Object.entries(resolved)) {
     for (const alternative of binding.split(";").filter(Boolean)) {
@@ -153,6 +168,5 @@ export const typingKeymap: readonly KeyBinding[] = [
     if (!key) return false; // This application is Windows-only.
     return !/Mod-|Ctrl-|Alt-/.test(key) ||
       ["Alt-ArrowLeft", "Alt-ArrowRight", "Mod-ArrowLeft", "Mod-ArrowRight", "Mod-Home", "Mod-End"].includes(key);
-  }),
-  indentWithTab
+  })
 ];

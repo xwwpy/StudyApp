@@ -1,5 +1,8 @@
 //! The Windows child-window host for the continuous Markdown editor.
 
+#[path = "native_surface_geometry.rs"]
+mod surface_geometry;
+
 const EDITOR_PAGE: &str = "https://studyapp.editor/index.html";
 // JSON may expand each raw byte to six bytes (\u0000); allow the full 10 MiB
 // document plus bounded transaction metadata. The document itself is checked
@@ -38,14 +41,22 @@ pub use windows_host::{HostedEditor, ParentWindow};
 
 #[cfg(windows)]
 mod windows_host {
-    use super::{EditorAsset, editor_asset, editor_page_allowed, ipc_allowed};
+    use super::{
+        EditorAsset, editor_asset, editor_page_allowed, ipc_allowed,
+        surface_geometry::{DragGate, LogicalRect, PhysicalRect, clipped_occlusions},
+    };
     use anyhow::{Context as _, Result, ensure};
     use gpui_kit::{Bounds, Pixels, Window};
     use std::{
-        borrow::Cow, cell::Cell, marker::PhantomData, path::PathBuf, rc::Rc, sync::mpsc::Sender,
+        borrow::Cow,
+        cell::{Cell, RefCell},
+        marker::PhantomData,
+        path::PathBuf,
+        rc::Rc,
+        sync::mpsc::Sender,
     };
     use wry::{
-        NewWindowResponse, PermissionResponse, WebContext, WebView, WebViewBuilder,
+        DragDropEvent, NewWindowResponse, PermissionResponse, WebContext, WebView, WebViewBuilder,
         WebViewBuilderExtWindows, WebViewExtWindows,
         dpi::{LogicalPosition, LogicalSize},
         http::{Method, Request, Response, StatusCode},
@@ -107,12 +118,23 @@ mod windows_host {
         _parent: ParentWindow,
         bounds: Cell<Option<EditorGeometry>>,
         visible: Cell<bool>,
+        occlusions: RefCell<Vec<LogicalRect>>,
+        applied_occlusions: RefCell<Vec<PhysicalRect>>,
+        applied_region_size: Cell<Option<(i32, i32)>>,
+        #[cfg(feature = "ui-test")]
+        occlusion_updates: Cell<u64>,
+        #[cfg(feature = "ui-test")]
+        bounds_updates: Cell<u64>,
+        #[cfg(feature = "ui-test")]
+        visibility_updates: Cell<u64>,
     }
 
     impl HostedEditor {
         pub fn new(parent: ParentWindow, sender: Sender<String>, profile: PathBuf) -> Result<Self> {
             std::fs::create_dir_all(&profile).context("无法创建本地编辑器运行目录")?;
             let mut context = WebContext::new(Some(profile));
+            let drag_sender = sender.clone();
+            let drag_gate = RefCell::new(DragGate::default());
             let builder = WebViewBuilder::new_with_web_context(&mut context)
                 .with_custom_protocol("studyapp".to_owned(), |_, request| {
                     embedded_response(request)
@@ -139,8 +161,48 @@ mod windows_host {
                 .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
                 .with_download_started_handler(|_, _| false)
                 .with_navigation_handler(|url| editor_page_allowed(&url))
+                .with_drag_drop_handler(move |event| {
+                    // Only OS-provided paths enter this trusted host channel.
+                    // Over carries position only: suppress it to avoid invalidating
+                    // the shell on every native pointer movement.
+                    let change = match event {
+                        DragDropEvent::Enter { paths, .. } => drag_gate
+                            .borrow_mut()
+                            .enter(paths.clone())
+                            .then_some(("enter", paths)),
+                        DragDropEvent::Drop { paths, .. } => drag_gate
+                            .borrow_mut()
+                            .drop_paths(paths.clone())
+                            .then_some(("drop", paths)),
+                        DragDropEvent::Leave => drag_gate
+                            .borrow_mut()
+                            .leave()
+                            .then_some(("leave", Vec::new())),
+                        _ => None,
+                    };
+                    if let Some((phase, paths)) = change {
+                        let _ = drag_sender.send(
+                            serde_json::json!({
+                                "type": "externalDrag", "phase": phase, "paths": paths
+                            })
+                            .to_string(),
+                        );
+                    }
+                    true
+                })
                 .with_ipc_handler(move |request| {
                     if ipc_allowed(&request.uri().to_string(), request.body().len()) {
+                        #[derive(serde::Deserialize)]
+                        struct MessageKind<'a> {
+                            #[serde(rename = "type", borrow)]
+                            kind: &'a str,
+                        }
+                        // The page cannot forge a native file drag event.
+                        if !serde_json::from_str::<MessageKind<'_>>(request.body())
+                            .is_ok_and(|message| message.kind != "externalDrag")
+                        {
+                            return;
+                        }
                         // Callbacks never enter GPUI: the editor drains this queue
                         // on its foreground task and validates the JSON protocol.
                         let _ = sender.send(request.into_body());
@@ -158,6 +220,15 @@ mod windows_host {
                 _parent: parent,
                 bounds: Cell::new(None),
                 visible: Cell::new(false),
+                occlusions: RefCell::new(Vec::new()),
+                applied_occlusions: RefCell::new(Vec::new()),
+                applied_region_size: Cell::new(None),
+                #[cfg(feature = "ui-test")]
+                occlusion_updates: Cell::new(0),
+                #[cfg(feature = "ui-test")]
+                bounds_updates: Cell::new(0),
+                #[cfg(feature = "ui-test")]
+                visibility_updates: Cell::new(0),
             })
         }
 
@@ -170,7 +241,7 @@ mod windows_host {
         }
 
         /// GPUI Pixels are logical units; Wry applies the window DPI conversion.
-        /// The caller must provide an unobscured rectangle inside the parent.
+        /// Overlays are clipped separately, without changing this document rectangle.
         pub fn set_bounds(&self, bounds: Bounds<Pixels>) -> Result<()> {
             let x = f64::from(f32::from(bounds.origin.x));
             let y = f64::from(f32::from(bounds.origin.y));
@@ -197,6 +268,82 @@ mod windows_host {
                 })
                 .context("无法更新 Markdown 编辑器布局")?;
             self.bounds.set(Some(geometry));
+            #[cfg(feature = "ui-test")]
+            self.bounds_updates.set(self.bounds_updates.get() + 1);
+            self.apply_occlusions()?;
+            Ok(())
+        }
+
+        /// Parent-client logical bounds of individual overlay cards, including
+        /// their shadows. This keeps Chromium live and focus/selection unchanged.
+        pub fn set_occlusions(&self, bounds: Vec<Bounds<Pixels>>) -> Result<()> {
+            *self.occlusions.borrow_mut() = bounds
+                .into_iter()
+                .map(|b| {
+                    (
+                        f64::from(f32::from(b.origin.x)),
+                        f64::from(f32::from(b.origin.y)),
+                        f64::from(f32::from(b.size.width)),
+                        f64::from(f32::from(b.size.height)),
+                    )
+                })
+                .collect();
+            self.apply_occlusions()
+        }
+
+        fn apply_occlusions(&self) -> Result<()> {
+            use windows::Win32::Graphics::Gdi::{
+                CombineRgn, CreateRectRgn, DeleteObject, GDI_REGION_TYPE, RGN_DIFF, SetWindowRgn,
+            };
+            let Some((x, y, width, height, dpi)) = self.bounds.get() else {
+                return Ok(());
+            };
+            let clips = clipped_occlusions((x, y, width, height), dpi, &self.occlusions.borrow());
+            let scale = f64::from(dpi) / 96.;
+            let size = (
+                (width * scale).ceil() as i32,
+                (height * scale).ceil() as i32,
+            );
+            if *self.applied_occlusions.borrow() == clips
+                && (clips.is_empty() || self.applied_region_size.get() == Some(size))
+            {
+                return Ok(());
+            }
+            // SAFETY: the child HWND belongs to this UI-thread host. Windows
+            // owns a successful SetWindowRgn region; all other GDI objects are
+            // released locally, including every failure path.
+            unsafe {
+                if clips.is_empty() {
+                    ensure!(
+                        SetWindowRgn(self.webview.hwnd(), None, true) != 0,
+                        "无法恢复编辑器可见区域"
+                    );
+                } else {
+                    let region = CreateRectRgn(0, 0, size.0, size.1);
+                    ensure!(!region.0.is_null(), "无法创建编辑器可见区域");
+                    for &(left, top, right, bottom) in &clips {
+                        let hole = CreateRectRgn(left, top, right, bottom);
+                        if hole.0.is_null() {
+                            let _ = DeleteObject(region.into());
+                            anyhow::bail!("无法创建通知遮挡区域");
+                        }
+                        let combined = CombineRgn(Some(region), Some(region), Some(hole), RGN_DIFF);
+                        let _ = DeleteObject(hole.into());
+                        if combined == GDI_REGION_TYPE(0) {
+                            let _ = DeleteObject(region.into());
+                            anyhow::bail!("无法更新通知遮挡区域");
+                        }
+                    }
+                    if SetWindowRgn(self.webview.hwnd(), Some(region), true) == 0 {
+                        let _ = DeleteObject(region.into());
+                        anyhow::bail!("无法应用编辑器可见区域");
+                    }
+                }
+            }
+            *self.applied_occlusions.borrow_mut() = clips;
+            self.applied_region_size.set(Some(size));
+            #[cfg(feature = "ui-test")]
+            self.occlusion_updates.set(self.occlusion_updates.get() + 1);
             Ok(())
         }
 
@@ -208,6 +355,9 @@ mod windows_host {
                 .set_visible(visible)
                 .context("无法更新 Markdown 编辑器显示状态")?;
             self.visible.set(visible);
+            #[cfg(feature = "ui-test")]
+            self.visibility_updates
+                .set(self.visibility_updates.get() + 1);
             Ok(())
         }
 
@@ -305,6 +455,10 @@ mod windows_host {
                 "hitClass": hit_class,
                 "foregroundHwnd": foreground,
                 "logicalBounds": self.bounds.get(),
+                "boundsUpdates": self.bounds_updates.get(),
+                "visibilityUpdates": self.visibility_updates.get(),
+                "occlusionUpdates": self.occlusion_updates.get(),
+                "occlusions": *self.applied_occlusions.borrow(),
             }))
         }
 

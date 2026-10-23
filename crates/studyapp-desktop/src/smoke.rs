@@ -85,6 +85,13 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
         #[cfg(feature = "ui-test")]
         {
             use gpui_kit::test::TestWindowExt;
+            #[cfg(windows)]
+            if std::env::var("WW_STUDYAPP_SMOKE_SCENARIO").as_deref() == Ok("shortcuts") {
+                Box::pin(crate::smoke_workspace::saved_shortcuts(window, &view, &database, cx)).await;
+                std::fs::write(database.with_file_name("shortcut-only-result.txt"), "PASS: isolated custom shortcut scenario; full native smoke was not run.\n").unwrap();
+                cx.update(|cx| cx.quit());
+                return;
+            }
             window.update(cx, |_, window, cx| {
                 window.click(("nav", 2_usize), cx);
                 assert_eq!(view.read(cx).page, Page::Reviews);
@@ -176,6 +183,26 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
             window.update(cx, |_, window, cx| {
                 window.click(("nav", 1_usize), cx);
                 let position = point(px(450.), px(200.));
+                let count = view.read(cx).snapshot.as_ref().unwrap().notes.len();
+                window.dispatch_event(PlatformInput::FileDrop(FileDropEvent::Entered { position, paths: ExternalPaths(vec![dropped.clone()].into_iter().collect()) }), cx);
+                window.render_frame(cx);
+                assert!(view.read(cx).external_drop.active());
+                assert!(window.try_find("external-drop-overlay").is_some());
+                #[cfg(windows)]
+                assert_eq!(view.read(cx).note_content.read(cx).native_state().unwrap()["controllerVisible"], false);
+                window.press("escape", cx);
+                window.render_frame(cx);
+                assert!(!view.read(cx).external_drop.active(), "Escape retained the drag overlay");
+                assert_eq!(view.read(cx).snapshot.as_ref().unwrap().notes.len(), count);
+                view.update(cx, |app, cx| { app.storage_busy = true; cx.notify(); });
+                window.dispatch_event(PlatformInput::FileDrop(FileDropEvent::Entered { position, paths: ExternalPaths(vec![dropped.clone()].into_iter().collect()) }), cx);
+                window.render_frame(cx);
+                assert_eq!(view.read(cx).external_drop.blocked(), Some(crate::external_drop::DropBlock::Busy));
+                window.dispatch_event(PlatformInput::FileDrop(FileDropEvent::Submit { position }), cx);
+                window.render_frame(cx);
+                assert!(!view.read(cx).external_drop.active());
+                assert_eq!(view.read(cx).snapshot.as_ref().unwrap().notes.len(), count, "busy drop imported content");
+                view.update(cx, |app, cx| { app.storage_busy = false; cx.notify(); });
                 window.dispatch_event(PlatformInput::FileDrop(FileDropEvent::Entered { position, paths: ExternalPaths(vec![dropped].into_iter().collect()) }), cx);
                 window.render_frame(cx);
                 window.dispatch_event(PlatformInput::FileDrop(FileDropEvent::Pending { position }), cx);
@@ -190,6 +217,7 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
                 let snapshot = view.read(cx).snapshot.as_ref().unwrap();
                 assert_eq!(snapshot.versions.iter().filter(|v| v.note_id == managed_id).count(), 2);
                 window.click(("nav", 4_usize), cx);
+                window.click("settings-section-sync", cx);
                 // Scroll outside nested lists to expose the sync card.
                 #[cfg(windows)]
                 crate::smoke_library::reveal_scrolled(window, "save-sync-settings".into(), "page-scroll", cx);
@@ -224,6 +252,8 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
             Box::pin(crate::smoke_library::exercise(window, &view, &database, cx)).await;
             #[cfg(windows)]
             Box::pin(crate::smoke_interactions::exercise(window, &view, &database, cx)).await;
+            #[cfg(windows)]
+            Box::pin(crate::smoke_settings::exercise(window, &view, &database, cx)).await;
             #[cfg(windows)]
             Box::pin(crate::smoke_workspace::exercise(window, &view, &database, cx)).await;
         }

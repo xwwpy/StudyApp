@@ -274,7 +274,7 @@ async fn resize_pane(
         )
         .unwrap();
     }
-    let (before, start, preferred, saved) = window
+    let (before, initial_width, start, preferred, saved) = window
         .update(cx, |_, window, cx| {
             window.render_frame(cx);
             let before = window
@@ -294,7 +294,19 @@ async fn resize_pane(
                 .settings
                 .layout
                 .clone();
-            (before, start, view.read(cx).layout.clone(), saved)
+            let effective = view.read(cx).effective_layout(window);
+            let initial_width = match pane {
+                "navigation-pane" => effective.navigation,
+                "notes-pane" => effective.notes,
+                _ => unreachable!("unknown resize fixture pane"),
+            };
+            (
+                before,
+                initial_width,
+                start,
+                view.read(cx).layout.clone(),
+                saved,
+            )
         })
         .unwrap();
     native_pointer(&native, start, Some(true));
@@ -336,6 +348,14 @@ async fn resize_pane(
                 current["bounds"], native["bounds"],
                 "drag moved the live editor before release"
             );
+            assert_eq!(
+                current["boundsUpdates"], native["boundsUpdates"],
+                "held divider wrote unchanged native geometry"
+            );
+            assert_eq!(
+                current["visibilityUpdates"], native["visibilityUpdates"],
+                "held divider toggled native visibility"
+            );
             assert_guide(&current, true);
             assert_eq!(
                 view.read(cx).snapshot.as_ref().unwrap().settings.layout,
@@ -362,11 +382,30 @@ async fn resize_pane(
             let committed = &view.read(cx).layout;
             let preferred_width = match pane {
                 "navigation-pane" => committed.navigation_width,
-                "folders-pane" => committed.folders_width,
                 "notes-pane" => committed.notes_width,
                 _ => unreachable!("unknown resize fixture pane"),
             };
-            let requested = (f32::from(before) + delta).round();
+            // SendInput operates in physical pixels. The actual MouseDown and
+            // MouseUp coordinates are the rounded physical coordinates divided
+            // by DPI, not the requested fractional logical positions. Match the
+            // production candidate's effective initial width and exact delta.
+            let scale = native["logicalBounds"][4].as_f64().unwrap() / 96.;
+            let actual_x = |position: Pixels| {
+                ((f64::from(f32::from(position)) * scale).round() / scale) as f32
+            };
+            let actual_delta = actual_x(end.x) - actual_x(start.x);
+            let requested = (f32::from(initial_width) + actual_delta).round().clamp(
+                if pane == "navigation-pane" {
+                    128.
+                } else {
+                    160.
+                },
+                if pane == "navigation-pane" {
+                    320.
+                } else {
+                    440.
+                },
+            );
             assert_eq!(
                 preferred_width, requested as u32,
                 "{pane} candidate was not committed on release"
@@ -376,12 +415,8 @@ async fn resize_pane(
             // the rendered note pane must leave 280 px for the document.
             let rendered = if pane == "notes-pane" {
                 let navigation = window.find("navigation-pane").bounds().size.width;
-                let folders = window.find("folders-pane").bounds().size.width;
                 requested.min(
-                    f32::from(window.viewport_size().width - navigation - folders)
-                        - 32.
-                        - 3. * 6.
-                        - 280.,
+                    f32::from(window.viewport_size().width - navigation) - 32. - 2. * 6. - 280.,
                 )
             } else {
                 requested
@@ -402,6 +437,287 @@ async fn resize_pane(
         cx,
     )
     .await;
+}
+
+async fn exercise_notifications(
+    window: AnyWindowHandle,
+    view: &Entity<StudyApp>,
+    editor: &Entity<MarkdownEditor>,
+    database: &Path,
+    cx: &mut AsyncApp,
+) {
+    let native = crate::smoke_visibility::visible(window, editor, cx).await;
+    // Short and long notifications size themselves independently, rather than
+    // stretching every message to a fixed shell-wide banner.
+    let short_width = window
+        .update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.clear_notices(cx);
+                app.push_notice(Ok("已保存".into()), cx);
+            });
+            window.render_frame(cx);
+            let id = view.read(cx).notifications.read(cx).test_state()[0].0;
+            window
+                .find(SharedString::from(format!("notice-{id}")))
+                .bounds()
+                .size
+                .width
+        })
+        .unwrap();
+    window
+        .update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.clear_notices(cx);
+                let message =
+                    "通知队列回归：相同结果分别显示；悬停暂停，关闭时平滑淡出。".repeat(4);
+                app.push_notice(Ok(message.clone()), cx);
+                app.push_notice(Ok(message), cx);
+                app.push_notice(Err("等待前面的通知退出后显示".into()), cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).notifications.read(cx).visible_count(), 2);
+        })
+        .unwrap();
+    cx.background_executor()
+        .timer(Duration::from_millis(240))
+        .await;
+    let (ids, body, dismiss, covered) = window
+        .update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            let center = view.read(cx).notifications.clone();
+            let state = center.read(cx).test_state();
+            assert_eq!(state.len(), 2);
+            assert_ne!(state[0].0, state[1].0);
+            assert!(state.iter().all(|(_, opacity)| *opacity == 1.));
+            let notice = window
+                .find(SharedString::from(format!("notice-{}", state[0].0)))
+                .bounds();
+            assert!(
+                notice.size.width > short_width,
+                "long notification did not adapt its width"
+            );
+            assert!(
+                notice.size.width <= px(560.)
+                    && notice.size.width <= window.viewport_size().width - px(32.)
+            );
+            assert!(
+                notice.size.height > px(40.),
+                "long notification did not wrap"
+            );
+            assert!((f32::from(notice.center().x - window.viewport_size().width / 2.)).abs() < 2.);
+            for action in [
+                "library-add-menu",
+                "library-sort-menu",
+                "library-more-menu",
+                "toggle-navigation",
+            ] {
+                assert!(
+                    !notice.intersects(&window.find(SharedString::from(action)).bounds()),
+                    "notification {notice:?} covered {action} {:?}",
+                    window.find(SharedString::from(action)).bounds()
+                );
+            }
+            let current = editor.read(cx).native_state().unwrap();
+            assert_eq!(current["boundsUpdates"], native["boundsUpdates"]);
+            assert_eq!(current["visibilityUpdates"], native["visibilityUpdates"]);
+            assert_eq!(current["controllerVisible"], true);
+            assert!(
+                !current["occlusions"].as_array().unwrap().is_empty(),
+                "notification did not clip the native child"
+            );
+            let child = HWND(current["hwnd"].as_u64().unwrap() as usize as *mut _);
+            let child_left = current["bounds"]["x"].as_i64().unwrap() as i32;
+            let child_top = current["bounds"]["y"].as_i64().unwrap() as i32;
+            let hole = &current["occlusions"][0];
+            let covered = POINT {
+                x: child_left + (hole[0].as_i64().unwrap() + hole[2].as_i64().unwrap()) as i32 / 2,
+                y: child_top + (hole[1].as_i64().unwrap() + hole[3].as_i64().unwrap()) as i32 / 2,
+            };
+            let neighbor = POINT {
+                x: child_left + current["bounds"]["width"].as_i64().unwrap() as i32 - 4,
+                y: covered.y,
+            };
+            unsafe {
+                assert_eq!(
+                    WindowFromPoint(covered),
+                    parent_hwnd(&current),
+                    "notification is covered by the native child"
+                );
+                let hit = WindowFromPoint(neighbor);
+                assert!(
+                    hit == child || IsChild(child, hit).as_bool(),
+                    "notification clipped unrelated editor pixels"
+                );
+                // At least one native surface pixel must be visible within the
+                // clipped footprint. A logical GPUI capture cannot prove this.
+                let palette = crate::theme::palette();
+                let expected = ((palette.surface & 0xFF) << 16)
+                    | (palette.surface & 0xFF00)
+                    | (palette.surface >> 16);
+                let dc = GetDC(None);
+                let mut surface_pixels = 0;
+                for y in covered.y - 8..=covered.y + 8 {
+                    for x in covered.x - 16..=covered.x + 16 {
+                        surface_pixels += usize::from(GetPixel(dc, x, y).0 == expected);
+                    }
+                }
+                ReleaseDC(None, dc);
+                assert!(
+                    surface_pixels > 10,
+                    "native screenshot pixels do not show the notification surface"
+                );
+            }
+            let body = window.find("notice-message-scroll").bounds().center();
+            window
+                .render_to_image()
+                .unwrap()
+                .save(database.with_file_name("workspace-floating-notice.png"))
+                .unwrap();
+            (
+                state.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                body,
+                window.find("dismiss-notice").bounds().center(),
+                covered,
+            )
+        })
+        .unwrap();
+    native_pointer(&native, body, Some(true));
+    native_pointer(&native, body, Some(false));
+    native_tick(cx).await;
+    window
+        .update(cx, |_, _, cx| {
+            assert!(
+                view.read(cx).note_editor.is_none(),
+                "native notification click leaked through to editable body"
+            );
+            assert_eq!(view.read(cx).notifications.read(cx).visible_count(), 2);
+        })
+        .unwrap();
+    crate::smoke_visibility::capture_window(
+        window,
+        editor,
+        &database.with_file_name("workspace-floating-notice-native.bmp"),
+        cx,
+    )
+    .await;
+    native_pointer(&native, dismiss, Some(true));
+    native_pointer(&native, dismiss, Some(false));
+    cx.background_executor()
+        .timer(Duration::from_millis(70))
+        .await;
+    window
+        .update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            let state = view.read(cx).notifications.read(cx).test_state();
+            let closing = state.iter().find(|(id, _)| *id == ids[0]).unwrap();
+            assert!(closing.1 > 0. && closing.1 < 1., "dismiss did not fade");
+            let current = editor.read(cx).native_state().unwrap();
+            assert_eq!(current["bounds"], native["bounds"]);
+            assert_eq!(current["visible"], true);
+            assert_eq!(current["boundsUpdates"], native["boundsUpdates"]);
+            assert_eq!(current["visibilityUpdates"], native["visibilityUpdates"]);
+        })
+        .unwrap();
+    cx.background_executor()
+        .timer(Duration::from_millis(220))
+        .await;
+    window
+        .update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            let state = view.read(cx).notifications.read(cx).test_state();
+            assert_eq!(state.len(), 2);
+            assert!(!state.iter().any(|(id, _)| *id == ids[0]));
+            assert!(state.iter().any(|(id, _)| *id != ids[1]));
+            view.update(cx, |app, cx| app.clear_notices(cx));
+        })
+        .unwrap();
+    native_tick(cx).await;
+    window
+        .update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            let restored = editor.read(cx).native_state().unwrap();
+            assert!(
+                restored["occlusions"].as_array().unwrap().is_empty(),
+                "dismissed notifications retained a native hole"
+            );
+            assert_eq!(restored["boundsUpdates"], native["boundsUpdates"]);
+            assert_eq!(restored["visibilityUpdates"], native["visibilityUpdates"]);
+            let child = HWND(restored["hwnd"].as_u64().unwrap() as usize as *mut _);
+            let hit = unsafe { WindowFromPoint(covered) };
+            assert!(
+                hit == child || unsafe { IsChild(child, hit).as_bool() },
+                "dismissed notification did not restore native editor hit testing"
+            );
+        })
+        .unwrap();
+}
+
+async fn measure_drag_frames(
+    window: AnyWindowHandle,
+    view: &Entity<StudyApp>,
+    editor: &Entity<MarkdownEditor>,
+    database: &Path,
+    cx: &mut AsyncApp,
+) {
+    let native = crate::smoke_visibility::visible(window, editor, cx).await;
+    let (start, index, layout) = window
+        .update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            (
+                window.find("resize-notes").bounds().center(),
+                view.read(cx).folders.read(cx).library_index(),
+                view.read(cx).layout.clone(),
+            )
+        })
+        .unwrap();
+    native_pointer(&native, start, Some(true));
+    native_tick(cx).await;
+    let mut samples = Vec::new();
+    for step in 0..60 {
+        native_pointer(
+            &native,
+            start + point(px((step % 24) as f32 * 2.), px(0.)),
+            None,
+        );
+        cx.background_executor()
+            .timer(Duration::from_millis(16))
+            .await;
+        let elapsed = window
+            .update(cx, |_, window, cx| {
+                let began = Instant::now();
+                window.render_frame(cx);
+                let elapsed = began.elapsed().as_secs_f64() * 1000.;
+                assert_eq!(view.read(cx).layout, layout);
+                let current_index = view.read(cx).folders.read(cx).library_index();
+                assert!(
+                    std::sync::Arc::ptr_eq(&index, &current_index),
+                    "pointer frame rebuilt note metadata"
+                );
+                let state = editor.read(cx).native_state().unwrap();
+                assert_eq!(state["boundsUpdates"], native["boundsUpdates"]);
+                assert_eq!(state["visibilityUpdates"], native["visibilityUpdates"]);
+                elapsed
+            })
+            .unwrap();
+        samples.push(elapsed);
+    }
+    window
+        .update(cx, |_, window, cx| window.press("escape", cx))
+        .unwrap();
+    native_pointer(&native, start, Some(false));
+    native_tick(cx).await;
+    samples.sort_by(f64::total_cmp);
+    let report = json!({
+        "samples": samples.len(), "medianFrameMs": samples[30], "p95FrameMs": samples[56],
+        "maxFrameMs": samples[59], "metadataRebuilds": 0, "nativeBoundsWrites": 0,
+        "nativeVisibilityWrites": 0,
+        "scope": "GPUI forced frame duration during 60 native divider pointer moves; not input-to-photon latency"
+    });
+    std::fs::write(
+        database.with_file_name("workspace-drag-performance.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
 }
 
 async fn cancel_resize(
@@ -560,7 +876,7 @@ async fn browser_key(
     panic!("CDP shortcut dispatch timed out");
 }
 
-async fn saved_shortcuts(
+pub(crate) async fn saved_shortcuts(
     window: AnyWindowHandle,
     view: &Entity<StudyApp>,
     database: &Path,
@@ -624,7 +940,19 @@ async fn saved_shortcuts(
         .update(cx, |_, window, cx| {
             window.click(("nav", 1_usize), cx);
             window.render_frame(cx);
+            let row = SharedString::from(format!("note-{}", note.id));
+            crate::smoke_library::reveal_scrolled(window, row.clone(), "note-list-scroll", cx);
+            window.click(row, cx);
+            assert_eq!(view.read(cx).selected_note.as_ref(), Some(&note.id));
             window.click("edit-note", cx);
+            assert_eq!(
+                view.read(cx)
+                    .note_editor
+                    .as_ref()
+                    .and_then(|draft| draft.note_id.as_ref()),
+                Some(&note.id),
+                "shortcut fixture must edit its own managed note"
+            );
             (
                 view.read(cx).note_content.clone(),
                 view.read(cx)
@@ -646,8 +974,31 @@ async fn saved_shortcuts(
         cx,
     )
     .await;
+    window
+        .update(cx, |_, _, cx| {
+            view.update(cx, |app, cx| app.clear_notices(cx))
+        })
+        .unwrap();
+    crate::smoke_visibility::focus_body(window, &editor, cx).await;
     crate::smoke_visibility::visible(window, &editor, cx).await;
+    window.update(cx, |_, _, cx| view.update(cx, |app, cx| {
+        eprintln!("custom shortcut native setup: expected_note={}; selected={:?}; draft_note={:?}; generation={}; revision={}; intent={:?}", note.id, app.selected_note, app.note_editor.as_ref().map(|draft| &draft.note_id), editor.read(cx).generation(), editor.read(cx).revision(), app.note_intent.as_ref().map(|(request, _)| request));
+        cx.subscribe(&editor, |app, _, event: &crate::markdown_editor::MarkdownEvent, cx| {
+            let event = match event {
+                crate::markdown_editor::MarkdownEvent::Save => "Save".to_owned(),
+                crate::markdown_editor::MarkdownEvent::Flushed(request) => format!("Flushed({request})"),
+                crate::markdown_editor::MarkdownEvent::Shortcut(action) => format!("Shortcut({action})"),
+                _ => return,
+            };
+            eprintln!("custom shortcut native event: {event}; draft_note={:?}; generation={}; revision={}; intent={:?}", app.note_editor.as_ref().map(|draft| &draft.note_id), app.note_content.read(cx).generation(), app.note_content.read(cx).revision(), app.note_intent.as_ref().map(|(request, _)| request));
+        }).detach();
+    })).unwrap();
     let current = browser(window, &editor, json!({"type":"snapshot"}), cx).await;
+    eprintln!("custom shortcut before dispatch: {current}");
+    assert_eq!(
+        current["bindings"]["editor.save"], "Ctrl+Shift+S",
+        "committed shortcut did not reach the editor"
+    );
     let expected = format!(
         "{}\n自定义保存组合键已应用。\n",
         current["text"].as_str().unwrap()
@@ -675,6 +1026,8 @@ async fn saved_shortcuts(
         })
         .unwrap();
     browser_key(window, &editor, "S", "KeyS", 10, 83, cx).await;
+    let dispatched = browser(window, &editor, json!({"type":"snapshot"}), cx).await;
+    eprintln!("custom shortcut after dispatch: {dispatched}");
     until(
         window,
         view,
@@ -763,7 +1116,7 @@ pub async fn exercise(
                 app.page = Page::Notes;
                 app.history = false;
                 app.show_detached = false;
-                app.notice = None;
+                app.clear_notices(cx);
                 app.search
                     .update(cx, |input, cx| input.set_value("", window, cx));
                 app.folders
@@ -788,6 +1141,28 @@ pub async fn exercise(
         })
         .unwrap();
     crate::smoke_visibility::visible(window, &editor, cx).await;
+    window
+        .update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            let app = view.read(cx);
+            eprintln!(
+                "workspace cursor fixture: viewport={:?}, divider={:?}, busy={}/{}/{}, native={}",
+                window.viewport_size(),
+                window.find("resize-notes").bounds(),
+                app.storage_busy,
+                app.preferences_ui.busy,
+                app.preferences_ui.replacing,
+                app.note_content.read(cx).native_state().unwrap()
+            );
+        })
+        .unwrap();
+    crate::smoke_visibility::capture_window(
+        window,
+        &editor,
+        &database.with_file_name("workspace-before-cursor.bmp"),
+        cx,
+    )
+    .await;
     crate::smoke_visibility::assert_cursor(
         window,
         &editor,
@@ -822,7 +1197,7 @@ pub async fn exercise(
                 .layout
                 .clone();
             window.click("toggle-navigation", cx);
-            for divider in ["resize-navigation", "resize-folders", "resize-notes"] {
+            for divider in ["resize-navigation", "resize-notes"] {
                 let start = window.find(SharedString::from(divider)).bounds().center();
                 press(window, start, cx);
                 assert!(
@@ -866,43 +1241,8 @@ pub async fn exercise(
             window.render_frame(cx);
         })
         .unwrap();
-    window
-        .update(cx, |_, window, cx| {
-            view.update(cx, |app, cx| {
-                app.notice = Some(Err(
-                    "工作区浮动提示遮挡回归：这段提示应拦截覆盖范围内的点击。".repeat(8),
-                ));
-                cx.notify();
-            });
-            window.render_frame(cx);
-            let notice = window.find("floating-notice").bounds();
-            for action in ["new-note", "header-import", "toggle-navigation"] {
-                assert!(
-                    !notice.intersects(&window.find(SharedString::from(action)).bounds()),
-                    "floating notice covered header action {action}"
-                );
-            }
-            let body = window.find("notice-message-scroll").bounds().center();
-            assert!(notice.contains(&body));
-            press(window, body, cx);
-            release(window, body, cx);
-            assert!(
-                view.read(cx).note_editor.is_none(),
-                "floating notice body click opened an editor"
-            );
-            assert!(
-                view.read(cx).notice.is_some(),
-                "notice body click dismissed the notice"
-            );
-            window
-                .render_to_image()
-                .unwrap()
-                .save(database.with_file_name("workspace-floating-notice.png"))
-                .unwrap();
-            window.click("dismiss-notice", cx);
-            assert!(view.read(cx).notice.is_none());
-        })
-        .unwrap();
+    exercise_notifications(window, view, &editor, database, cx).await;
+    measure_drag_frames(window, view, &editor, database, cx).await;
     let baseline = browser(
         window,
         &editor,
@@ -915,7 +1255,6 @@ pub async fn exercise(
         .unwrap();
     for (divider, pane, delta) in [
         ("resize-navigation", "navigation-pane", 24.),
-        ("resize-folders", "folders-pane", 32.),
         ("resize-notes", "notes-pane", 36.),
     ] {
         resize_pane(window, view, &editor, divider, pane, delta, cx).await;
@@ -997,12 +1336,12 @@ pub async fn exercise(
     )
     .await;
     unchanged(window, view, &editor, &baseline, &reader_key, cx).await;
-    let folders_width = window
+    let notes_width = window
         .update(cx, |_, window, cx| {
             window.render_frame(cx);
-            let preferred = view.read(cx).layout.folders_width;
-            let start = window.find("resize-folders").bounds().center();
-            let left = window.find("folders-pane").bounds().left();
+            let preferred = view.read(cx).layout.notes_width;
+            let start = window.find("resize-notes").bounds().center();
+            let left = window.find("notes-pane").bounds().left();
             press(window, start, cx);
             let edge = point(left + px(24.), start.y);
             pointer(window, edge, true, cx);
@@ -1010,16 +1349,16 @@ pub async fn exercise(
                 view.read(cx).layout.folders_visible,
                 "folders collapsed before release"
             );
-            assert!(window.try_find("folders-pane").is_some());
+            assert!(window.try_find("notes-pane").is_some());
             release(window, edge, cx);
             assert!(!view.read(cx).layout.folders_visible);
             assert_eq!(
-                view.read(cx).layout.folders_width,
+                view.read(cx).layout.notes_width,
                 preferred,
                 "collapse lost restored folder width"
             );
-            assert!(window.try_find("folders-pane").is_none());
-            assert!(window.try_find("resize-folders").is_none());
+            assert!(window.try_find("notes-pane").is_none());
+            assert!(window.try_find("resize-notes").is_none());
             assert!(
                 window.try_find("toggle-folders").is_some(),
                 "collapsed folders lost restore icon"
@@ -1049,10 +1388,10 @@ pub async fn exercise(
             window.click("toggle-folders", cx);
             window.render_frame(cx);
             assert!(view.read(cx).layout.folders_visible);
-            assert_eq!(view.read(cx).layout.folders_width, folders_width);
-            assert!(window.try_find("resize-folders").is_some());
+            assert_eq!(view.read(cx).layout.notes_width, notes_width);
+            assert!(window.try_find("resize-notes").is_some());
             assert!(
-                (f32::from(window.find("folders-pane").bounds().size.width) - folders_width as f32)
+                (f32::from(window.find("notes-pane").bounds().size.width) - notes_width as f32)
                     .abs()
                     < 2.
             );
@@ -1085,7 +1424,7 @@ pub async fn exercise(
     .await;
     window
         .update(cx, |_, window, cx| {
-            window.click("folder-create", cx);
+            crate::smoke_library::library_add(window, true, cx);
             window.render_frame(cx);
             assert!(view.read(cx).folders.read(cx).modal_open());
             assert!(window.try_find("modal-content-scroll").is_some());
@@ -1113,7 +1452,7 @@ pub async fn exercise(
     const DESTINATION: &str = "工作区布局回归目标";
     window
         .update(cx, |_, window, cx| {
-            window.click("folder-create", cx);
+            crate::smoke_library::library_add(window, true, cx);
             window.input(DESTINATION, cx); // Initial modal focus must accept typing.
             window.press("enter", cx);
             window.press("enter", cx);
@@ -1174,7 +1513,7 @@ pub async fn exercise(
             crate::smoke_library::reveal_scrolled(
                 window,
                 destination_row.clone(),
-                "folder-tree-scroll",
+                "note-list-scroll",
                 cx,
             );
         })
@@ -1248,15 +1587,34 @@ pub async fn exercise(
     .await;
     unchanged(window, view, &editor, &baseline, &reader_key, cx).await;
     assert_eq!(std::fs::read(&note.path).unwrap(), original);
-    // Compact defaults now fit at 1000 px. Explicitly enlarge the preferred
-    // note width so the following narrow-window assertions still test fitting.
+    // Force both preferred widths to exceed the 1000px document budget, so
+    // this still checks fitting after removing the old independent folder pane.
+    let (nav_delta, note_delta) = window
+        .update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            (
+                320. - f32::from(window.find("navigation-pane").bounds().size.width),
+                416. - f32::from(window.find("notes-pane").bounds().size.width),
+            )
+        })
+        .unwrap();
     resize_pane(
         window,
         view,
         &editor,
         "resize-notes",
         "notes-pane",
-        180.,
+        note_delta,
+        cx,
+    )
+    .await;
+    resize_pane(
+        window,
+        view,
+        &editor,
+        "resize-navigation",
+        "navigation-pane",
+        nav_delta,
         cx,
     )
     .await;
@@ -1289,7 +1647,7 @@ pub async fn exercise(
                 window.find("notes-pane").bounds().size.width < px(preferred.notes_width as f32),
                 "fixture must temporarily fit a smaller note pane"
             );
-            for divider in ["resize-navigation", "resize-folders", "resize-notes"] {
+            for divider in ["resize-navigation", "resize-notes"] {
                 let position = window.find(SharedString::from(divider)).bounds().center();
                 press(window, position, cx);
                 assert!(view.read(cx).is_layout_resizing());
@@ -1351,6 +1709,174 @@ pub async fn exercise(
     )
     .unwrap();
     saved_shortcuts(window, view, database, cx).await;
+    exercise_images(window, view, database, cx).await;
     std::fs::write(database.with_file_name("workspace-smoke-result.txt"),
-        "PASS: three deferred native divider drags preserve layout and visible WebView bounds while held; owned dashed guide retains capture/focus and is not globally topmost; release commits and Escape cancels without saving; busy layout controls remain inert; navigation and folder edge collapse retain width and restore icons; same editor generation/revision/selection/text survive workspace changes; folder modal background blocking, Escape and exactly-once Enter; floating notice contains body clicks and dismisses explicitly; compact native drag preview and metadata-only drop; 1000px document reservation and no-motion divider clicks retain preferred widths.\n").unwrap();
+        "PASS: two deferred native divider drags preserve layout and visible WebView bounds while held; owned dashed guide retains capture/focus and is not globally topmost; release commits and Escape cancels without saving; busy layout controls remain inert; navigation and folder edge collapse retain width and restore icons; same editor generation/revision/selection/text survive workspace changes; folder modal background blocking, Escape and exactly-once Enter; independent identical queued notices contain clicks and fade before removal; compact native drag preview and metadata-only drop; 1000px document reservation and no-motion divider clicks retain preferred widths.\n").unwrap();
+}
+
+async fn exercise_images(
+    window: AnyWindowHandle,
+    view: &Entity<StudyApp>,
+    database: &Path,
+    cx: &mut AsyncApp,
+) {
+    let note = create_note(window, view, "本地图片采用与拖入回归", None, cx).await;
+    let source = Path::new(&note.path)
+        .parent()
+        .unwrap()
+        .join("native-adopt-source.png");
+    image::RgbaImage::from_pixel(48, 32, image::Rgba([22, 121, 202, 255]))
+        .save(&source)
+        .unwrap();
+    let source_bytes = std::fs::read(&source).unwrap();
+    let editor = window
+        .update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.page = Page::Notes;
+                app.selected_note = Some(note.id.clone());
+                app.selected_version = None;
+                app.search
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                app.folders
+                    .update(cx, |folders, cx| folders.set_filter(FolderFilter::All, cx));
+                app.clear_notices(cx);
+                cx.notify();
+            });
+            window.render_frame(cx);
+            let row = SharedString::from(format!("note-{}", note.id));
+            crate::smoke_library::reveal_scrolled(window, row.clone(), "note-list-scroll", cx);
+            window.click(row, cx);
+            assert_eq!(view.read(cx).selected_note.as_ref(), Some(&note.id));
+            window.click("edit-note", cx);
+            assert_eq!(
+                view.read(cx)
+                    .note_editor
+                    .as_ref()
+                    .and_then(|draft| draft.note_id.as_ref()),
+                Some(&note.id),
+                "image fixture must edit its own managed note"
+            );
+            view.read(cx).note_content.clone()
+        })
+        .unwrap();
+    let before = browser(window, &editor, json!({"type":"snapshot"}), cx).await;
+    let text =
+        "# 本地图片采用与拖入回归\n\n![原有相对图片](native-adopt-source.png)\n\n图片验证尾行。\n";
+    browser(window, &editor, json!({"type":"replace","from":0,"to":before["text"].as_str().unwrap().encode_utf16().count(),"text":text}), cx).await;
+    // Keep the image source line inactive, so the production renderer must
+    // resolve its trusted bytes instead of displaying Markdown source text.
+    browser(window, &editor, json!({"type":"select","anchor":0}), cx).await;
+    let began = Instant::now();
+    loop {
+        let state = browser(window, &editor, json!({"type":"snapshot"}), cx).await;
+        if state["images"] == 1 {
+            break;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(8),
+            "relative image never rendered: {state}"
+        );
+    }
+    // Use native-window FileDrop delivery on the existing editable child.
+    // The overlay hands the payload to the asynchronous image worker.
+    window
+        .update(cx, |_, window, cx| {
+            let position = window.find("continuous-markdown-editor").bounds().center();
+            window.dispatch_event(
+                PlatformInput::FileDrop(FileDropEvent::Entered {
+                    position,
+                    paths: ExternalPaths(vec![source.clone()].into_iter().collect()),
+                }),
+                cx,
+            );
+            window.render_frame(cx);
+            assert!(view.read(cx).external_drop.active());
+            assert!(window.try_find("external-drop-overlay").is_some());
+            window.dispatch_event(
+                PlatformInput::FileDrop(FileDropEvent::Submit { position }),
+                cx,
+            );
+            window.render_frame(cx);
+            assert!(
+                !view.read(cx).external_drop.active(),
+                "accepted image retained blocking overlay"
+            );
+            assert!(
+                !view.read(cx).note_saving,
+                "image drop synchronously entered save"
+            );
+        })
+        .unwrap();
+    until(
+        window,
+        view,
+        "image drop persisted managed asset",
+        |app, cx| {
+            !app.media_busy()
+                && app
+                    .note_content
+                    .read(cx)
+                    .value()
+                    .contains("studyapp-media:")
+        },
+        cx,
+    )
+    .await;
+    window
+        .update(cx, |_, window, cx| window.click("save-note", cx))
+        .unwrap();
+    until(
+        window,
+        view,
+        "relative images adopted before note save",
+        |app, _| {
+            !app.media_busy()
+                && !app.note_saving
+                && app.note_editor.is_none()
+                && app
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .versions
+                    .iter()
+                    .any(|version| {
+                        version.note_id == note.id
+                            && version.content.matches("studyapp-media:").count() == 2
+                    })
+        },
+        cx,
+    )
+    .await;
+    let saved = std::fs::read_to_string(&note.path).unwrap();
+    assert!(
+        !saved.contains("](native-adopt-source.png)"),
+        "save kept an unmanaged relative image destination"
+    );
+    assert_eq!(
+        std::fs::read(&source).unwrap(),
+        source_bytes,
+        "image adoption changed external source bytes"
+    );
+    crate::smoke_visibility::visible(window, &editor, cx).await;
+    let began = Instant::now();
+    loop {
+        let state = browser(window, &editor, json!({"type":"snapshot"}), cx).await;
+        if state["images"] == 2 {
+            assert_eq!(state["imagePlaceholders"], 0);
+            assert_eq!(state["readonly"], true);
+            break;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(8),
+            "saved managed images never rendered: {state}"
+        );
+    }
+    crate::smoke_visibility::capture_window(
+        window,
+        &editor,
+        &database.with_file_name("native-managed-images.bmp"),
+        cx,
+    )
+    .await;
+    std::fs::write(database.with_file_name("native-image-smoke-result.txt"), "PASS: relative image resolved in native editor; native-window image drop dismisses overlay and queues managed insertion; saving adopts relative and inserted assets before note write; both managed images render without placeholders; source image bytes preserved.\n").unwrap();
 }

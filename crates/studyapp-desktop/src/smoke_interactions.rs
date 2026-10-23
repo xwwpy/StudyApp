@@ -20,6 +20,7 @@ pub async fn exercise(
         .update(cx, |_, window, cx| {
             window.resize(size(px(1280.), px(900.)));
             view.update(cx, |app, cx| {
+                app.clear_notices(cx);
                 app.page = Page::Notes;
                 app.history = false;
                 app.search
@@ -45,7 +46,7 @@ pub async fn exercise(
     .await;
     window
         .update(cx, |_, window, cx| {
-            window.click("folder-create", cx);
+            crate::smoke_library::library_add(window, true, cx);
             window.click("folder-name-input", cx);
             window.input("拖动目标目录", cx);
             window.press("enter", cx);
@@ -185,7 +186,31 @@ pub async fn exercise(
     window
         .update(cx, |_, window, cx| {
             window.click(SharedString::from(format!("folder-row-{destination}")), cx);
+        })
+        .unwrap();
+    until(
+        window,
+        view,
+        "empty folder selection delivered",
+        |app, cx| {
+            app.folders.read(cx).filter() == &FolderFilter::Folder(destination.clone())
+                && app.selected_note.is_none()
+        },
+        cx,
+    )
+    .await;
+    window
+        .update(cx, |_, window, cx| {
             window.render_frame(cx);
+            assert!(view.read(cx).selected_note.is_none());
+            let timer_snapshot = view.read(cx).snapshot.as_ref().unwrap().clone();
+            view.update(cx, |app, cx| {
+                app.accept_snapshot(timer_snapshot, false, window, cx)
+            });
+            assert!(
+                view.read(cx).selected_note.is_none(),
+                "timer refresh must keep an empty folder's document empty"
+            );
             for old_button in ["folder-rename", "folder-move", "folder-delete"] {
                 assert!(
                     window.try_find(SharedString::from(old_button)).is_none(),
@@ -249,6 +274,7 @@ pub async fn exercise(
                 cx.notify();
             });
             window.render_frame(cx);
+            window.click(note_element.clone(), cx);
             assert!(
                 window.try_find("note-file-path").is_none(),
                 "paths must be hidden by default"
@@ -281,6 +307,26 @@ pub async fn exercise(
     )
     .await;
     assert_eq!(std::fs::read(&note.path).unwrap(), bytes);
+    window
+        .update(cx, |_, window, cx| {
+            assert_eq!(
+                view.read(cx).selected_note.as_ref(),
+                Some(&note.id),
+                "moving the selected note must preserve its document"
+            );
+            assert_eq!(
+                view.read(cx).folders.read(cx).filter(),
+                &FolderFilter::Folder(destination.clone()),
+                "new-note destination follows the moved selected note"
+            );
+            crate::smoke_library::reveal_scrolled(
+                window,
+                note_element.clone(),
+                "note-list-scroll",
+                cx,
+            );
+        })
+        .unwrap();
     crate::smoke_visibility::hover(window, &editor, note_element.clone(), cx).await;
     for attempt in 0..100 {
         cx.background_executor()
@@ -357,6 +403,16 @@ pub async fn exercise(
         cx,
     )
     .await;
+    window
+        .update(cx, |_, _, cx| {
+            assert_eq!(
+                view.read(cx).selected_note.as_ref(),
+                Some(&note.id),
+                "context move must preserve the selected document"
+            );
+            assert_eq!(view.read(cx).folders.read(cx).filter(), &FolderFilter::Root);
+        })
+        .unwrap();
     let editor = window
         .update(cx, |_, _, cx| view.read(cx).note_content.clone())
         .unwrap();
@@ -397,6 +453,7 @@ pub async fn exercise(
                 previous_clipboard.unwrap_or_else(|| ClipboardItem::new_string(String::new())),
             );
             window.click(("nav", 4_usize), cx);
+            window.click("settings-section-appearance", cx);
             click_scrolled(window, "show-file-paths".into(), "page-scroll", cx);
             assert!(
                 view.read(cx)
@@ -499,6 +556,7 @@ pub async fn exercise(
                 "discard retained dirty settings"
             );
             window.click(("nav", 4_usize), cx);
+            window.click("settings-section-appearance", cx);
             click_scrolled(window, "show-file-paths".into(), "page-scroll", cx);
             window.click(("nav", 1_usize), cx);
             window.render_frame(cx);
@@ -528,7 +586,12 @@ pub async fn exercise(
             assert!(
                 window
                     .try_find(SharedString::from(format!("note-row-path-{}", note.id)))
-                    .is_some()
+                    .is_none(),
+                "compact library rows keep paths in their hover tooltip"
+            );
+            assert_eq!(
+                window.find(note_element.clone()).bounds().size.height,
+                px(32.)
             );
             window.click("edit-note", cx);
         })
@@ -545,7 +608,7 @@ pub async fn exercise(
         .update(cx, |_, window, cx| {
             window.render_frame(cx);
             assert!(window.try_find("editor-file-path").is_some());
-            window.click("discard-note-draft", cx);
+            crate::smoke_library::editor_action(window, view, true, cx);
             window.click("confirm-note-action", cx);
         })
         .unwrap();
@@ -563,7 +626,11 @@ pub async fn exercise(
     window
         .update(cx, |_, window, cx| {
             window.click(("nav", 4_usize), cx);
-            view.update(cx, |app, cx| app.storage_work(Work::RefreshStorage, cx));
+            window.click("settings-section-storage", cx);
+            view.update(cx, |app, cx| {
+                app.clear_notices(cx);
+                app.storage_work(Work::RefreshStorage, cx);
+            });
         })
         .unwrap();
     until(
@@ -634,7 +701,7 @@ pub async fn exercise(
                 .unwrap();
             let old_top = window.find("storage-copy-list").bounds().origin.y;
             // Wheel to the left of the inset card, outside its file-list bounds.
-            let page = window.find("page-scroll").bounds();
+            let page = window.find("settings-section-scroll").bounds();
             window.dispatch_event(
                 ScrollWheelEvent {
                     position: point(page.origin.x + px(5.), initial.center().y),
@@ -649,6 +716,7 @@ pub async fn exercise(
                 window.find("storage-copy-list").bounds().origin.y < old_top,
                 "Settings must scroll outside the file list"
             );
+            window.click("settings-section-appearance", cx);
             click_scrolled(window, "show-file-paths".into(), "page-scroll", cx);
             assert!(
                 !view

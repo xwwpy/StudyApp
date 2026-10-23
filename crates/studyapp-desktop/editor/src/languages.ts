@@ -48,3 +48,20 @@ export const codeHighlighting = HighlightStyle.define([
   { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], class: "tok-function" },
   { tag: [tags.operator, tags.punctuation], class: "tok-punctuation" }
 ]);
+
+// Share the parser registry with the native, keyboard-searchable selector.
+export const fenceLanguageNames = [...languages.keys()];
+
+export function normalizeFenceLanguage(value: string): string {
+  const token = value.trim().toLowerCase();
+  return languages.has(token) ? token : "";
+}
+
+export function completeFenceLanguage(value: string): string[] {
+  const query = value.trim().toLowerCase();
+  return fenceLanguageNames.filter(name => !query || name.includes(query))
+    .sort((a, b) => {
+      const rank = (name: string) => name === query ? 0 : name.startsWith(query) ? 1 : 2;
+      return rank(a) - rank(b) || a.length - b.length || a.localeCompare(b);
+    }).slice(0, 5);
+}

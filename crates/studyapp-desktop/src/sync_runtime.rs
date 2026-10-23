@@ -136,7 +136,26 @@ fn remote_copy_id(source: &str, content: &str) -> String {
     )
 }
 
+type MediaProviderFactory = Box<dyn FnOnce() -> Result<Option<Box<dyn Provider>>> + Send>;
+
 impl SyncRuntime {
+    /// Only the background job sees decrypted credentials or a provider. The
+    /// frontend receives image bytes/data URLs and never service credentials.
+    pub fn media_provider_factory(&self) -> MediaProviderFactory {
+        let target = self.data.settings.target.clone();
+        let encrypted = self.data.protected_password.clone();
+        Box::new(move || {
+            let provider: Box<dyn Provider> = match target {
+                SyncTarget::Disabled => return Ok(None),
+                SyncTarget::Folder { path } => Box::new(LocalFolderProvider::new(path)?),
+                SyncTarget::WebDav { url, username } => {
+                    let secret = crate::credentials::unprotect(&encrypted)?;
+                    Box::new(WebDavProvider::new(&url, &username, secret.as_str())?)
+                }
+            };
+            Ok(Some(provider))
+        })
+    }
     fn read_legacy(database: &Path) -> Result<Persisted> {
         let path = database.with_file_name("sync-config.json");
         if !path.try_exists()? {

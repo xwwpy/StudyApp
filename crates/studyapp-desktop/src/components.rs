@@ -33,9 +33,9 @@ impl Render for SidebarTooltip {
                     .p_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(0xFFFFFF))
-                    .text_color(rgb(INK))
+                    .border_color(crate::theme::color(BORDER))
+                    .bg(crate::theme::color(0xFFFFFF))
+                    .text_color(crate::theme::color(INK))
                     .text_sm()
                     .shadow_md()
                     .child(self.text.clone()),
@@ -44,21 +44,30 @@ impl Render for SidebarTooltip {
 }
 
 pub fn column() -> Div {
-    div().flex().flex_col().gap_4()
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(crate::theme::palette().spacing as f32))
 }
 pub fn row() -> Div {
-    div().flex().items_center().gap_3()
+    div()
+        .flex()
+        .items_center()
+        .gap(px(crate::theme::palette().spacing as f32))
 }
 pub fn card() -> Div {
     column()
-        .p_5()
-        .rounded_xl()
-        .bg(rgb(0xFFFFFF))
+        .p_4()
+        .rounded_lg()
+        .bg(crate::theme::color(0xFFFFFF))
         .border_1()
-        .border_color(rgb(BORDER))
+        .border_color(crate::theme::color(BORDER))
 }
 pub fn muted(text: impl Into<SharedString>) -> Div {
-    div().text_sm().text_color(rgb(MUTED)).child(text.into())
+    div()
+        .text_sm()
+        .text_color(crate::theme::color(MUTED))
+        .child(text.into())
 }
 pub fn heading(text: impl Into<SharedString>) -> Div {
     div()
@@ -72,7 +81,7 @@ pub fn pill(text: impl Into<SharedString>, color: u32) -> Div {
         .py_1()
         .rounded_full()
         .text_xs()
-        .bg(rgb(color))
+        .bg(crate::theme::color(color))
         .child(text.into())
 }
 pub fn empty(title: &str, detail: &str) -> Div {

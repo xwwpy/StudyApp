@@ -236,6 +236,65 @@ impl WebDavProvider {
 }
 
 impl Provider for WebDavProvider {
+    fn read_asset(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        validate_asset_key(key)?;
+        let url = self
+            .base
+            .join(&format!("StudyApp/{key}"))
+            .map_err(|_| SyncError::InvalidUrl)?;
+        let response = Self::send(self.request(Method::GET, url))?;
+        match response.status().as_u16() {
+            404 => return Ok(None),
+            200 => {}
+            status => return Err(SyncError::Http(status)),
+        };
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_CONTENT_BYTES as u64)
+        {
+            return Err(SyncError::LimitExceeded);
+        }
+        bounded_bytes(response).map(Some)
+    }
+    fn write_asset(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        validate_asset_key(key)?;
+        if bytes.len() > MAX_CONTENT_BYTES {
+            return Err(SyncError::LimitExceeded);
+        }
+        self.ensure_dirs()?;
+        let group = key.split('/').nth(1).ok_or(SyncError::InvalidPath)?;
+        for relative in [
+            "StudyApp/assets/".to_owned(),
+            format!("StudyApp/assets/{group}/"),
+        ] {
+            let url = self
+                .base
+                .join(&relative)
+                .map_err(|_| SyncError::InvalidUrl)?;
+            let response = Self::send(self.request(
+                Method::from_bytes(b"MKCOL").map_err(|_| SyncError::InvalidUrl)?,
+                url,
+            ))?;
+            if !matches!(response.status().as_u16(), 201 | 405) {
+                return Err(SyncError::Http(response.status().as_u16()));
+            }
+        }
+        let url = self
+            .base
+            .join(&format!("StudyApp/{key}"))
+            .map_err(|_| SyncError::InvalidUrl)?;
+        let response = Self::send(
+            self.request(Method::PUT, url)
+                .header(IF_NONE_MATCH, "*")
+                .header("Content-Type", "application/octet-stream")
+                .body(bytes.to_owned()),
+        )?;
+        match response.status().as_u16() {
+            200 | 201 | 204 => Ok(()),
+            412 => Err(SyncError::Conflict),
+            status => Err(SyncError::Http(status)),
+        }
+    }
     fn list(&self) -> Result<Vec<String>> {
         self.ensure_dirs()?;
         let response = Self::send(self.request(Method::from_bytes(b"PROPFIND").map_err(|_| SyncError::InvalidUrl)?, self.notes.clone())

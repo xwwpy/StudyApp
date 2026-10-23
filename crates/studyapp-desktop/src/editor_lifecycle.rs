@@ -56,6 +56,7 @@ impl StudyApp {
         if self.note_editor.is_none()
             || self.storage_busy
             || self.note_saving
+            || self.media_busy()
             || self.draft_discard.is_some()
             || (self.confirmation.is_some()
                 && !matches!(
@@ -73,7 +74,7 @@ impl StudyApp {
             Ok(request) => self.note_intent = Some((request, intent)),
             Err(error) => {
                 self.note_saving = false;
-                self.notice = Some(Err(error.to_string()));
+                self.push_notice(Err(error.to_string()), cx);
             }
         }
         cx.notify();
@@ -86,7 +87,39 @@ impl StudyApp {
         cx: &mut Context<Self>,
     ) {
         match event {
+            MarkdownEvent::RequestInsertImage => self.request_insert_image(window, cx),
+            MarkdownEvent::PasteImage { name, mime, base64 } => {
+                self.paste_editor_image(name, mime, base64, window, cx);
+            }
+            MarkdownEvent::ExternalDrag { phase, paths } => {
+                self.handle_external_drag(phase, paths, window, cx);
+            }
             MarkdownEvent::Save => self.save_note(window, cx),
+            MarkdownEvent::RequestEdit(position) => {
+                let allowed = self.page == Page::Notes
+                    && !self.history
+                    && self.selected_version.is_none()
+                    && self.note_editor.is_none()
+                    && !self.has_modal(cx)
+                    && self.active_note_menu.is_none()
+                    && !self.storage_busy
+                    && !self.external_drop.active()
+                    && self.snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot.notes.iter().any(|note| {
+                            Some(&note.id) == self.selected_note.as_ref()
+                                && note.managed
+                                && !note.detached
+                                && !note.missing
+                        })
+                    });
+                if allowed {
+                    self.open_note_editor(false, window, cx);
+                    if self.note_editor.is_some() {
+                        self.note_content
+                            .update(cx, |editor, cx| editor.restore_selection(position, cx));
+                    }
+                }
+            }
             MarkdownEvent::CancelResize => self.cancel_resize(cx),
             MarkdownEvent::Shortcut(action) => {
                 self.dispatch_shortcut(&action, window, cx);
@@ -95,7 +128,7 @@ impl StudyApp {
                 self.note_intent = None;
                 self.note_saving = false;
                 self.close_requested = false;
-                self.notice = Some(Err(error));
+                self.push_notice(Err(error), cx);
                 cx.notify();
             }
             MarkdownEvent::Flushed(request) => {
@@ -110,11 +143,7 @@ impl StudyApp {
                 self.capture_note_draft(cx);
                 match intent {
                     NoteIntent::Save { copy } => {
-                        if copy && let Some(draft) = &mut self.note_editor {
-                            draft.note_id = None;
-                            draft.expected_hash = None;
-                        }
-                        self.commit_note(cx);
+                        self.begin_save_images(copy, window, cx);
                     }
                     NoteIntent::Discard => {
                         self.note_saving = false;
@@ -196,6 +225,7 @@ impl StudyApp {
         }
         if !self.note_content.read(cx).creating()
             && !self.storage_busy
+            && !self.media_busy()
             && self.note_editor.is_none()
             && self.draft_discard.is_none()
         {
@@ -210,6 +240,7 @@ impl StudyApp {
         if !self.close_requested
             || self.close_allowed
             || self.note_saving
+            || self.media_busy()
             || self.draft_discard.is_some()
             || self.note_content.read(cx).creating()
             || self.storage_busy
@@ -233,6 +264,7 @@ impl StudyApp {
     pub fn begin_discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.storage_busy
             || self.note_saving
+            || self.media_busy()
             || self.draft_loading
             || self.draft_discard.is_some()
         {
@@ -332,6 +364,7 @@ impl StudyApp {
             && !self.preferences_ui.reset_confirmation
             && self.draft_discard.is_none()
             && self.active_note_menu.is_none();
+        show &= !self.external_drop.active();
         if self.note_editor.is_none() {
             let version = self.snapshot.as_ref().and_then(|s| {
                 s.versions.iter().rev().find(|v| {
@@ -356,7 +389,25 @@ impl StudyApp {
                 });
             }
         }
-        self.note_content
-            .update(cx, |editor, cx| editor.set_visible(show, cx));
+        let can_edit = show
+            && self.note_editor.is_none()
+            && !self.history
+            && self.selected_version.is_none()
+            && !self.storage_busy
+            && !self.draft_loading
+            && !self.draft_failed
+            && self.recoverable_draft.is_none()
+            && self.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.notes.iter().any(|note| {
+                    Some(&note.id) == self.selected_note.as_ref()
+                        && note.managed
+                        && !note.detached
+                        && !note.missing
+                })
+            });
+        self.note_content.update(cx, |editor, cx| {
+            editor.set_can_request_edit(can_edit, cx);
+            editor.set_visible(show, cx);
+        });
     }
 }

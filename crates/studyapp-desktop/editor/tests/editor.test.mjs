@@ -5,6 +5,7 @@ import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import { parser as markdownParser } from "@lezer/markdown";
 import { normalizeBinding, resolveBindings, shortcutDefaults } from "../src/shortcuts.ts";
 
 const root = fileURLToPath(new URL("../dist/", import.meta.url));
@@ -78,6 +79,363 @@ function replayRawChanges(raw, messages, preferredEol) {
   }
   return raw;
 }
+
+test("contextual fence language input ranks completions and preserves metadata, CRLF and history", async () => {
+  const raw = "开头\r\n\r\n~~~~mystery  extra=yes \r\nconst answer = 42;\r\n~~~~\r\n\r\n```\r\nprint('hi')\r\n```";
+  const { page, errors } = await setup(raw);
+  const picker = page.getByRole("combobox", { name: "代码语言" });
+  assert.equal(await picker.count(), 0);
+  await select(page, raw.replaceAll("\r", "").indexOf("answer"));
+  assert.equal(await picker.count(), 1);
+  assert.equal(await picker.inputValue(), "mystery");
+  const original = await state(page);
+  await picker.fill("JaVa");
+  const options = page.getByRole("option");
+  assert.ok(await options.count() <= 5);
+  assert.equal(await options.first().textContent(), "java");
+  await picker.fill("JAVASCRIPT");
+  await picker.press("Enter");
+  const changed = await state(page);
+  assert.equal(changed.text, original.text.replace("mystery", "javascript"));
+  assert.equal(changed.text.slice(changed.selection.anchor - 6, changed.selection.anchor), original.text.slice(original.selection.anchor - 6, original.selection.anchor));
+  assert.equal(await page.locator(".cm-content").evaluate(el => el === document.activeElement), true);
+  const messages = await page.evaluate(() => window.messages.filter(m => m.type === "change"));
+  assert.equal(replayRawChanges(raw, messages, "\r\n"), raw.replace("mystery", "javascript"));
+  await page.keyboard.press("Control+z");
+  assert.equal((await state(page)).text, original.text);
+  await picker.fill("unsupported-language");
+  await picker.press("Enter");
+  assert.equal((await state(page)).text, original.text.replace("mystery", ""));
+  assert.equal(await picker.inputValue(), "");
+  await picker.fill("PY");
+  await picker.press("Tab");
+  assert.equal((await state(page)).text, original.text.replace("mystery", "py"));
+  await select(page, 0);
+  assert.equal(await picker.count(), 0);
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test("metadata only fences separate inserted languages while preserving whitespace CRLF and undo", async () => {
+  for (const gap of ["", "  "]) {
+    const raw = "```" + gap + "{.numberLines}\r\nconst answer = 42;\r\n```";
+    const original = raw.replaceAll("\r", "");
+    const { page, errors } = await setup(raw);
+    await select(page,original.indexOf("answer"));
+    const picker = page.getByRole("combobox", {name:"代码语言"});
+    assert.equal(await picker.inputValue(),"");
+    await picker.fill("javascript");
+    await picker.press("Enter");
+    const expected = "```javascript" + (gap || " ") + "{.numberLines}\nconst answer = 42;\n```";
+    assert.equal((await state(page)).text,expected);
+    assert.equal(await picker.inputValue(),"javascript");
+    assert.ok(await page.locator(".tok-keyword").count() > 0,"inserted language must be recognized by the code parser");
+    const messages = await page.evaluate(() => window.messages.filter(m => m.type === "change"));
+    assert.equal(replayRawChanges(raw,messages,"\r\n"),expected.replaceAll("\n","\r\n"));
+    await page.keyboard.press("Control+z");
+    assert.equal((await state(page)).text,original);
+    assert.deepEqual(errors,[]);
+    await page.close();
+  }
+});
+
+test("language draft cancellation and keys stay local, preserving code selection", async () => {
+  const text = "```js\nconst answer = 42;\n```";
+  const { page } = await setup(text);
+  await select(page, text.indexOf("answer"), text.indexOf("answer") + 6);
+  const picker = page.getByRole("combobox", { name: "代码语言" });
+  await picker.fill("python");
+  await picker.press("Control+s");
+  await picker.press("Escape");
+  assert.equal((await state(page)).text, text);
+  assert.deepEqual(await page.evaluate(() => window.messages.filter(m => ["save", "shortcut", "cancelResize"].includes(m.type))), []);
+  await picker.fill("ts");
+  await picker.press("Enter");
+  const snapshot = await state(page);
+  assert.equal(snapshot.text.slice(snapshot.selection.anchor, snapshot.selection.head), "answer");
+  await page.keyboard.press("Control+s");
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "save").length), 1);
+  await page.close();
+});
+
+test("headings replace levels and paragraph clears them through configurable shortcuts", async () => {
+  const { page } = await setup("## Title\n\n- [ ] item");
+  await select(page, 5);
+  await page.keyboard.press("Control+6");
+  assert.match((await state(page)).text, /^###### Title/);
+  await page.keyboard.press("Control+0");
+  assert.match((await state(page)).text, /^Title/);
+  await shortcuts(page, { "editor.heading-1": "Ctrl+Alt+H" });
+  await page.keyboard.press("Control+1");
+  assert.match((await state(page)).text, /^Title/);
+  await page.keyboard.press("Control+Alt+h");
+  assert.match((await state(page)).text, /^# Title/);
+  await page.close();
+});
+
+function listDepth(text, content) {
+  let depth = 0;
+  for (let node = markdownParser.parse(text).resolveInner(text.indexOf(content), 1); node; node = node.parent) {
+    if (node.name === "ListItem") depth++;
+  }
+  return depth;
+}
+
+test("Markdown indentation uses ordered marker width and moves selected subtrees with CRLF history", async () => {
+  for (const marker of ["1.", "10."]) {
+    const raw = `${marker} parent\r\n2. child\r\n   - grandchild\r\n3. sibling\r\n4. end`;
+    const original = raw.replaceAll("\r", "");
+    const { page } = await setup(raw);
+    await select(page, original.indexOf("2. child"), original.indexOf("4. end"));
+    await page.keyboard.press("Tab");
+    const nested = (await state(page)).text;
+    assert.equal(listDepth(nested, "parent"), 1);
+    assert.equal(listDepth(nested, "child"), 2, `${marker} parent must contain child`);
+    assert.equal(listDepth(nested, "grandchild"), 3);
+    assert.equal(listDepth(nested, "sibling"), 2);
+    assert.equal(listDepth(nested, "end"), 1);
+    const messages = await page.evaluate(() => window.messages.filter(m => m.type === "change"));
+    assert.equal(replayRawChanges(raw, messages, "\r\n"), nested.replaceAll("\n", "\r\n"));
+    await page.keyboard.press("Shift+Tab");
+    assert.equal((await state(page)).text, original);
+    await page.keyboard.press("Control+z");
+    assert.equal((await state(page)).text, nested);
+    await page.keyboard.press("Control+z");
+    assert.equal((await state(page)).text, original);
+    await page.close();
+  }
+});
+
+test("configurable indentation shares Markdown nesting and readonly semantics with Tab", async () => {
+  const original = "10. parent\n2. child\n   - grandchild\n3. end";
+  const { page } = await setup(original);
+  await shortcuts(page, { "editor.indent-more": "Ctrl+Alt+I", "editor.indent-less": "Ctrl+Alt+O" });
+  await select(page, original.indexOf("child"));
+  await page.keyboard.press("Control+Alt+i");
+  const nested = (await state(page)).text;
+  assert.equal(listDepth(nested, "child"), 2);
+  assert.equal(listDepth(nested, "grandchild"), 3, "cursor indentation must move the item's subtree");
+  await page.keyboard.press("Control+Alt+o");
+  assert.equal((await state(page)).text, original);
+  await page.evaluate(() => window.studyappEditor.setReadonly(true));
+  const before = await state(page);
+  await page.keyboard.press("Control+Alt+i");
+  await page.keyboard.press("Tab");
+  assert.equal((await state(page)).text, before.text);
+  assert.equal((await state(page)).revision, before.revision);
+  await page.close();
+});
+
+test("Markdown indentation nests mixed list markers beneath their preceding ordered parent", async () => {
+  const original = "10. parent\n- [ ] child\n  - grandchild\n- end";
+  const { page } = await setup(original);
+  await select(page,original.indexOf("child"));
+  await page.keyboard.press("Tab");
+  const nested = (await state(page)).text;
+  assert.equal(listDepth(nested,"child"),2);
+  assert.equal(listDepth(nested,"grandchild"),3);
+  assert.equal(listDepth(nested,"end"),1);
+  await page.keyboard.press("Shift+Tab");
+  assert.equal((await state(page)).text,original);
+  await page.close();
+});
+
+test("fenced code remains readable for resolved dark and custom surfaces", async () => {
+  const { page } = await setup("```unknown\nplain text\n```\n\n```js\nconst answer = 'value'; // comment\n```\n\n```python\ndef f(x):\n    return 42\n```");
+  for (const theme of [
+    {mode:"dark",background:"#1D1F23",surface:"#272A30",text:"#EFF0F3",codeBackground:"#272A30",codeText:"#EFF0F3"},
+    {mode:"light",background:"#FFFFFF",surface:"#FFFFFF",text:"#24272D",codeBackground:"#FFFFFF",codeText:"#24272D"},
+    {mode:"dark",background:"#101010",surface:"#666666",text:"#FFFFFF",codeBackground:"#666666",codeText:"#FFFFFF"}
+  ]) {
+    await page.evaluate(theme => window.studyappEditor.setTheme(theme), theme);
+    const samples = await page.locator(".md-code-line").evaluateAll(lines => lines.flatMap(line => {
+      const background = getComputedStyle(line).backgroundColor;
+      return [line, ...line.querySelectorAll('[class*="tok-"]')].map(node => ({foreground:getComputedStyle(node).color, background}));
+    }));
+    assert.ok(samples.length > 10, "include plain code and highlighted language tokens");
+    const luminance = css => {
+      const channels = css.match(/\d+/g).slice(0,3).map(value => Number(value)/255).map(value => value <= .04045 ? value/12.92 : ((value+.055)/1.055)**2.4);
+      return channels[0]*.2126 + channels[1]*.7152 + channels[2]*.0722;
+    };
+    for (const sample of samples) {
+      const a = luminance(sample.foreground), b = luminance(sample.background);
+      assert.ok((Math.max(a,b)+.05)/(Math.min(a,b)+.05) >= 4.5, JSON.stringify({theme,sample}));
+    }
+  }
+  await page.close();
+});
+
+test("Tab nests ordered unordered task lists and code, selection and undo survive", async () => {
+  const text = "- first\n1. second\n- [ ] third";
+  const { page } = await setup(text);
+  await select(page, 0, text.length);
+  await page.keyboard.press("Tab");
+  assert.equal((await state(page)).text, "  - first\n  1. second\n  - [ ] third");
+  await page.keyboard.press("Shift+Tab");
+  assert.equal((await state(page)).text, text);
+  await page.keyboard.press("Control+z");
+  assert.equal((await state(page)).text, "  - first\n  1. second\n  - [ ] third");
+  await page.evaluate(() => window.studyappEditor.load({generation:42,text:"```js\nconst x = 1;\n```",readonly:false}));
+  await select(page, 6);
+  await page.keyboard.press("Tab");
+  assert.match((await state(page)).text, /\n  const/);
+  await page.close();
+});
+
+test("managed readonly body click requests UTF16 caret only and theme values are safe", async () => {
+  const { page } = await setup("Hello 😀 text");
+  await page.evaluate(() => window.studyappEditor.load({generation:77,text:"Hello 😀 text",readonly:true,canRequestEdit:true}));
+  await page.locator(".cm-line").click({position:{x:70,y:10}});
+  const request = await page.evaluate(() => window.messages.find(m => m.type === "requestEdit"));
+  assert.equal(request.generation, 77);
+  assert.ok(Number.isInteger(request.position));
+  await page.evaluate(position => {window.studyappEditor.setReadonly(false);window.studyappEditor.restoreSelection(position);}, 8);
+  assert.equal((await state(page)).selection.anchor, 8);
+  await page.evaluate(() => window.studyappEditor.setTheme({mode:"dark",background:"#1b2026",surface:"#252b33",text:"#edf1f5",muted:"#a1adba",border:"#3c4652",accent:"#78c9c2",selection:"#365854",codeBackground:"#242d36",fontSize:17,spacing:1.8}));
+  assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--editor-background").trim()), "#1b2026");
+  await page.evaluate(() => window.studyappEditor.setTheme({background:"url(https://bad.test)",fontSize:999}));
+  assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--editor-background").trim()), "#1b2026");
+  await page.screenshot({path:fileURLToPath(new URL("../test-results/adaptive-dark.png",import.meta.url))});
+  await page.evaluate(() => window.studyappEditor.load({generation:78,text:"Hello",readonly:true}));
+  await page.locator(".cm-line").click();
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "requestEdit").length), 1);
+  await page.close();
+});
+
+test("readonly renders Markdown at the initial caret while editing reveals its markers", async () => {
+  const text = "# Title\n\n**bold**\n\n- item\n\n- [ ] task";
+  const { page, errors } = await setup(text);
+  assert.match(await page.locator(".md-heading").innerText(),/^# Title$/);
+  await page.evaluate(() => window.studyappEditor.setReadonly(true));
+  assert.equal(await page.locator(".md-heading").innerText(),"Title");
+  assert.equal(await page.locator(".md-strong").innerText(),"bold");
+  assert.equal(await page.locator(".md-task").count(),1);
+  assert.equal(await page.locator(".md-task").isDisabled(),true);
+  assert.ok(!(await page.locator(".cm-content").innerText()).includes("- item"));
+  assert.equal((await state(page)).text,text);
+  assert.equal((await state(page)).revision,0);
+  await page.evaluate(() => window.studyappEditor.setReadonly(false));
+  assert.match(await page.locator(".md-heading").innerText(),/^# Title$/);
+  assert.deepEqual(errors,[]);
+  await page.close();
+});
+
+test("readonly renders the first image at the initial caret without changing Markdown", async () => {
+  const text = "![first](assets/pixel.png)\n\n![missing](assets/missing.png)";
+  const { page, errors, externalRequests } = await setup(text);
+  const pixel = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==";
+  await page.evaluate(pixel => {
+    window.studyappEditor.setImages({generation:41,images:{"assets/pixel.png":pixel}});
+    window.studyappEditor.setReadonly(true);
+  }, pixel);
+  assert.equal(await page.locator("img.md-image").count(),1);
+  await page.waitForFunction(() => document.querySelector("img.md-image")?.naturalWidth === 1);
+  assert.equal(await page.locator(".md-image-placeholder").count(),1);
+  assert.equal((await state(page)).text,text);
+  assert.equal((await state(page)).selection.anchor,0);
+  assert.deepEqual(errors,[]);
+  assert.deepEqual(externalRequests,[]);
+  await page.close();
+});
+
+test("line wrapped inline and reference images render with bounded missing placeholders", async () => {
+  const text = "![line\nwrapped](assets/pixel.png)\n\n![ref alt][my\n photo]\n\n![inline](\nassets/pixel.png\n)\n\n![" + "missing ".repeat(300) + "](assets/missing.png)\n\n[my photo]: assets/pixel.png\n\nend";
+  const { page, errors, externalRequests } = await setup(text);
+  const pixel = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==";
+  await select(page,text.indexOf("\n\n") + 1);
+  await page.evaluate(pixel => window.studyappEditor.setImages({generation:41,images:{"assets/pixel.png":pixel}}),pixel);
+  assert.equal(await page.locator("img.md-image").count(),3);
+  assert.equal(await page.locator(".md-image-placeholder").count(),1);
+  const bounds = await page.locator(".md-image-placeholder").evaluate(node => ({width:node.getBoundingClientRect().width,height:node.getBoundingClientRect().height,parent:node.parentElement.getBoundingClientRect().width}));
+  assert.ok(bounds.width <= bounds.parent && bounds.height <= 160,JSON.stringify(bounds));
+  assert.equal((await state(page)).text,text);
+  assert.equal((await state(page)).revision,0);
+  assert.deepEqual(errors,[]);
+  assert.deepEqual(externalRequests,[]);
+  await page.close();
+});
+
+test("managed image map renders only validated data and insertion preserves Markdown", async () => {
+  const text = "![pixel](assets/pixel.png)\n\n![blocked](file:///C:/private.png)\n\nend";
+  const { page, externalRequests } = await setup(text);
+  await select(page, text.length);
+  const pixel = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==";
+  await page.evaluate(pixel => window.studyappEditor.setImages({generation:41,images:{"assets/pixel.png":pixel,"file:///C:/private.png":"file:///C:/private.png"}}),pixel);
+  assert.equal(await page.locator("img.md-image").count(), 1);
+  assert.equal(await page.locator("img.md-image").getAttribute("alt"), "pixel");
+  await page.evaluate(() => window.studyappEditor.setImages({generation:40,images:{}}));
+  assert.equal(await page.locator("img.md-image").count(), 1);
+  await page.evaluate(() => window.studyappEditor.insertText("\n![new](assets/new.png)"));
+  assert.ok((await state(page)).text.endsWith("\n![new](assets/new.png)"));
+  await page.evaluate(() => window.studyappEditor.command("undo"));
+  assert.equal((await state(page)).text, text);
+  await page.evaluate(() => window.studyappEditor.setReadonly(true));
+  await page.evaluate(() => window.studyappEditor.insertText("forbidden"));
+  assert.equal((await state(page)).text, text);
+  assert.deepEqual(externalRequests, []);
+  await page.close();
+});
+
+test("full collapsed shortcut image references resolve only allowed destinations outside code", async () => {
+  const text = "![Full alt][PHOTO]\n\n![photo][]\n\n![photo]\n\n![missing][unknown]\n\n`![inline code][photo]`\n\n```md\n![fenced code][photo]\n[unknown]: assets/pixel.png\n```\n\n[photo]: <assets/pixel.png> \"title\"\n\nend";
+  const { page, errors, externalRequests } = await setup(text);
+  const pixel = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==";
+  await select(page,text.length);
+  await page.evaluate(pixel => window.studyappEditor.setImages({generation:41,images:{"assets/pixel.png":pixel}}),pixel);
+  assert.equal(await page.locator("img.md-image").count(),3);
+  assert.deepEqual(await page.locator("img.md-image").evaluateAll(images => images.map(image => image.alt)),["Full alt","photo","photo"]);
+  assert.equal(await page.locator(".md-image-placeholder").count(),1);
+  assert.match(await page.locator(".md-image-placeholder").textContent(),/missing/);
+  assert.equal((await state(page)).text,text);
+  await page.evaluate(() => window.studyappEditor.setTheme(null));
+  assert.equal((await state(page)).text,text);
+  await page.evaluate(() => window.studyappEditor.load({generation:42,text:"loaded",readonly:false}));
+  assert.equal((await state(page)).text,"loaded");
+  assert.deepEqual(errors,[]);
+  assert.deepEqual(externalRequests,[]);
+  await page.close();
+});
+
+test("reference images honor first definitions, normalized labels and escaped destinations", async () => {
+  const text = "![label alt][ My   Photo ]\n\n[my photo]: assets/pixel&amp;one.png\n[my photo]: assets/duplicate.png\n\nend";
+  const {page} = await setup(text);
+  await select(page,text.length);
+  const pixel = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==";
+  await page.evaluate(pixel => window.studyappEditor.setImages({generation:41,images:{"assets/pixel&one.png":pixel}}),pixel);
+  assert.equal(await page.locator("img.md-image").count(),1);
+  assert.equal((await state(page)).text,text);
+  await page.close();
+});
+
+test("new heading defaults migrate around existing custom digit bindings", () => {
+  const resolved = resolveBindings({"editor.bold":"Ctrl+1"});
+  assert.equal(resolved["editor.bold"],"Ctrl+1");
+  assert.equal(resolved["editor.heading-1"],"");
+  assert.equal(resolved["editor.heading-2"],"Ctrl+2");
+  assert.throws(() => resolveBindings({"editor.bold":"Ctrl+1","editor.heading-1":"Ctrl+1"}));
+});
+
+test("adaptive light dark and contextual language screenshots keep controls inside the viewport", async () => {
+  const text = "# 研究笔记\n\n今天整理 Markdown 编辑体验。\n\n- 资料整理\n  - [ ] 检查引用\n\n```typescript\nconst answer: number = 42;\nconsole.log(answer);\n```\n\n继续记录。";
+  const {page, errors} = await setup(text);
+  await select(page,text.indexOf("answer"));
+  const picker = page.getByRole("combobox",{name:"代码语言"});
+  await picker.fill("s");
+  assert.equal(await page.getByRole("option").count(),5);
+  const bounds = await picker.boundingBox();
+  assert.ok(bounds.y > 200 && bounds.x + bounds.width <= 1100);
+  await page.screenshot({path:fileURLToPath(new URL("../test-results/adaptive-light-language.png",import.meta.url))});
+  await picker.press("Escape");
+  await page.evaluate(() => window.studyappEditor.setTheme({mode:"dark",background:"#1b2026",surface:"#252b33",text:"#edf1f5",muted:"#a1adba",border:"#3c4652",accent:"#78c9c2",selection:"#365854",codeBackground:"#242d36"}));
+  await page.getByRole("button",{name:"格式菜单"}).click();
+  await page.screenshot({path:fileURLToPath(new URL("../test-results/adaptive-dark-menu.png",import.meta.url))});
+  await page.getByRole("button",{name:"格式菜单"}).click();
+  await select(page,text.indexOf("资料"));
+  await page.keyboard.press("Tab");
+  await page.screenshot({path:fileURLToPath(new URL("../test-results/adaptive-list-caret.png",import.meta.url))});
+  assert.deepEqual(errors,[]);
+  await page.close();
+});
 
 test("shortcut registry matches the native allowlist and validation rejects conflicts and platform keys", async () => {
   const native = await readFile(new URL("../../src/shortcuts.rs", import.meta.url), "utf8");
@@ -480,7 +838,8 @@ test("keyboard selection crosses paragraphs and prefix patches use the pre-trans
   await page.keyboard.press("Control+Shift+End");
   const selected = (await state(page)).selection;
   assert.deepEqual(selected, { anchor: 0, head: 15 });
-  await page.getByRole("button", { name: "列表", exact: true }).click();
+  await page.getByRole("button", { name: "格式菜单" }).click();
+  await page.getByRole("menuitem", { name: "列表", exact: true }).click();
   assert.equal((await state(page)).text, "- one\n- \n- two\n- \n- three");
   const change = await page.evaluate(() => window.messages.filter(m => m.type === "change").at(-1));
   assert.equal(change.changes.length, 5);
@@ -562,7 +921,7 @@ test("readonly, save key, and production test isolation", async () => {
   await page.keyboard.insertText("blocked");
   assert.equal((await state(page)).text, "readonly");
   await page.keyboard.press("Control+s");
-  assert.ok(await page.evaluate(() => window.messages.some(m => m.type === "save" && m.generation === 41)));
+  assert.equal(await page.evaluate(() => window.messages.some(m => m.type === "save")), false);
   await page.close();
   const production = await setup("secure", false);
   assert.equal(await production.page.evaluate(() => typeof window.studyappEditor.test), "undefined");

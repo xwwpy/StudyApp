@@ -1,8 +1,6 @@
-use crate::controls::Button;
 use crate::{app::StudyApp, components::*};
 use gpui_kit::{
     base::{Dialog, DialogPopup},
-    component::{Sizable, button::ButtonVariants},
     *,
 };
 
@@ -84,9 +82,9 @@ pub fn modal_shell(
                 .rounded_xl()
                 .shadow_lg()
                 .border_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(0xFFFFFF))
-                .text_color(rgb(INK))
+                .border_color(crate::theme::color(BORDER))
+                .bg(crate::theme::color(0xFFFFFF))
+                .text_color(crate::theme::color(INK))
                 .child(
                     div()
                         .id("modal-content-scroll")
@@ -100,52 +98,18 @@ pub fn modal_shell(
 }
 
 impl StudyApp {
-    /// The caller places this bounded surface in the reserved header slot, so
-    /// the native editor keeps its viewport and focus while results arrive.
-    pub fn floating_notice_view(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let notice = self.notice.as_ref()?;
-        let (message, background, accent) = match notice {
-            Ok(message) => (message, LIGHT, GREEN),
-            Err(message) => (message, 0xFFF0EA, 0xA34829),
-        };
-        Some(
-            row()
-                .gap_3()
-                .p_3()
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(background))
-                .shadow_md()
-                .min_w_0()
-                .child(div().text_color(rgb(accent)).child(if notice.is_ok() {
-                    "✓"
-                } else {
-                    "!"
-                }))
-                .child(
-                    div()
-                        .id("notice-message-scroll")
-                        .test_support()
-                        .flex_1()
-                        .min_w_0()
-                        .max_h(px(40.))
-                        .overflow_y_scroll()
-                        .text_sm()
-                        .child(message.clone())
-                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation()),
-                )
-                .child(
-                    Button::new("dismiss-notice")
-                        .small()
-                        .ghost()
-                        .label("关闭")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.notice = None;
-                            cx.notify();
-                        })),
-                ),
-        )
+    pub fn push_notice(&mut self, message: Result<String, String>, cx: &mut Context<Self>) {
+        // Retain the latest outcome for diagnostic assertions; event delivery
+        // goes to the queue, never through text equality or render timing.
+        self.notice = Some(message.clone());
+        self.notifications
+            .update(cx, |center, cx| center.push(message, cx));
+    }
+
+    #[cfg(feature = "ui-test")]
+    pub fn clear_notices(&mut self, cx: &mut Context<Self>) {
+        self.notice = None;
+        self.notifications.update(cx, |center, cx| center.clear(cx));
     }
 }
 

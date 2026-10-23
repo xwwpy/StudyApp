@@ -40,6 +40,7 @@ impl StudyApp {
     pub fn storage_work(&mut self, work: Work, cx: &mut Context<Self>) {
         let migrating = matches!(&work, Work::MigrateLibrary(_));
         if self.storage_busy
+            || self.media_jobs_active()
             || self.note_saving
             || self.draft_discard.is_some()
             || self.draft_persist.is_some()
@@ -74,12 +75,16 @@ impl StudyApp {
                 self.sync_panel
                     .update(cx, |panel, cx| panel.set_editing_locked(false, cx));
             }
-            self.notice = Some(Err("后台服务已停止，请重新启动应用".into()));
+            self.push_notice(Err("后台服务已停止，请重新启动应用".into()), cx);
         }
         cx.notify();
     }
 
     pub fn choose_storage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.media_jobs_active() {
+            self.push_notice(Err("正在处理图片，请稍候再迁移资料库。".into()), cx);
+            return;
+        }
         if self.guard_settings(crate::settings_ui::SettingsContinuation::Migrate, cx) {
             return;
         }
@@ -92,7 +97,7 @@ impl StudyApp {
             return;
         }
         if self.draft_failed {
-            self.notice = Some(Err("请先重试草稿保存，再迁移资料库。".into()));
+            self.push_notice(Err("请先重试草稿保存，再迁移资料库。".into()), cx);
             cx.notify();
         } else if self.note_editor.is_some() {
             self.request_note_action(NoteIntent::PrepareMigration, window, cx);
@@ -177,7 +182,7 @@ impl StudyApp {
                         let path_id = SharedString::from(format!("storage-copy-path-{id}"));
                         let in_draft = self.note_editor.as_ref().or(self.recoverable_draft.as_ref())
                             .is_some_and(|d| d.note_id.as_ref() == Some(&id));
-                        column().gap_2().p_3().rounded_lg().bg(rgb(BG))
+                        column().gap_2().p_3().rounded_lg().bg(crate::theme::color(BG))
                             .child(row().child(div().flex_1().min_w_0().truncate().child(copy.title.clone()))
                                 .child(muted(size_label(copy.bytes)).flex_shrink_0())
                                 .child(Button::new(SharedString::from(format!("copy-history-{id}")))
@@ -239,9 +244,10 @@ impl StudyApp {
             return;
         };
         if !self.copy_confirmation_allowed(&note_id, cx) {
-            self.notice = Some(Err(
-                "这份副本当前无法删除，请等待任务结束后重新统计空间。".into()
-            ));
+            self.push_notice(
+                Err("这份副本当前无法删除，请等待任务结束后重新统计空间。".into()),
+                cx,
+            );
             cx.notify();
             return;
         }

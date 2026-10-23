@@ -571,3 +571,72 @@ fn folder_replace_never_overwrites_a_file_created_during_publication() {
     assert!(retained.iter().any(|text| text == "original"));
     assert!(retained.iter().any(|text| text == "incoming"));
 }
+#[test]
+fn binary_assets_are_immutable_bounded_and_separate_from_note_listing() {
+    let root = tempfile::tempdir().unwrap().keep();
+    let provider = LocalFolderProvider::new(&root).unwrap();
+    let key = "assets/123e4567-e89b-42d3-a456-426614174000/20261023-title-abc.png";
+    provider.write_asset(key, b"first").unwrap();
+    assert_eq!(provider.read_asset(key).unwrap().unwrap(), b"first");
+    assert!(provider.write_asset(key, b"second").is_err());
+    assert!(provider.write_asset("assets/../bad.png", b"bad").is_err());
+    assert!(
+        provider
+            .write_asset(key, &vec![0; MAX_CONTENT_BYTES + 1])
+            .is_err()
+    );
+    assert!(provider.list().unwrap().is_empty());
+}
+
+#[test]
+fn webdav_asset_upload_is_create_only_and_uses_separate_collection() {
+    let key = format!("assets/{ID}/20261023-title-abc.png");
+    let (url, server) = fixture(vec![
+        (201, vec![], String::new()),
+        (201, vec![], String::new()),
+        (201, vec![], String::new()),
+        (201, vec![], String::new()),
+        (201, vec![], String::new()),
+        (200, vec![], "binary bytes".into()),
+    ]);
+    let provider = WebDavProvider::for_loopback_test(&url, "alice", "secret").unwrap();
+    provider.write_asset(&key, b"binary bytes").unwrap();
+    assert_eq!(provider.read_asset(&key).unwrap().unwrap(), b"binary bytes");
+    let requests = server.join().unwrap();
+    let put = &requests[4];
+    assert!(put.starts_with(&format!("PUT /dav/StudyApp/{key} ")));
+    assert!(put.to_lowercase().contains("if-none-match: *"));
+    assert!(!put.contains("/notes/"));
+}
+
+#[test]
+fn webdav_asset_conflicts_redirects_and_lengths_never_overwrite_or_follow() {
+    let key = format!("assets/{ID}/20261023-title-abc.png");
+    let (url, server) = fixture(vec![
+        (201, vec![], String::new()),
+        (201, vec![], String::new()),
+        (201, vec![], String::new()),
+        (201, vec![], String::new()),
+        (412, vec![], String::new()),
+        (
+            302,
+            vec![("Location", "https://evil.invalid/".into())],
+            String::new(),
+        ),
+        (200, vec![], "x".repeat(MAX_CONTENT_BYTES + 1)),
+    ]);
+    let provider = WebDavProvider::for_loopback_test(&url, "alice", "secret").unwrap();
+    assert!(matches!(
+        provider.write_asset(&key, b"immutable"),
+        Err(SyncError::Conflict)
+    ));
+    assert!(matches!(
+        provider.read_asset(&key),
+        Err(SyncError::Http(302))
+    ));
+    assert!(matches!(
+        provider.read_asset(&key),
+        Err(SyncError::LimitExceeded)
+    ));
+    assert_eq!(server.join().unwrap().len(), 7);
+}

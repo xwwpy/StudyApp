@@ -1,22 +1,29 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod appearance_ui;
 mod assets;
 mod components;
 mod controls;
 mod credentials;
 mod drafts;
 mod editor_lifecycle;
+mod external_drop;
+mod external_drop_ui;
 mod feedback;
 mod folders_ui;
 mod history_preview;
 mod imports;
 mod markdown_editor;
+mod media;
+mod media_ui;
 mod native_shortcuts;
 mod note_actions;
 mod note_commands;
 mod note_editor;
 mod notes_view;
+mod notice_queue;
+mod notifications;
 mod preferences;
 mod resize_overlay;
 mod settings_ui;
@@ -29,6 +36,8 @@ mod smoke_interactions;
 #[cfg(all(windows, feature = "ui-test"))]
 mod smoke_library;
 #[cfg(all(windows, feature = "ui-test"))]
+mod smoke_settings;
+#[cfg(all(windows, feature = "ui-test"))]
 mod smoke_visibility;
 #[cfg(all(windows, feature = "ui-test"))]
 mod smoke_workspace;
@@ -36,6 +45,7 @@ mod storage_backend;
 mod storage_ui;
 mod sync_runtime;
 mod sync_ui;
+mod theme;
 mod views;
 #[cfg(windows)]
 mod web_editor_host;

@@ -39,7 +39,7 @@ impl HistoryPreview {
             .min_h_0()
             .min_w_0()
             .overflow_hidden()
-            .bg(rgb(BG))
+            .bg(crate::theme::color(BG))
             .rounded_lg()
             .child(
                 uniform_list("history-diff-scroll", rows.len(), move |range, _, _| {
@@ -59,7 +59,7 @@ impl HistoryPreview {
                                 .font_family("Consolas")
                                 .text_size(px(12.))
                                 .line_height(px(22.))
-                                .text_color(rgb(color))
+                                .text_color(crate::theme::color(color))
                                 .whitespace_nowrap()
                                 .child(text.clone())
                         })

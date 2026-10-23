@@ -2,6 +2,94 @@ import { EditorSelection, Transaction, ChangeSpec } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { undo, redo, isolateHistory } from "@codemirror/commands";
 import { syntaxTree } from "@codemirror/language";
+import type { SyntaxNode } from "@lezer/common";
+
+export function indentMarkdown(view: EditorView, outdent = false): boolean {
+  if (view.state.readOnly) return false;
+  const { state } = view;
+  const lines = new Set<number>();
+  for (const range of state.selection.ranges) {
+    const end = state.doc.lineAt(range.to > range.from ? range.to - 1 : range.to).number;
+    for (let n = state.doc.lineAt(range.from).number; n <= end; n++) lines.add(n);
+  }
+  const tree = syntaxTree(state);
+  const items = new Map<number, SyntaxNode>();
+  for (const number of lines) {
+    const line = state.doc.line(number);
+    for (let node: SyntaxNode | null = tree.resolveInner(line.from + /^\s*/.exec(line.text)![0].length, 1); node; node = node.parent) {
+      if (node.name === "FencedCode" || node.name === "CodeBlock") break;
+      if (node.name === "ListItem") { items.set(node.from, node); break; }
+    }
+  }
+  // An item carries all its continuation lines and child lists. Selecting a
+  // parent and child must move that subtree once, preserving its internal depth.
+  const roots = [...items.values()].filter(item => {
+    for (let parent = item.parent; parent; parent = parent.parent) if (items.has(parent.from) && parent.name === "ListItem") return false;
+    return true;
+  });
+  const whitespace = (number: number) => /^[ \t]*/.exec(state.doc.line(number).text)![0];
+  const columns = (text: string) => [...text].reduce((width, char) => char === "\t" ? width + 4 - width % 4 : width + 1, 0);
+  const indentation = (item: SyntaxNode) => columns(whitespace(state.doc.lineAt(item.from).number));
+  const previousItem = (item: SyntaxNode) => {
+    if (item.prevSibling?.name === "ListItem") return item.prevSibling;
+    const previousList = item.parent?.prevSibling;
+    return previousList && /^(?:Ordered|Bullet)List$/.test(previousList.name) ? previousList.lastChild : null;
+  };
+  const shifts = new Map<number, number>();
+  for (const item of roots) {
+    const current = indentation(item);
+    let delta = outdent ? -Math.min(2, current) : 2;
+    if (outdent) {
+      let parent = item.parent?.parent;
+      while (parent && parent.name !== "ListItem") parent = parent.parent;
+      if (parent) delta = indentation(parent) - current;
+    } else {
+      let previous = previousItem(item);
+      while (previous && items.has(previous.from)) previous = previousItem(previous);
+      if (previous?.name === "ListItem") {
+        const parentLine = state.doc.lineAt(previous.from);
+        const prefix = /^[ \t]*(?:[-+*]|\d+[.)])[ \t]+/.exec(parentLine.text);
+        if (prefix) delta = columns(prefix[0]) - current;
+      }
+    }
+    const first = state.doc.lineAt(item.from).number;
+    const last = state.doc.lineAt(Math.max(item.from, item.to - 1)).number;
+    for (let number = first; number <= last; number++) shifts.set(number, delta);
+  }
+  for (const number of lines) if (!shifts.has(number)) {
+    shifts.set(number, outdent ? -Math.min(2, columns(whitespace(number))) : 2);
+  }
+  const edits: ChangeSpec[] = [];
+  for (const [number, delta] of [...shifts].sort(([a], [b]) => a - b)) {
+    const line = state.doc.line(number);
+    const prefix = whitespace(number);
+    if (delta > 0) edits.push({from: line.from, insert: " ".repeat(delta)});
+    else if (delta < 0) {
+      const remaining = Math.max(0, columns(prefix) + delta);
+      edits.push({from: line.from, to: line.from + prefix.length, insert: " ".repeat(remaining)});
+    }
+  }
+  const changes = state.changes(edits);
+  view.dispatch({ changes, selection: state.selection.map(changes), annotations: [Transaction.userEvent.of("input.indent"), isolateHistory.of("full")], scrollIntoView: true });
+  return true;
+}
+
+function setHeading(view: EditorView, level: number): boolean {
+  const { state } = view;
+  const lines = new Set<number>();
+  for (const range of state.selection.ranges) {
+    const last = state.doc.lineAt(range.to > range.from ? range.to - 1 : range.to).number;
+    for (let n = state.doc.lineAt(range.from).number; n <= last; n++) lines.add(n);
+  }
+  const edits = [...lines].map(n => {
+    const line = state.doc.line(n);
+    const match = /^([ \t]*)(?:#{1,6}(?:[ \t]+|$))?/.exec(line.text)!;
+    return { from: line.from + match[1].length, to: line.from + match[0].length, insert: level ? "#".repeat(level) + " " : "" };
+  });
+  const changes = state.changes(edits);
+  view.dispatch({ changes, selection: state.selection.map(changes), annotations: [Transaction.userEvent.of("input.format"), isolateHistory.of("full")], scrollIntoView: true });
+  return true;
+}
 
 function surround(view: EditorView, delimiter: string): boolean {
   const { state } = view;
@@ -128,6 +216,9 @@ export function formatCommand(view: EditorView, name: string): boolean {
   if (name === "italic") return surround(view, "*");
   if (name === "code") return surround(view, "`");
   if (name === "strike") return surround(view, "~~");
+  if (/^heading-[1-6]$/.test(name)) return setHeading(view, Number(name.at(-1)));
+  if (name === "paragraph") return setHeading(view, 0);
+  if (name === "ordered") return prefixLines(view, "1. ");
   if (name === "heading") return prefixLines(view, "## ");
   if (name === "bullet") return prefixLines(view, "- ");
   if (name === "task") return prefixLines(view, "- [ ] ");

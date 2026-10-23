@@ -1,6 +1,142 @@
-import { Range, Transaction } from "@codemirror/state";
+import { Range, StateEffect, Text, Transaction } from "@codemirror/state";
 import { syntaxTree } from "@codemirror/language";
+import { markdownLanguage } from "@codemirror/lang-markdown";
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate, WidgetType } from "@codemirror/view";
+import { completeFenceLanguage, normalizeFenceLanguage } from "./languages";
+import { isolateHistory } from "@codemirror/commands";
+
+export const imageMapChanged = StateEffect.define<void>();
+let resolvedImages: ReadonlyMap<string, string> = new Map();
+export function updateImages(images: Record<string, unknown>): void {
+  const next = new Map<string,string>();
+  let total = 0;
+  for (const [destination,value] of Object.entries(images)) {
+    if (destination.length > 4096 || typeof value !== "string" || value.length > 14*1024*1024) continue;
+    if (!/^data:image\/(?:png|jpeg|gif|webp|bmp);base64,[A-Za-z0-9+/]+={0,2}$/.test(value)) continue;
+    const encoded = value.slice(value.indexOf(",")+1);
+    const bytes = encoded.length*3/4 - (encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0);
+    if (bytes > 10*1024*1024 || total+bytes > 64*1024*1024) continue;
+    total += bytes; next.set(destination,value);
+  }
+  resolvedImages = next;
+}
+class ImageWidget extends WidgetType {
+  constructor(readonly source:string,readonly alt:string) { super(); }
+  eq(other:ImageWidget) { return this.source === other.source && this.alt === other.alt; }
+  toDOM() {
+    const image = document.createElement("img");
+    image.className = "md-image"; image.src = this.source; image.alt = this.alt;
+    image.draggable = false;
+    return image;
+  }
+  ignoreEvent() { return false; }
+}
+
+class MissingImageWidget extends WidgetType {
+  constructor(readonly alt:string) { super(); }
+  eq(other:MissingImageWidget) { return this.alt === other.alt; }
+  toDOM() {
+    const placeholder = document.createElement("span");
+    placeholder.className = "md-image-placeholder";
+    placeholder.setAttribute("role","img");
+    placeholder.setAttribute("aria-label",`图片未找到：${this.alt || "图片"}`);
+    placeholder.title = "图片未找到，选中后可编辑 Markdown 引用";
+    placeholder.textContent = `▧ ${this.alt || "图片未找到"}`;
+    return placeholder;
+  }
+  ignoreEvent() { return false; }
+}
+
+function decodeMarkdown(value:string):string {
+  // Character references are inert text; angle brackets are never parsed as HTML.
+  const decoder = document.createElement("textarea");
+  decoder.innerHTML = value.replaceAll("<","&lt;").replaceAll(">","&gt;");
+  return decoder.value.replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\]\\^_`{|}~])/g,"$1");
+}
+function referenceLabel(value:string):string {
+  return decodeMarkdown(value).trim().replace(/\s+/g," ").toUpperCase();
+}
+
+class LanguageWidget extends WidgetType {
+  constructor(readonly from: number, readonly to: number, readonly token: string) { super(); }
+  eq(other: LanguageWidget) { return this.from === other.from && this.to === other.to && this.token === other.token; }
+  toDOM(view: EditorView) {
+    const wrapper = document.createElement("span");
+    wrapper.className = "md-language-control";
+    const input = document.createElement("input");
+    input.className = "md-language-picker";
+    input.dataset.languageFrom = String(this.from);
+    input.setAttribute("role", "combobox");
+    input.setAttribute("aria-label", "代码语言");
+    input.setAttribute("aria-autocomplete", "list");
+    input.setAttribute("aria-expanded", "false");
+    input.placeholder = "纯文本";
+    input.value = this.token === "text" ? "" : this.token;
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    const list = document.createElement("span");
+    list.className = "md-language-completions";
+    list.setAttribute("role", "listbox");
+    list.id = `language-options-${this.from}`;
+    input.setAttribute("aria-controls", list.id);
+    let choices: string[] = [], selected = -1, dirty = false, finished = false;
+    const show = () => {
+      choices = completeFenceLanguage(input.value);
+      selected = -1;
+      list.replaceChildren();
+      for (const [index, choice] of choices.entries()) {
+        const option = document.createElement("span");
+        option.setAttribute("role", "option");
+        option.id = `${list.id}-${index}`;
+        option.textContent = choice;
+        option.addEventListener("mousedown", event => { event.preventDefault(); input.value = choice; dirty = true; commit(true); });
+        list.append(option);
+      }
+      list.hidden = choices.length === 0;
+      input.setAttribute("aria-expanded", String(choices.length > 0));
+    };
+    const commit = (focus: boolean) => {
+      if (finished) return;
+      finished = true;
+      list.hidden = true;
+      input.setAttribute("aria-expanded", "false");
+      if (dirty && !view.state.readOnly && view.state.sliceDoc(this.from, this.to) === this.token) {
+        const value = normalizeFenceLanguage(input.value);
+        const adjacentMetadata = value && this.from === this.to && /\S/.test(view.state.sliceDoc(this.to,this.to+1));
+        const changes = view.state.changes({ from: this.from, to: this.to, insert: value + (adjacentMetadata ? " " : "") });
+        view.dispatch({ changes, selection: view.state.selection.map(changes), annotations: [Transaction.userEvent.of("input.language"), isolateHistory.of("full")] });
+      }
+      if (focus) view.focus();
+    };
+    input.addEventListener("focus", () => { finished = false; dirty = false; });
+    input.addEventListener("input", () => { dirty = true; show(); });
+    input.addEventListener("blur", () => commit(false));
+    input.addEventListener("keydown", event => {
+      event.stopPropagation();
+      if (event.isComposing || event.keyCode === 229) return;
+      if (event.key === "Escape") {
+        event.preventDefault(); finished = true; list.hidden = true;
+        input.value = this.token === "text" ? "" : this.token;
+        input.setAttribute("aria-expanded", "false"); view.focus();
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        if (selected >= 0) { input.value = choices[selected]; dirty = true; }
+        commit(true);
+      } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        if (!choices.length) show();
+        if (!choices.length) return;
+        selected = (selected + (event.key === "ArrowDown" ? 1 : -1) + choices.length) % choices.length;
+        for (const [index, option] of [...list.children].entries()) option.setAttribute("aria-selected", String(index === selected));
+        input.setAttribute("aria-activedescendant", `${list.id}-${selected}`);
+      }
+    });
+    list.hidden = true;
+    wrapper.append(input, list);
+    return wrapper;
+  }
+  ignoreEvent() { return true; }
+}
 
 class BulletWidget extends WidgetType {
   eq() { return true; }
@@ -43,13 +179,15 @@ class TaskWidget extends WidgetType {
 export const renderedMarkdown = ViewPlugin.fromClass(class {
   decorations: DecorationSet;
   tree;
+  referenceDocument?: Text;
+  referenceDestinations?: Map<string,string>;
   constructor(view: EditorView) {
     this.tree = syntaxTree(view.state);
     this.decorations = this.build(view);
   }
   update(update: ViewUpdate) {
     const tree = syntaxTree(update.state);
-    if (update.docChanged || update.selectionSet || update.viewportChanged || tree !== this.tree ||
+    if (update.transactions.some(transaction => transaction.effects.some(effect => effect.is(imageMapChanged))) || update.docChanged || update.selectionSet || update.viewportChanged || tree !== this.tree ||
         update.startState.readOnly !== update.state.readOnly) {
       this.tree = tree;
       this.decorations = this.build(update.view);
@@ -60,7 +198,27 @@ export const renderedMarkdown = ViewPlugin.fromClass(class {
     const lines = new Set<string>();
     const seen = new Set<string>();
     const { state } = view;
-    const active = (from: number, to: number) => state.selection.ranges.some(range => range.from <= to && range.to >= from);
+    const references = () => {
+      if (this.referenceDocument !== state.doc) {
+        this.referenceDocument = state.doc;
+        this.referenceDestinations = undefined;
+      }
+      if (!this.referenceDestinations) {
+        this.referenceDestinations = new Map();
+        // Resolve distant definitions too. The full parse is lazy, cached per
+        // document and needed only when an actual reference image is visible.
+        const tree = this.tree.length === state.doc.length ? this.tree : markdownLanguage.parser.parse(state.doc.toString());
+        tree.iterate({enter: cursor => {
+          if (cursor.name !== "LinkReference") return;
+          const label = cursor.node.getChild("LinkLabel"), url = cursor.node.getChild("URL");
+          if (!label || !url) return;
+          const key = referenceLabel(state.sliceDoc(label.from+1,label.to-1));
+          if (!this.referenceDestinations!.has(key)) this.referenceDestinations!.set(key,decodeMarkdown(state.sliceDoc(url.from,url.to).replace(/^<|>$/g,"")));
+        }});
+      }
+      return this.referenceDestinations;
+    };
+    const active = (from: number, to: number) => !state.readOnly && state.selection.ranges.some(range => range.from <= to && range.to >= from);
     const mark = (from: number, to: number, className: string, attributes?: Record<string, string>) => {
       if (to > from) ranges.push(Decoration.mark({ class: className, attributes }).range(from, to));
     };
@@ -110,6 +268,21 @@ export const renderedMarkdown = ViewPlugin.fromClass(class {
             const first = state.doc.lineAt(Math.max(from, visible.from)).number;
             const last = state.doc.lineAt(Math.min(to, visible.to)).number;
             for (let i = first; i <= last; i++) line(state.doc.line(i).from, "md-code-line");
+            if (name === "FencedCode") {
+              const opening = state.doc.lineAt(from);
+              const fence = node.getChild("CodeMark");
+              if (fence && active(from, to) && !state.readOnly) {
+                const token = /^(\s*)(\S*)/.exec(state.sliceDoc(fence.to, opening.to))!;
+                let start = fence.to + token[1].length;
+                // Attribute metadata is never mistaken for a language after a
+                // language is cleared. Unknown plain language tags stay intact.
+                const metadata = /[={}\[\]"']/.test(token[2]);
+                const value = metadata ? "" : token[2];
+                if (metadata) start = fence.to;
+                const bottom = state.doc.lineAt(to).to;
+                ranges.push(Decoration.widget({ widget: new LanguageWidget(start, start + value.length, value), side: 1 }).range(bottom));
+              }
+            }
           } else if (name === "HeaderMark" && parent && !active(parent.from, parent.to)) {
             const end = state.doc.lineAt(to).to;
             hide(from, Math.min(end, to + (state.sliceDoc(to, to + 1) === " " ? 1 : 0)));
@@ -134,6 +307,23 @@ export const renderedMarkdown = ViewPlugin.fromClass(class {
             if (!active(current.from, current.to)) {
               ranges.push(Decoration.replace({ widget: new TaskWidget(from, /\[[xX]\]/.test(state.sliceDoc(from, to)), state.readOnly) }).range(from, to));
             }
+          } else if (name === "Image" && !active(from,to)) {
+            const url = node.getChild("URL");
+            const marks = node.getChildren("LinkMark");
+            const alt = marks.length >= 2 ? decodeMarkdown(state.sliceDoc(marks[0].to,marks[1].from)) : "";
+            const label = node.getChild("LinkLabel");
+            const key = label ? state.sliceDoc(label.from+1,label.to-1) || alt : alt;
+            const destination = url ? decodeMarkdown(state.sliceDoc(url.from,url.to).replace(/^<|>$/g,"")) : references().get(referenceLabel(key));
+            const source = destination ? resolvedImages.get(destination) : undefined;
+            if (state.doc.lineAt(from).number === state.doc.lineAt(to).number) {
+              ranges.push(Decoration.replace({widget:source ? new ImageWidget(source,alt) : new MissingImageWidget(alt)}).range(from,to));
+            } else {
+              // ViewPlugin replacements cannot span line breaks. Keep those
+              // breaks in the document and hide each source fragment separately.
+              ranges.push(Decoration.widget({widget:source ? new ImageWidget(source,alt) : new MissingImageWidget(alt),side:1}).range(from));
+              hide(from,to);
+            }
+            return false;
           } else if (name === "Link" || name === "Autolink") {
             const urlNode = node.getChild("URL");
             const url = urlNode ? state.sliceDoc(urlNode.from, urlNode.to) : "";

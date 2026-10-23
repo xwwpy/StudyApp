@@ -16,6 +16,47 @@ use studyapp_core::{Command, Note};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Exercise the compact library dropdown and its keyboard navigation. PopupMenu
+/// items deliberately have no app-owned button IDs; the chosen item is asserted
+/// by each caller's resulting application state.
+pub(crate) fn library_add(window: &mut Window, folder: bool, cx: &mut App) {
+    window.click("library-add-menu", cx);
+    window.press("down", cx);
+    if folder {
+        window.press("down", cx);
+    }
+    window.press("enter", cx);
+}
+
+pub(crate) fn editor_action(
+    window: &mut Window,
+    view: &Entity<StudyApp>,
+    discard: bool,
+    cx: &mut App,
+) {
+    let has_copy = view
+        .read(cx)
+        .note_editor
+        .as_ref()
+        .unwrap()
+        .note_id
+        .is_some();
+    window.click("note-editor-menu", cx);
+    for _ in 0..1 + usize::from(has_copy) + usize::from(discard) {
+        window.press("down", cx);
+    }
+    window.press("enter", cx);
+}
+
+/// The reader's compact menu orders Export, Move, Unmanage, then Relink.
+pub(crate) fn reader_action(window: &mut Window, index: usize, cx: &mut App) {
+    window.click("note-more-menu", cx);
+    for _ in 0..=index {
+        window.press("down", cx);
+    }
+    window.press("enter", cx);
+}
+
 async fn pause(cx: &AsyncApp) {
     cx.background_executor()
         .timer(Duration::from_millis(40))
@@ -37,10 +78,17 @@ pub(crate) async fn until(
         {
             return;
         }
-        assert!(
-            started.elapsed() < TIMEOUT,
-            "library smoke timed out: {description}"
-        );
+        if started.elapsed() >= TIMEOUT {
+            let diagnostic = window.update(cx, |_, _, cx| {
+                let app = view.read(cx);
+                format!("page={:?}; notice={:?}; storage_busy={}; note_saving={}; draft_loading={}; media_busy={}; preferences_busy={}; replacing={}; dirty={}; leave={}; preferences_error={:?}; modal={}; last_library={}; notes={}",
+                    app.page, app.notice, app.storage_busy, app.note_saving, app.draft_loading,
+                    app.media_busy(), app.preferences_ui.busy, app.preferences_ui.replacing,
+                    app.settings_dirty(cx), app.preferences_ui.leave.is_some(), app.preferences_ui.error,
+                    app.has_modal(cx), app.last_library, app.snapshot.as_ref().map_or(0, |snapshot| snapshot.notes.len()))
+            }).unwrap();
+            panic!("library smoke timed out: {description}; {diagnostic}");
+        }
         pause(cx).await;
     }
 }
@@ -126,7 +174,7 @@ pub(crate) async fn create_note(
     until(
         window,
         view,
-        "create managed fixture",
+        &format!("create managed fixture {title}"),
         |app, _| {
             app.snapshot
                 .as_ref()
@@ -157,6 +205,24 @@ pub(crate) fn click_scrolled(window: &mut Window, id: SharedString, scroll: &str
 }
 
 pub(crate) fn reveal_scrolled(window: &mut Window, id: SharedString, scroll: &str, cx: &mut App) {
+    window.render_frame(cx);
+    let scroll = if scroll == "folder-tree-scroll" {
+        "note-list-scroll"
+    } else {
+        scroll
+    };
+    let settings_scroll = if window.try_find("settings-section-scroll").is_some() {
+        "settings-section-scroll"
+    } else {
+        "page-scroll"
+    };
+    // Save/reset are fixed outside the section scroll viewport.
+    let fixed_header = matches!(id.as_ref(), "save-settings" | "reset-settings");
+    let scroll = if scroll == "page-scroll" && !fixed_header {
+        settings_scroll
+    } else {
+        scroll
+    };
     for _ in 0..35 {
         window.render_frame(cx);
         let viewport = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
@@ -178,7 +244,7 @@ pub(crate) fn reveal_scrolled(window: &mut Window, id: SharedString, scroll: &st
         }) {
             scroll
         } else {
-            "page-scroll"
+            settings_scroll
         };
         let scroll_bounds = window.find(SharedString::from(scroll.to_owned())).bounds();
         let delta = if target
@@ -189,7 +255,7 @@ pub(crate) fn reveal_scrolled(window: &mut Window, id: SharedString, scroll: &st
         } else {
             -160.
         };
-        if scroll == "page-scroll" {
+        if scroll == "page-scroll" || scroll == "settings-section-scroll" {
             scroll_settings(window, delta, cx);
         } else {
             window.scroll(
@@ -202,9 +268,12 @@ pub(crate) fn reveal_scrolled(window: &mut Window, id: SharedString, scroll: &st
     panic!("could not reveal native button {id}");
 }
 
-/// Scroll in the outer page's padding, where nested file lists cannot consume it.
+/// Scroll in the section's padding, where nested file lists cannot consume it.
 pub(crate) fn scroll_settings(window: &mut Window, delta: f32, cx: &mut App) {
-    let page = window.find("page-scroll").bounds();
+    let page = window
+        .try_find("settings-section-scroll")
+        .unwrap_or_else(|| window.find("page-scroll"))
+        .bounds();
     window.dispatch_event(
         ScrollWheelEvent {
             position: point(page.origin.x + px(5.), page.center().y),
@@ -229,6 +298,7 @@ pub async fn exercise(
         .update(cx, |_, window, cx| {
             window.resize(size(px(1440.), px(1000.)));
             view.update(cx, |app, cx| {
+                app.clear_notices(cx);
                 assert!(app.note_editor.is_none() && app.recoverable_draft.is_none());
                 app.page = Page::Notes;
                 app.history = false;
@@ -311,7 +381,7 @@ pub async fn exercise(
     let original_file = std::fs::read(&note.path).unwrap();
     window
         .update(cx, |_, window, cx| {
-            window.click("move-note-folder", cx);
+            reader_action(window, 1, cx);
             window.click(
                 SharedString::from(format!("folder-destination-{child_id}")),
                 cx,
@@ -349,7 +419,8 @@ pub async fn exercise(
                 assert!(
                     window
                         .try_find(SharedString::from(format!("note-{id}")))
-                        .is_none()
+                        .is_some(),
+                    "folder selection must not filter other branches out of the unified tree"
                 );
             }
             window.click("folders-root", cx);
@@ -358,8 +429,31 @@ pub async fn exercise(
             assert!(
                 window
                     .try_find(SharedString::from(format!("note-{}", note.id)))
-                    .is_none()
+                    .is_some(),
+                "selecting Unclassified must retain expanded folder notes"
             );
+            // Click a note in another branch, then accept a timer-only snapshot.
+            // An obsolete folder filter must not switch the reader back.
+            window.click(SharedString::from(format!("note-{}", note.id)), cx);
+            let same_snapshot = view.read(cx).snapshot.as_ref().unwrap().clone();
+            view.update(cx, |app, cx| {
+                app.accept_snapshot(same_snapshot, false, window, cx)
+            });
+            assert_eq!(view.read(cx).selected_note.as_ref(), Some(&note.id));
+            window.click(SharedString::from(format!("folder-expand-{child_id}")), cx);
+            window.render_frame(cx);
+            assert!(
+                window
+                    .try_find(SharedString::from(format!("note-{}", note.id)))
+                    .is_none(),
+                "collapsed branch kept constructing its notes"
+            );
+            assert_eq!(
+                view.read(cx).selected_note.as_ref(),
+                Some(&note.id),
+                "collapsing a branch changed the document"
+            );
+            window.click(SharedString::from(format!("folder-expand-{child_id}")), cx);
             window.click("folders-all", cx);
             assert_eq!(view.read(cx).folders.read(cx).filter(), &FolderFilter::All);
         })
@@ -440,8 +534,45 @@ pub async fn exercise(
                 "resize did not settle: {:?}",
                 window.viewport_size()
             );
+            // The preceding version save is fixture setup. Its success toast
+            // must not intercept the history-tab interaction under test.
+            view.update(cx, |app, cx| app.clear_notices(cx));
             window.click("history-tab", cx);
             window.render_frame(cx);
+            assert!(
+                view.read(cx).history,
+                "history tab interaction was intercepted"
+            );
+        })
+        .unwrap();
+    let history_layout_started = Instant::now();
+    loop {
+        pause(cx).await;
+        let laid_out = window
+            .update(cx, |_, window, cx| {
+                window.render_frame(cx);
+                view.read(cx)
+                    .history_preview
+                    .scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .bounds()
+                    .size
+                    .height
+                    > px(0.)
+            })
+            .unwrap();
+        if laid_out {
+            break;
+        }
+        assert!(
+            history_layout_started.elapsed() < TIMEOUT,
+            "long history did not lay out a positive viewport at 1000x700"
+        );
+    }
+    window
+        .update(cx, |_, window, cx| {
             assert!(
                 view.read(cx)
                     .history_preview
@@ -628,7 +759,7 @@ pub async fn exercise(
                 .id
                 .clone();
             window.click(SharedString::from(format!("folder-row-{id}")), cx);
-            window.click("new-note", cx);
+            crate::smoke_library::library_add(window, false, cx);
             view.update(cx, |app, cx| {
                 assert_eq!(
                     app.note_editor.as_ref().unwrap().folder_id.as_ref(),
@@ -713,6 +844,7 @@ pub async fn exercise(
                 .map(|v| (v.id.clone(), v.content.clone()))
                 .collect::<Vec<_>>();
             window.click(("nav", 4_usize), cx);
+            window.click("settings-section-storage", cx);
             click_scrolled(window, "refresh-storage".into(), "page-scroll", cx);
             versions
         })
@@ -803,7 +935,7 @@ pub async fn exercise(
     window
         .update(cx, |_, window, cx| {
             view.update(cx, |app, cx| {
-                app.notice = None;
+                app.clear_notices(cx);
                 app.new_note(window, cx);
             });
             window.render_frame(cx);
@@ -818,7 +950,9 @@ pub async fn exercise(
     )
     .await;
     window
-        .update(cx, |_, window, cx| window.click("keep-note-draft", cx))
+        .update(cx, |_, window, cx| {
+            crate::smoke_library::editor_action(window, view, false, cx)
+        })
         .unwrap();
     settled(window, view, cx).await;
     let original_database = std::fs::canonicalize(database).unwrap();

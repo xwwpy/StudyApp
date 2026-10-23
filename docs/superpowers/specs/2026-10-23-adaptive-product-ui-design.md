@@ -36,3 +36,10 @@ Content-sized cards with bounded width and wrapped text, compact icon/dismiss bu
 ## Verification
 
 Regression-first for editor transformations, language completion, theme serialization/draft atomicity, drag enter/leave/drop and click-edit ownership. Browser screenshots verify light/dark/custom and editor language controls. Native isolated smoke verifies compact menus, drag overlay across editor, selection preservation, shortcut recording, themed settings, notification geometry and existing data workflows. Test-owned EXEs/data only; no bulk deletion and no stopping user PID 41512. Root serializes Cargo/native work. CI still requires Win32 SendInput. Publish only after local gates, independent review and remote CI.
+# Managed image addendum
+
+Markdown images render in both reading and editing views. The native worker validates PNG/JPEG/GIF/WebP/BMP data and supplies a bounded data-URL allowlist to the offline editor. Relative paths resolve against the tracked Markdown file; HTTPS resources load in the background without synchronization credentials. Missing images have a stable placeholder and an actionable notification.
+
+Every managed note uses a persistent UUID asset group. Image names contain an addition timestamp, sanitized note title and collision-resistant suffix. Local storage defaults to the library's images directory; a custom absolute location and configured WebDAV/NAS storage are available in the separately persisted image settings category. Cloud storage retains a local cache and does not report insertion success until upload succeeds. Failed uploads retain staged bytes.
+
+Creating a managed copy copies the original note's referenced resources and rewrites the copy. It never modifies or removes the tracked Markdown or source images. Asset indexes retain old custom locations after a setting change, while migrated library assets take precedence over stale absolute indexes.

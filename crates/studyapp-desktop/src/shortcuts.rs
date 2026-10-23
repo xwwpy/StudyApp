@@ -39,6 +39,15 @@ actions![
     ("editor.bold", "粗体", "格式", "Ctrl+B"),
     ("editor.italic", "斜体", "格式", "Ctrl+I"),
     ("editor.heading", "标题", "格式", ""),
+    ("editor.heading-1", "1 级标题", "格式", "Ctrl+1"),
+    ("editor.heading-2", "2 级标题", "格式", "Ctrl+2"),
+    ("editor.heading-3", "3 级标题", "格式", "Ctrl+3"),
+    ("editor.heading-4", "4 级标题", "格式", "Ctrl+4"),
+    ("editor.heading-5", "5 级标题", "格式", "Ctrl+5"),
+    ("editor.heading-6", "6 级标题", "格式", "Ctrl+6"),
+    ("editor.paragraph", "正文", "格式", "Ctrl+0"),
+    ("editor.ordered", "有序列表", "格式", ""),
+    ("editor.insert-image", "插入图片", "格式", ""),
     ("editor.code", "行内代码", "格式", ""),
     ("editor.bullet", "列表", "格式", ""),
     ("editor.task", "任务列表", "格式", ""),
@@ -133,11 +142,145 @@ pub fn default_bindings() -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Newly introduced defaults yield to an older explicit custom binding.
+/// Existing actions and explicit new bindings retain strict conflict checking.
+pub fn resolved_bindings(bindings: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut resolved = default_bindings();
+    let explicit: BTreeSet<String> = bindings
+        .values()
+        .filter_map(|value| normalize_binding(value).ok())
+        .flat_map(|value| {
+            value
+                .split(';')
+                .filter(|key| !key.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for action in ["editor.paragraph".to_owned()]
+        .into_iter()
+        .chain((1..=6).map(|level| format!("editor.heading-{level}")))
+    {
+        if !bindings.contains_key(&action)
+            && resolved
+                .get(&action)
+                .is_some_and(|binding| explicit.contains(binding))
+        {
+            resolved.insert(action, String::new());
+        }
+    }
+    resolved.extend(bindings.clone());
+    resolved
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CaptureKey {
+    Pending,
+    Cancel,
+    Binding(String),
+    Invalid(String),
+}
+
+/// Capture consumes every event while armed, including invalid or modifier keys.
+pub fn capture_key(key: &str, ctrl: bool, alt: bool, shift: bool, platform: bool) -> CaptureKey {
+    if matches!(key.to_ascii_lowercase().as_str(), "escape" | "esc") {
+        return CaptureKey::Cancel;
+    }
+    if matches!(
+        key.to_ascii_lowercase().as_str(),
+        "ctrl" | "control" | "alt" | "shift" | "meta" | "super" | "win" | "command" | "fn"
+    ) {
+        return CaptureKey::Pending;
+    }
+    if platform {
+        return CaptureKey::Invalid("Windows 系统组合键不能录制".into());
+    }
+    match key_combination(key, ctrl, alt, shift) {
+        Ok(binding) => CaptureKey::Binding(binding),
+        Err(error) => CaptureKey::Invalid(error.to_string()),
+    }
+}
+
+/// Format a live platform event before applying the binding delimiter grammar.
+/// Windows GPUI consumes Shift into punctuation (for example `+` with shift=false),
+/// so recover it from the symbol before canonicalizing the key token. Explicit
+/// registry tokens such as Equal keep the modifier flags supplied by the caller.
+pub fn key_combination(key: &str, ctrl: bool, alt: bool, shift: bool) -> Result<String> {
+    let (key, symbol_shift) = match key {
+        "!" => ("1", true),
+        "@" => ("2", true),
+        "#" => ("3", true),
+        "$" => ("4", true),
+        "%" => ("5", true),
+        "^" => ("6", true),
+        "&" => ("7", true),
+        "*" => ("8", true),
+        "(" => ("9", true),
+        ")" => ("0", true),
+        "+" => ("Equal", true),
+        "_" => ("Minus", true),
+        ":" => ("Semicolon", true),
+        "\"" => ("Quote", true),
+        "<" => ("Comma", true),
+        ">" => ("Period", true),
+        "?" => ("Slash", true),
+        "|" => ("Backslash", true),
+        "{" => ("BracketLeft", true),
+        "}" => ("BracketRight", true),
+        "~" => ("Backquote", true),
+        other => (other, false),
+    };
+    let key = normalize_key(key)?;
+    normalize_binding(&format!(
+        "{}{}{}{}",
+        if ctrl { "Ctrl+" } else { "" },
+        if alt { "Alt+" } else { "" },
+        if shift || symbol_shift { "Shift+" } else { "" },
+        key
+    ))
+}
+
+pub fn record_binding(previous: &str, captured: &str, append: bool) -> Result<String> {
+    if append && !previous.trim().is_empty() {
+        normalize_binding(&format!("{previous};{captured}"))
+    } else {
+        normalize_binding(captured)
+    }
+}
+
+/// Return every participant, including conflicts against omitted default bindings.
+pub fn binding_conflicts(bindings: &BTreeMap<String, String>) -> BTreeMap<String, Vec<String>> {
+    let resolved = resolved_bindings(bindings);
+    let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (action, binding) in resolved {
+        for alias in binding.split(';').filter(|alias| !alias.trim().is_empty()) {
+            if let Ok(alias) = normalize_binding(alias) {
+                let owners = owners.entry(alias).or_default();
+                if !owners.contains(&action) {
+                    owners.push(action.clone());
+                }
+            }
+        }
+    }
+    let mut conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for owners in owners.values().filter(|owners| owners.len() > 1) {
+        for action in owners {
+            let others = conflicts.entry(action.clone()).or_default();
+            for other in owners.iter().filter(|other| *other != action) {
+                if !others.contains(other) {
+                    others.push(other.clone());
+                }
+            }
+        }
+    }
+    conflicts
+}
+
 /// Missing actions use defaults, while an explicit empty value unbinds an action.
 pub fn validate_bindings(bindings: &BTreeMap<String, String>) -> Result<()> {
-    let mut resolved = default_bindings();
+    let mut resolved = resolved_bindings(bindings);
     for (action, binding) in bindings {
-        if !resolved.contains_key(action) {
+        if !SHORTCUT_ACTIONS.iter().any(|known| known.id == action) {
             bail!("未知快捷键操作：{action}");
         }
         resolved.insert(
@@ -355,5 +498,93 @@ mod tests {
         validate_bindings(&bindings).unwrap();
         bindings.insert("app.arbitrary-code".into(), "Ctrl+Q".into());
         assert!(validate_bindings(&bindings).is_err());
+    }
+
+    #[test]
+    fn additive_heading_defaults_preserve_old_digit_customizations() {
+        let mut old = BTreeMap::from([("editor.bold".to_owned(), "Ctrl+1".to_owned())]);
+        validate_bindings(&old).unwrap();
+        assert_eq!(resolved_bindings(&old)["editor.heading-1"], "");
+        assert_eq!(resolved_bindings(&old)["editor.heading-2"], "Ctrl+2");
+        old.insert("editor.heading-1".into(), "Ctrl+1".into());
+        assert!(validate_bindings(&old).is_err());
+    }
+}
+
+#[cfg(test)]
+mod recording_tests {
+    use super::*;
+
+    #[test]
+    fn punctuation_capture_and_dispatch_use_canonical_key_tokens() {
+        for (key, shift, expected) in [
+            (";", false, "Ctrl+Semicolon"),
+            ("=", false, "Ctrl+Equal"),
+            ("+", false, "Ctrl+Shift+Equal"),
+            ("+", true, "Ctrl+Shift+Equal"),
+            (":", false, "Ctrl+Shift+Semicolon"),
+            ("!", false, "Ctrl+Shift+1"),
+            ("?", false, "Ctrl+Shift+Slash"),
+            ("{", false, "Ctrl+Shift+BracketLeft"),
+            ("Semicolon", false, "Ctrl+Semicolon"),
+        ] {
+            assert_eq!(
+                capture_key(key, true, false, shift, false),
+                CaptureKey::Binding(expected.into()),
+                "{key}"
+            );
+            assert_eq!(
+                key_combination(key, true, false, shift).unwrap(),
+                expected,
+                "dispatch {key}"
+            );
+            assert_eq!(normalize_binding(expected).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn recording_consumes_commands_ignores_modifiers_and_cancels_escape() {
+        assert_eq!(
+            capture_key("Control", true, false, false, false),
+            CaptureKey::Pending
+        );
+        assert_eq!(
+            capture_key("Shift", false, false, true, false),
+            CaptureKey::Pending
+        );
+        assert_eq!(
+            capture_key("escape", true, false, false, false),
+            CaptureKey::Cancel
+        );
+        assert_eq!(
+            capture_key("s", true, false, false, false),
+            CaptureKey::Binding("Ctrl+S".into())
+        );
+        assert!(matches!(
+            capture_key("s", false, false, false, false),
+            CaptureKey::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn live_conflicts_include_every_alias_owner_and_save_rejects_them() {
+        let mut bindings = default_bindings();
+        bindings.insert("app.new".into(), "control+s;F8".into());
+        bindings.insert("app.import".into(), "f8".into());
+        let conflicts = binding_conflicts(&bindings);
+        assert_eq!(conflicts["app.new"].len(), 2);
+        assert!(conflicts["editor.save"].contains(&"app.new".to_owned()));
+        assert!(conflicts["app.import"].contains(&"app.new".to_owned()));
+        assert!(validate_bindings(&bindings).is_err());
+    }
+
+    #[test]
+    fn recording_appends_normalized_alternatives_without_losing_existing() {
+        assert_eq!(
+            record_binding("control+y", "Ctrl+Shift+Z", true).unwrap(),
+            "Ctrl+Y;Ctrl+Shift+Z"
+        );
+        assert_eq!(record_binding("Ctrl+Y", "F8", false).unwrap(), "F8");
+        assert!(record_binding("Ctrl+Y", "Ctrl+Y", true).is_err());
     }
 }

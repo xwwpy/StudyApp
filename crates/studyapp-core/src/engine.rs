@@ -10,7 +10,12 @@ pub struct Engine {
     conn: Connection,
     path: PathBuf,
     state: State,
+    deferred_settings_baseline: Option<SettingsMirrorBaseline>,
     managed_storage_checked: bool,
+}
+struct SettingsMirrorBaseline {
+    settings: Settings,
+    target_seconds: u64,
 }
 fn id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -31,13 +36,15 @@ impl Engine {
         let mut state = storage::load(&conn)?.unwrap_or_else(|| State::new(now));
         crate::managed::rebase(&mut state, &path)?;
         let recovered_conflict = crate::managed::recover(&mut conn, &path, &mut state)
-            .context("托管笔记恢复未完成，原文和写入草稿仍保留；请排除文件占用或目录错误后重试")?;
+            .context("托管笔记恢复未完成，原文和写入草稿仍保留；请排除文件占用或目录错误后重试")?
+            .unwrap_or(false);
         state.last_tick = state.last_tick.max(now);
         state.expire(now);
         let mut engine = Self {
             conn,
             path,
             state,
+            deferred_settings_baseline: None,
             managed_storage_checked: false,
         };
         let recovery_errors: Vec<_> = if recovered_conflict {
@@ -85,6 +92,14 @@ impl Engine {
     /// The file-backed configuration has already committed. No fallible I/O is
     /// permitted here; subsequent checkpoints refresh SQLite's legacy mirror.
     pub fn install_prepared_settings(&mut self, prepared: PreparedSettings) {
+        // Independent configuration publication does not update app_state. Keep
+        // its original mirror fields until a later SQLite commit, even across
+        // multiple preference installations before that commit.
+        self.deferred_settings_baseline
+            .get_or_insert_with(|| SettingsMirrorBaseline {
+                settings: self.state.settings.clone(),
+                target_seconds: self.state.timer.target_seconds,
+            });
         if self.state.timer.active_seconds == 0 {
             self.state.timer.target_seconds = u64::from(prepared.settings.interval_minutes) * 60;
         }
@@ -108,16 +123,22 @@ impl Engine {
         next.expire(now);
         match &command {
             Command::CreateNote { title, content }
-            | Command::CreateNoteInFolder { title, content, .. } => {
+            | Command::CreateNoteInFolder { title, content, .. }
+            | Command::CreateNoteWithId { title, content, .. } => {
                 let folder_id = match &command {
-                    Command::CreateNoteInFolder { folder_id, .. } => folder_id.clone(),
+                    Command::CreateNoteInFolder { folder_id, .. }
+                    | Command::CreateNoteWithId { folder_id, .. } => folder_id.clone(),
                     _ => None,
+                };
+                let note_id = match &command {
+                    Command::CreateNoteWithId { note_id, .. } => note_id.clone(),
+                    _ => id(),
                 };
                 crate::folders::require_target(&next, folder_id.as_deref())?;
                 let write = crate::managed::create(
                     &mut next,
                     &self.path,
-                    id(),
+                    note_id,
                     title.clone(),
                     content.clone(),
                     now,
@@ -497,6 +518,7 @@ impl Engine {
             | Command::Restore(_)
             | Command::CreateNote { .. }
             | Command::CreateNoteInFolder { .. }
+            | Command::CreateNoteWithId { .. }
             | Command::SaveNote { .. }
             | Command::ReceiveSyncedNote { .. }
             | Command::ReceiveSyncedCopy { .. }
@@ -504,6 +526,7 @@ impl Engine {
         };
         storage::save(&mut self.conn, &next, self.state.versions.len(), false)?;
         self.state = next;
+        self.deferred_settings_baseline = None;
         Ok(message)
     }
     fn save_settings(state: &mut State, settings: Settings) -> Result<()> {
@@ -544,6 +567,7 @@ impl Engine {
         next.last_tick = next.last_tick.max(now);
         storage::save(&mut self.conn, &next, self.state.versions.len(), false)?;
         self.state = next;
+        self.deferred_settings_baseline = None;
         Ok(())
     }
     pub fn checkpoint(&mut self) -> Result<()> {
@@ -554,6 +578,7 @@ impl Engine {
             self.state.versions.len(),
             false,
         )?;
+        self.deferred_settings_baseline = None;
         self.conn.execute_batch("PRAGMA wal_checkpoint(FULL);")?;
         Ok(())
     }
@@ -794,14 +819,26 @@ impl Engine {
             crate::managed::check_filesystem(&self.path)?;
             self.managed_storage_checked = true;
         }
-        crate::managed::prepare(&mut self.conn, &self.state, next, writes, replace)?;
+        let mut previous;
+        let previous = if let Some(baseline) = &self.deferred_settings_baseline {
+            previous = self.state.clone();
+            previous.settings = baseline.settings.clone();
+            previous.timer.target_seconds = baseline.target_seconds;
+            &previous
+        } else {
+            &self.state
+        };
+        crate::managed::prepare(&mut self.conn, previous, next, writes, replace)?;
         self.recover_writes()
     }
     fn recover_writes(&mut self) -> Result<()> {
-        let conflict = crate::managed::recover(&mut self.conn, &self.path, &mut self.state)
+        let recovered = crate::managed::recover(&mut self.conn, &self.path, &mut self.state)
             .context("托管写入未完成，原文和草稿仍保留；排除文件占用或目录错误后重试")?;
+        if recovered.is_some() {
+            self.deferred_settings_baseline = None;
+        }
         ensure!(
-            !conflict,
+            !recovered.unwrap_or(false),
             "发现外部修改：外部文件未被覆盖，待保存草稿已保留在版本历史"
         );
         Ok(())
@@ -817,6 +854,307 @@ fn unique(ids: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod managed_storage_tests {
     use super::*;
+
+    fn install_changed_preferences(engine: &mut Engine) -> Settings {
+        let mut settings = engine.snapshot().settings;
+        settings.interval_minutes = 30;
+        settings.appearance.mode = ThemeMode::Dark;
+        let prepared = engine.prepare_settings(settings.clone()).unwrap();
+        engine.install_prepared_settings(prepared);
+        settings
+    }
+
+    #[test]
+    fn installed_preferences_allow_immediate_managed_create_without_checkpoint() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let database = dir.join("preferences.sqlite");
+        let mut engine = Engine::open(&database, 1000).unwrap();
+        let original = engine.snapshot().settings;
+        let settings = install_changed_preferences(&mut engine);
+        assert_eq!(
+            storage::load(&engine.conn).unwrap().unwrap().settings,
+            original
+        );
+        engine
+            .apply(
+                Command::CreateNote {
+                    title: "immediate".into(),
+                    content: "after preferences".into(),
+                },
+                1001,
+            )
+            .unwrap();
+        assert_eq!(engine.snapshot().settings, settings);
+        assert_eq!(engine.snapshot().timer.target_seconds, 1800);
+        assert_eq!(
+            storage::load(&engine.conn).unwrap().unwrap().settings,
+            settings
+        );
+        drop(engine);
+        let reopened = Engine::open(&database, 1002).unwrap();
+        assert_eq!(reopened.snapshot().settings, settings);
+        assert_eq!(reopened.snapshot().versions[0].content, "after preferences");
+    }
+
+    #[test]
+    fn installed_preferences_allow_immediate_managed_save_during_active_cycle() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let mut engine = Engine::open(&dir.join("preferences.sqlite"), 1000).unwrap();
+        engine
+            .apply(
+                Command::CreateNote {
+                    title: "existing".into(),
+                    content: "before".into(),
+                },
+                1000,
+            )
+            .unwrap();
+        engine.tick(1001, 1).unwrap();
+        let before = engine.snapshot();
+        let settings = install_changed_preferences(&mut engine);
+        engine
+            .apply(
+                Command::SaveNote {
+                    note_id: before.notes[0].id.clone(),
+                    expected_hash: before.versions[0].hash.clone(),
+                    content: "after".into(),
+                },
+                1002,
+            )
+            .unwrap();
+        assert_eq!(engine.snapshot().settings, settings);
+        assert_eq!(engine.snapshot().timer.target_seconds, 3600);
+        assert_eq!(engine.snapshot().timer.active_seconds, 1);
+        assert_eq!(engine.snapshot().versions.last().unwrap().content, "after");
+    }
+
+    #[test]
+    fn repeated_preference_installs_keep_the_original_managed_write_baseline() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let mut engine = Engine::open(&dir.join("preferences.sqlite"), 1000).unwrap();
+        let original = engine.snapshot().settings;
+        for mode in [ThemeMode::Dark, ThemeMode::Light, original.appearance.mode] {
+            let mut settings = original.clone();
+            settings.appearance.mode = mode;
+            settings.interval_minutes = 30;
+            let prepared = engine.prepare_settings(settings).unwrap();
+            engine.install_prepared_settings(prepared);
+        }
+        for now in [1001, 1002] {
+            engine
+                .apply(
+                    Command::CreateNote {
+                        title: "repeat".into(),
+                        content: format!("note {now}"),
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+        assert_eq!(engine.snapshot().notes.len(), 2);
+        assert_eq!(engine.snapshot().timer.target_seconds, 1800);
+    }
+
+    #[test]
+    fn installed_preferences_still_reject_a_genuine_second_engine_write() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let database = dir.join("preferences.sqlite");
+        let mut engine = Engine::open(&database, 1000).unwrap();
+        let mut other = Engine::open(&database, 1000).unwrap();
+        install_changed_preferences(&mut engine);
+        other.apply(Command::SetPaused(true), 1001).unwrap();
+        let error = engine
+            .apply(
+                Command::CreateNote {
+                    title: "stale".into(),
+                    content: "must not publish".into(),
+                },
+                1002,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("资料库已被另一进程修改"));
+        assert!(engine.snapshot().notes.is_empty());
+        let stored = storage::load(&engine.conn).unwrap().unwrap();
+        assert!(stored.timer.paused);
+        assert!(stored.notes.is_empty());
+        assert_eq!(stored.settings, other.snapshot().settings);
+        let pending: i64 = engine
+            .conn
+            .query_row("SELECT count(*) FROM write_intents", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn preference_mirror_baseline_advances_after_each_ordinary_persistence_path() {
+        for path in ["command", "tick", "checkpoint", "backup", "restore"] {
+            let dir = tempfile::tempdir().unwrap().keep();
+            let mut engine = Engine::open(&dir.join("preferences.sqlite"), 1000).unwrap();
+            let backup = dir.join("backup.sqlite");
+            engine.apply(Command::Backup(backup.clone()), 1000).unwrap();
+            install_changed_preferences(&mut engine);
+            match path {
+                "command" => {
+                    engine.apply(Command::SetPaused(true), 1001).unwrap();
+                }
+                "tick" => engine.tick(1001, 1).unwrap(),
+                "checkpoint" => engine.checkpoint().unwrap(),
+                "backup" => {
+                    engine
+                        .apply(Command::Backup(dir.join("updated.sqlite")), 1001)
+                        .unwrap();
+                }
+                "restore" => {
+                    engine.restore_preserving_settings(&backup, 1001).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            engine
+                .apply(
+                    Command::CreateNote {
+                        title: path.into(),
+                        content: "after persistence".into(),
+                    },
+                    1002,
+                )
+                .unwrap();
+            assert_eq!(engine.snapshot().notes.len(), 1, "{path}");
+        }
+    }
+
+    #[test]
+    fn interrupted_write_with_installed_preferences_recovers_before_the_next_write() {
+        for reopen in [false, true] {
+            let dir = tempfile::tempdir().unwrap().keep();
+            let database = dir.join("preferences.sqlite");
+            let mut engine = Engine::open(&database, 1000).unwrap();
+            let settings = install_changed_preferences(&mut engine);
+            // A file where the notes directory should be interrupts publication
+            // after the durable intent, without deleting any fixture files.
+            let blocker = dir.join("notes");
+            std::fs::write(&blocker, "retained blocker").unwrap();
+            assert!(
+                engine
+                    .apply(
+                        Command::CreateNote {
+                            title: "recover".into(),
+                            content: "durable draft".into(),
+                        },
+                        1001
+                    )
+                    .is_err()
+            );
+            let pending: i64 = engine
+                .conn
+                .query_row("SELECT count(*) FROM write_intents", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(pending, 1);
+            std::fs::rename(&blocker, dir.join("retained-blocker")).unwrap();
+            if reopen {
+                drop(engine);
+                engine = Engine::open(&database, 1002).unwrap();
+            }
+            engine
+                .apply(
+                    Command::CreateNote {
+                        title: "next".into(),
+                        content: "after recovery".into(),
+                    },
+                    1003,
+                )
+                .unwrap();
+            assert_eq!(engine.snapshot().notes.len(), 2);
+            assert_eq!(engine.snapshot().settings, settings);
+            assert_eq!(
+                storage::load(&engine.conn).unwrap().unwrap().settings,
+                settings
+            );
+        }
+    }
+
+    #[test]
+    fn failed_ordinary_save_keeps_the_deferred_preference_baseline() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let mut engine = Engine::open(&dir.join("preferences.sqlite"), 1000).unwrap();
+        let original = engine.snapshot().settings;
+        let settings = install_changed_preferences(&mut engine);
+        engine.conn.execute_batch(
+            "CREATE TRIGGER fail_state_save BEFORE INSERT ON app_state BEGIN SELECT RAISE(ABORT, 'fixture save failure'); END;",
+        ).unwrap();
+        assert!(engine.apply(Command::SetPaused(true), 1001).is_err());
+        assert!(!engine.snapshot().timer.paused);
+        assert_eq!(
+            storage::load(&engine.conn).unwrap().unwrap().settings,
+            original
+        );
+        engine
+            .conn
+            .execute_batch("DROP TRIGGER fail_state_save;")
+            .unwrap();
+        engine
+            .apply(
+                Command::CreateNote {
+                    title: "retry".into(),
+                    content: "after failed state save".into(),
+                },
+                1002,
+            )
+            .unwrap();
+        assert_eq!(engine.snapshot().settings, settings);
+        assert_eq!(engine.snapshot().notes.len(), 1);
+    }
+
+    #[test]
+    fn recovered_file_conflict_advances_the_deferred_preference_baseline() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let mut engine = Engine::open(&dir.join("preferences.sqlite"), 1000).unwrap();
+        let settings = install_changed_preferences(&mut engine);
+        let blocker = dir.join("notes");
+        std::fs::write(&blocker, "retained blocker").unwrap();
+        assert!(
+            engine
+                .apply(
+                    Command::CreateNote {
+                        title: "recover conflict".into(),
+                        content: "durable draft".into(),
+                    },
+                    1001
+                )
+                .is_err()
+        );
+        let raw: String = engine
+            .conn
+            .query_row("SELECT data FROM write_intents", [], |row| row.get(0))
+            .unwrap();
+        let intent: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let note_id = intent["state"]["notes"][0]["id"].as_str().unwrap();
+        std::fs::rename(&blocker, dir.join("retained-blocker")).unwrap();
+        std::fs::create_dir(&blocker).unwrap();
+        let external_path = blocker.join(format!("{note_id}.md"));
+        std::fs::write(&external_path, "external writer").unwrap();
+        let error = engine.apply(Command::SetPaused(true), 1002).unwrap_err();
+        assert!(error.to_string().contains("发现外部修改"));
+        assert_eq!(
+            std::fs::read_to_string(external_path).unwrap(),
+            "external writer"
+        );
+        assert_eq!(engine.snapshot().settings, settings);
+        assert_eq!(engine.snapshot().versions.len(), 2);
+        engine
+            .apply(
+                Command::CreateNote {
+                    title: "next".into(),
+                    content: "after recovered conflict".into(),
+                },
+                1003,
+            )
+            .unwrap();
+        assert_eq!(engine.snapshot().notes.len(), 2);
+        assert_eq!(
+            storage::load(&engine.conn).unwrap().unwrap().settings,
+            settings
+        );
+    }
 
     #[test]
     fn preferences_cannot_commit_while_an_old_managed_write_can_replace_live_state() {

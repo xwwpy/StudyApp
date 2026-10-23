@@ -92,8 +92,11 @@ pub struct StudyApp {
     pub(crate) picker_sender: std::sync::mpsc::Sender<(String, Work)>,
     pub(crate) picker_results: std::sync::mpsc::Receiver<(String, Work)>,
     pub modal_focus: crate::feedback::ModalFocus,
-    notice_seen: Option<Result<String, String>>,
-    notice_started: Option<std::time::Instant>,
+    pub notifications: Entity<crate::notifications::NotificationCenter>,
+    pub applied_appearance: Option<crate::theme::ResolvedTheme>,
+    pub external_drop: crate::external_drop::ExternalDropState,
+    pub external_drop_paths: Vec<std::path::PathBuf>,
+    pub media_ui: crate::media_ui::MediaUi,
     notified: HashSet<String>,
     _poll: Task<()>,
 }
@@ -122,6 +125,11 @@ impl StudyApp {
                 }
             }
         });
+        cx.observe_window_appearance(window, |this, window, cx| {
+            this.refresh_appearance(window, cx);
+            cx.notify();
+        })
+        .detach();
         let search = input("搜索标题、路径与正文", "", window, cx);
         cx.subscribe(
             &search,
@@ -139,6 +147,16 @@ impl StudyApp {
         .detach();
         let note_title = input("笔记标题", "", window, cx);
         let note_content = cx.new(|cx| crate::markdown_editor::MarkdownEditor::new(window, cx));
+        let notifications = cx.new(|_| crate::notifications::NotificationCenter::new());
+        let editor_occlusions = note_content.clone();
+        cx.subscribe(
+            &notifications,
+            move |_, _, event: &crate::notifications::NotificationOcclusions, cx| {
+                editor_occlusions
+                    .update(cx, |editor, cx| editor.set_occlusions(event.0.clone(), cx));
+            },
+        )
+        .detach();
         cx.subscribe(
             &note_title,
             |this, _, _: &gpui_kit::component::input::InputEvent, _| this.mark_note_dirty(),
@@ -161,12 +179,24 @@ impl StudyApp {
         let shortcut_owner = weak.clone();
         let shortcut_window = window.window_handle();
         cx.intercept_keystrokes(move |event, window, cx| {
-            if window.window_handle() != shortcut_window
-                || event.input_preference == InputPreference::CharacterInput
-            {
+            if window.window_handle() != shortcut_window {
                 return;
             }
             let _ = shortcut_owner.update(cx, |this, cx| {
+                if this.capture_settings_keystroke(&event.keystroke, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if event.input_preference == InputPreference::CharacterInput {
+                    return;
+                }
+                if this.external_drop.active() && event.keystroke.key.eq_ignore_ascii_case("escape")
+                {
+                    this.cancel_external_drag(cx);
+                    cx.stop_active_drag(window);
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.is_layout_resizing() && event.keystroke.key.eq_ignore_ascii_case("escape") {
                     this.cancel_resize(cx);
                     cx.stop_propagation();
@@ -187,8 +217,7 @@ impl StudyApp {
             |this, _, event: &crate::sync_ui::SyncEvent, cx| {
                 match event {
                     crate::sync_ui::SyncEvent::Feedback(message) => {
-                        this.notice = Some(message.clone());
-                        this.notice_seen = None;
+                        this.push_notice(message.clone(), cx);
                     }
                     crate::sync_ui::SyncEvent::SaveRequested => this.save_preferences(cx),
                 }
@@ -250,11 +279,14 @@ impl StudyApp {
             resizing: None,
             layout_dirty: false,
             preferences_ui: Default::default(),
+            applied_appearance: None,
+            external_drop: Default::default(),
+            external_drop_paths: Vec::new(),
+            media_ui: crate::media_ui::MediaUi::new(),
             picker_sender,
             picker_results,
             modal_focus: crate::feedback::ModalFocus::new(cx),
-            notice_seen: None,
-            notice_started: None,
+            notifications,
             drafts: DraftStore::new(),
             note_title,
             note_content,
@@ -312,6 +344,7 @@ impl StudyApp {
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         while !self.storage_busy
+            && !self.media_jobs_active()
             && !self.preferences_ui.busy
             && !self.preferences_ui.replacing
             && !self.has_modal(cx)
@@ -324,15 +357,7 @@ impl StudyApp {
         self.sync_panel
             .update(cx, |panel, cx| panel.poll(window, cx));
         let mut changed = self.poll_drafts(window, cx);
-        if self.notice.as_ref().is_some_and(Result::is_ok)
-            && self
-                .notice_started
-                .is_some_and(|at| at.elapsed() >= Duration::from_secs(4))
-        {
-            self.notice = None;
-            self.notice_started = None;
-            changed = true;
-        }
+        self.poll_media(window, cx);
         if self
             .draft_dirty_since
             .is_some_and(|at| at.elapsed() >= Duration::from_millis(200))
@@ -340,7 +365,11 @@ impl StudyApp {
             self.capture_note_draft(cx);
         }
         while let Ok(update) = self.worker.receiver.try_recv() {
+            if let Some(response) = update.media_result {
+                self.accept_media_result(response, window, cx);
+            }
             let storage_finished = update.storage_event.is_some();
+            let preferences_finished = update.preferences_result.is_some();
             if let Some(crate::storage_backend::StorageEvent::Finished(result)) =
                 update.storage_event
             {
@@ -349,7 +378,7 @@ impl StudyApp {
                     .update(cx, |panel, cx| panel.set_busy(false, cx));
                 match result {
                     Ok(report) => self.storage_report = Some(report),
-                    Err(error) => self.notice = Some(Err(error)),
+                    Err(error) => self.push_notice(Err(error), cx),
                 }
             }
             if let Some(status) = update.sync_status {
@@ -382,8 +411,10 @@ impl StudyApp {
                 }
             }
             if let Some(notice) = update.notice {
-                self.notice = Some(notice);
-                self.notice_seen = None;
+                // preferences_finished emits one contextual outcome below.
+                if !preferences_finished {
+                    self.push_notice(notice, cx);
+                }
             }
             if let Some(snapshot) = update.snapshot {
                 if (update.library_replaced || self.last_library != snapshot.data_path)
@@ -531,18 +562,19 @@ impl StudyApp {
             self.selected_note = snapshot
                 .notes
                 .iter()
-                .find(|n| !n.detached)
+                .find(|n| {
+                    n.detached == self.show_detached && self.folders.read(cx).filter().matches(n)
+                })
                 .map(|n| n.id.clone());
             self.selected_version = None;
         }
         if self.note_editor.is_none()
             && self.selected_version.is_none()
             && self.selected_note.as_ref().is_none_or(|id| {
-                !snapshot.notes.iter().any(|n| {
-                    &n.id == id
-                        && n.detached == self.show_detached
-                        && self.folders.read(cx).filter().matches(n)
-                })
+                !snapshot
+                    .notes
+                    .iter()
+                    .any(|n| &n.id == id && n.detached == self.show_detached)
             })
         {
             self.selected_note = snapshot
@@ -553,8 +585,26 @@ impl StudyApp {
                 })
                 .map(|n| n.id.clone());
         }
+        // Folder selection is an explicit navigation action. A later snapshot
+        // must not replace the document just because that note was moved.
+        let moved_selection = self
+            .selected_note
+            .as_ref()
+            .filter(|id| {
+                self.snapshot
+                    .as_ref()
+                    .and_then(|old| old.notes.iter().find(|n| &n.id == *id))
+                    .zip(snapshot.notes.iter().find(|n| &n.id == *id))
+                    .is_some_and(|(old, new)| old.folder_id != new.folder_id)
+            })
+            .cloned();
         self.folders
             .update(cx, |panel, cx| panel.accept(snapshot.clone(), window, cx));
+        if let Some(id) = moved_selection {
+            self.folders.update(cx, |panel, cx| {
+                panel.align_note_context(&id, cx);
+            });
+        }
         let mut draft_folder_changed = false;
         for draft in [&mut self.note_editor, &mut self.recoverable_draft]
             .into_iter()
@@ -584,7 +634,10 @@ impl StudyApp {
                 self.drafts
                     .save(&self.last_library, self.recoverable_draft.clone());
             }
-            self.notice = Some(Ok("草稿目录已随笔记更新；已删除的目录会转为未分类。".into()));
+            self.push_notice(
+                Ok("草稿目录已随笔记更新；已删除的目录会转为未分类。".into()),
+                cx,
+            );
         }
         self.snapshot = Some(snapshot);
     }
@@ -597,7 +650,7 @@ impl StudyApp {
                 self.note_content
                     .update(cx, |editor, cx| editor.set_readonly(false, cx));
             }
-            self.notice = Some(Err("资料库维护进行中，请完成后重试。".into()));
+            self.push_notice(Err("资料库维护进行中，请完成后重试。".into()), cx);
             cx.notify();
             return;
         }
@@ -610,7 +663,7 @@ impl StudyApp {
             })
             .is_err()
         {
-            self.notice = Some(Err("后台服务已停止，请重新打开应用".into()));
+            self.push_notice(Err("后台服务已停止，请重新打开应用".into()), cx);
             self.saving = false;
             self.note_saving = false;
             self.note_content
@@ -745,7 +798,7 @@ impl StudyApp {
                 self.send(command, cx);
             }
             Err(error) => {
-                self.notice = Some(Err(error.to_string()));
+                self.push_notice(Err(error.to_string()), cx);
                 cx.notify();
             }
         }
@@ -870,27 +923,23 @@ impl StudyApp {
             .w(width)
             .h_full()
             .flex_shrink_0()
-            .bg(rgb(0xFFFFFF))
+            .bg(crate::theme::color(0xFFFFFF))
             .border_r_1()
-            .border_color(rgb(BORDER))
+            .border_color(crate::theme::color(BORDER))
             .p_3()
             .child(
-                column()
-                    .gap_1()
-                    .py_5()
-                    .child(
-                        row().gap_1().child(self.navigation_toggle(cx)).child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_sm()
-                                .truncate()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(GREEN))
-                                .child("WW-StudyApp"),
-                        ),
-                    )
-                    .child(muted("本地资料库")),
+                column().gap_1().py_2().child(
+                    row().gap_1().child(self.navigation_toggle(cx)).child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .truncate()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(crate::theme::color(GREEN))
+                            .child("WW-StudyApp"),
+                    ),
+                ),
             )
             .children(
                 items
@@ -910,19 +959,6 @@ impl StudyApp {
                     }),
             )
             .child(div().flex_1())
-            .child(
-                card()
-                    .bg(rgb(LIGHT))
-                    .p_3()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(GREEN))
-                            .child("让学习留下痕迹"),
-                    )
-                    .child(muted("记录 · 回顾 · 再次掌握")),
-            )
             .child(muted(format!(
                 "v{}  ·  数据保存在此设备",
                 env!("CARGO_PKG_VERSION")
@@ -932,23 +968,21 @@ impl StudyApp {
 
 impl Render for StudyApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.refresh_appearance(window, cx);
+        self.external_drop.set_blocked(self.external_drop_block(cx));
         let modal_open = self.has_modal(cx);
         let initial_focus = self.folders.read(cx).modal_initial_focus(cx);
         self.modal_focus
             .sync_with_initial(modal_open, initial_focus, window, cx);
-        if self.notice != self.notice_seen {
-            self.notice_seen = self.notice.clone();
-            self.notice_started = self.notice.as_ref().map(|_| std::time::Instant::now());
-        }
         self.prepare_document_view(window, cx);
         let layout = self.effective_layout(window);
         let continuous = self.page == Page::Notes;
         let title = match self.page {
-            Page::Today => "今天，学到了什么？",
-            Page::Notes => "你的知识，持续生长",
-            Page::Reviews => "把学过的，真正记住",
-            Page::Stats => "看见每一次积累",
-            Page::Settings => "按照你的节奏学习",
+            Page::Today => "今日学习",
+            Page::Notes => "笔记",
+            Page::Reviews => "复习计划",
+            Page::Stats => "学习统计",
+            Page::Settings => "设置",
         };
         let body = if let Some(snapshot) = self.snapshot.clone() {
             match self.page {
@@ -961,7 +995,6 @@ impl Render for StudyApp {
         } else {
             empty("正在打开本地资料库", "所有学习内容保存在你选择的目录").into_any_element()
         };
-        let notice = self.floating_notice_view(cx);
         let modal_content = if let Some(settings) = self.settings_modal(cx) {
             Some(settings)
         } else if self.confirmation.is_some() {
@@ -987,37 +1020,35 @@ impl Render for StudyApp {
         });
         row()
             .relative()
-            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                if this.storage_busy || this.has_modal(cx) {
-                    return;
-                }
-                if this
-                    .worker
-                    .sender
-                    .send(Work::Scoped {
-                        library: this.last_library.clone(),
-                        work: Box::new(Work::ImportPaths(paths.paths().to_vec())),
-                    })
-                    .is_err()
-                {
-                    this.notice = Some(Err("后台服务已停止".into()));
-                } else {
-                    this.notice = Some(Ok("正在后台导入拖入的 Markdown 文件…".into()));
-                }
-                cx.notify();
+            .on_drag_move::<ExternalPaths>(cx.listener(
+                |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    let paths = event.drag(cx).paths();
+                    if this.external_drop_paths != paths {
+                        this.external_drop_paths = paths.to_vec();
+                    }
+                    let count = paths.len();
+                    this.hover_external_file_count(count, cx);
+                },
+            ))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.drop_external_files(paths.paths().to_vec(), window, cx);
             }))
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if this.is_layout_resizing() && event.keystroke.key == "escape" {
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.external_drop.active() && event.keystroke.key == "escape" {
+                    this.cancel_external_drag(cx);
+                    cx.stop_active_drag(window);
+                    cx.stop_propagation();
+                } else if this.is_layout_resizing() && event.keystroke.key == "escape" {
                     this.cancel_resize(cx);
                     cx.stop_propagation();
                 }
             }))
             .gap_0()
             .size_full()
-            .bg(rgb(BG))
-            .text_color(rgb(INK))
+            .bg(crate::theme::color(BG))
+            .text_color(crate::theme::color(INK))
             .font_family("Microsoft YaHei UI")
-            .text_sm()
+            .text_size(px(crate::theme::palette().font_size as f32))
             .when(self.layout.navigation_visible, |view| {
                 view.child(self.navigation(layout.navigation, cx))
             })
@@ -1038,42 +1069,42 @@ impl Render for StudyApp {
                     .h_full()
                     .child(
                         row()
-                            .h(px(86.))
+                            .h(px(56.))
                             .flex_shrink_0()
                             .px_4()
                             .border_b_1()
-                            .border_color(rgb(BORDER))
+                            .border_color(crate::theme::color(BORDER))
                             .when(!self.layout.navigation_visible, |view| {
                                 view.child(self.navigation_toggle(cx))
                             })
+                            .when(
+                                self.page == Page::Notes && !self.layout.folders_visible,
+                                |view| {
+                                    view.child(
+                                        Button::new("toggle-folders")
+                                            .small()
+                                            .ghost()
+                                            .icon(IconName::PanelLeft)
+                                            .accessibility_label("展开笔记库")
+                                            .tooltip("展开笔记库")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_folders(cx)
+                                            })),
+                                    )
+                                },
+                            )
                             .child(
-                                column()
-                                    .gap_1()
+                                div()
                                     .flex_1()
                                     .min_w_0()
-                                    .child(
-                                        div()
-                                            .text_2xl()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .truncate()
-                                            .child(title),
-                                    )
-                                    .child(muted(
-                                        Local::now().format("%Y 年 %m 月 %d 日").to_string(),
-                                    )),
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .truncate()
+                                    .child(title),
                             )
-                            .child(Button::new("new-note").label("新建笔记").on_click(
-                                cx.listener(|this, _, window, cx| this.new_note(window, cx)),
-                            ))
-                            .child(
-                                Button::new("header-import")
-                                    .icon(IconName::Plus)
-                                    .primary()
-                                    .label("导入笔记")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.settings_picker("import", None, cx)
-                                    })),
-                            ),
+                            .when(self.page != Page::Notes, |view| {
+                                view.child(self.library_add_button(cx))
+                            }),
                     )
                     .child(
                         column()
@@ -1081,8 +1112,12 @@ impl Render for StudyApp {
                             .test_support()
                             .flex_1()
                             .min_h_0()
-                            .when(!continuous, |c| c.overflow_y_scroll())
-                            .when(continuous, |c| c.overflow_hidden())
+                            .when(!continuous && self.page != Page::Settings, |c| {
+                                c.overflow_y_scroll()
+                            })
+                            .when(continuous || self.page == Page::Settings, |c| {
+                                c.overflow_hidden()
+                            })
                             .when(continuous, |c| c.p_4())
                             .when(!continuous, |c| c.p_8())
                             .child(body),
@@ -1092,7 +1127,7 @@ impl Render for StudyApp {
                             .px_8()
                             .py_2()
                             .border_t_1()
-                            .border_color(rgb(BORDER))
+                            .border_color(crate::theme::color(BORDER))
                             .child(muted("本地保存"))
                             .child(div().flex_1())
                             .child(muted(format!(
@@ -1101,24 +1136,14 @@ impl Render for StudyApp {
                             ))),
                     ),
             )
-            .when_some(notice, |view, notice| {
-                view.child(
-                    div()
-                        .id("floating-notice")
-                        .test_support()
-                        .occlude()
-                        .absolute()
-                        .top(px(8.))
-                        .left(
-                            (window.viewport_size().width
-                                - px(440.)
-                                    .min((window.viewport_size().width - px(32.)).max(px(0.))))
-                                / 2.,
-                        )
-                        .w(px(440.).min((window.viewport_size().width - px(32.)).max(px(0.))))
-                        .child(notice),
-                )
+            .when(self.external_drop.active(), |view| {
+                view.child(crate::notes_view::external_drop_overlay(
+                    &self.external_drop,
+                    cx,
+                ))
             })
+            .child(self.external_drop_event_layer(cx))
+            .child(self.notifications.clone())
             .child(self.resize_event_layer(cx))
             .children(modal)
     }

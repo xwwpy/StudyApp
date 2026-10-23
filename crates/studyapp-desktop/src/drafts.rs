@@ -12,6 +12,8 @@ pub struct NoteDraft {
     pub expected_hash: Option<String>,
     #[serde(default)]
     pub folder_id: Option<String>,
+    #[serde(default)]
+    pub asset_group: String,
     pub title: String,
     pub content: String,
 }
@@ -225,6 +227,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_ownership_survives_restart_and_legacy_drafts_still_load() {
+        let legacy = r#"{"note_id":null,"expected_hash":null,"title":"旧草稿","content":"正文"}"#;
+        let mut draft: NoteDraft = serde_json::from_str(legacy).unwrap();
+        assert!(draft.asset_group.is_empty());
+        draft.asset_group = "36b79f08-5128-43ab-a1cb-13f318c455f7".into();
+        let saved = serde_json::to_vec(&draft).unwrap();
+        assert_eq!(serde_json::from_slice::<NoteDraft>(&saved).unwrap(), draft);
+    }
+
+    #[test]
     fn valid_markdown_with_json_escapes_can_be_recovered() {
         let directory = tempfile::tempdir().unwrap().keep();
         let library = directory
@@ -232,6 +244,7 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let draft = NoteDraft {
+            asset_group: String::new(),
             note_id: None,
             expected_hash: None,
             folder_id: None,
@@ -258,6 +271,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap().keep();
         let path = directory.join("note-draft.json");
         let draft = NoteDraft {
+            asset_group: String::new(),
             note_id: Some("note-id".into()),
             expected_hash: Some("version-hash".into()),
             folder_id: None,
@@ -285,6 +299,7 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let draft = |content: &str| NoteDraft {
+            asset_group: String::new(),
             note_id: None,
             expected_hash: None,
             folder_id: None,
@@ -318,6 +333,7 @@ mod tests {
         store.save(
             &library,
             Some(NoteDraft {
+                asset_group: String::new(),
                 note_id: None,
                 expected_hash: None,
                 folder_id: None,
@@ -354,6 +370,7 @@ mod tests {
 
     fn draft(content: &str) -> NoteDraft {
         NoteDraft {
+            asset_group: String::new(),
             note_id: None,
             expected_hash: None,
             folder_id: None,

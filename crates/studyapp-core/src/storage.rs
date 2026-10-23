@@ -49,12 +49,16 @@ impl Default for Settings {
             review_days: vec![1, 3, 7, 14, 30],
             show_file_paths: false,
             layout: Default::default(),
+            appearance: Default::default(),
+            images: Default::default(),
         }
     }
 }
 impl Settings {
     pub fn validate(&self) -> Result<()> {
         self.layout.validate()?;
+        self.appearance.validate()?;
+        crate::media_settings::validate_images(&self.images)?;
         ensure!(
             (5..=240).contains(&self.interval_minutes),
             "询问间隔应为 5–240 分钟"

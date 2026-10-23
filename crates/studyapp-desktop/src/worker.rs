@@ -15,6 +15,7 @@ pub enum Work {
     },
     Apply(Command),
     SavePreferences(SavePreferences),
+    Media(crate::media::MediaRequest),
     ImportPaths(Vec<PathBuf>),
     PreparedImport {
         generation: u64,
@@ -47,6 +48,7 @@ pub struct Update {
     pub storage_event: Option<StorageEvent>,
     pub preferences: Option<PreferenceSnapshot>,
     pub preferences_result: Option<Result<(), String>>,
+    pub media_result: Option<crate::media::MediaResponse>,
 }
 
 pub struct Worker {
@@ -158,6 +160,7 @@ impl Worker {
                             storage_event: None,
                             preferences: None,
                             preferences_result: None,
+                            media_result: None,
                         });
                         return;
                     }
@@ -175,6 +178,7 @@ impl Worker {
                 storage_event: None,
                 preferences: Some(preferences.snapshot()),
                 preferences_result: None,
+                media_result: None,
             });
             let mut last_tick = Instant::now();
             let mut last_scan = Instant::now();
@@ -199,6 +203,7 @@ impl Worker {
                                 Work::Apply(
                                     Command::CreateNote { .. }
                                         | Command::CreateNoteInFolder { .. }
+                                        | Command::CreateNoteWithId { .. }
                                         | Command::SaveNote { .. }
                                 )
                             )
@@ -218,6 +223,16 @@ impl Worker {
                                 Work::SwitchLibrary(_) | Work::Apply(Command::Restore(_))
                             )
                             .then(|| Err(error.clone()));
+                            let media_result = if let Work::Media(request) = work.as_ref() {
+                                Some(crate::media::MediaResponse {
+                                    library: library.clone(),
+                                    generation: request.generation(),
+                                    request: request.request(),
+                                    result: Err(error.clone()),
+                                })
+                            } else {
+                                None
+                            };
                             let _ = updates.send(Update {
                                 snapshot: Some(Arc::new(engine.snapshot())),
                                 notice: Some(Err(error)),
@@ -229,6 +244,7 @@ impl Worker {
                                 storage_event,
                                 preferences: Some(preferences.snapshot()),
                                 preferences_result,
+                                media_result,
                             });
                             continue;
                         }
@@ -247,6 +263,44 @@ impl Worker {
                 let mut storage_event = None;
                 let mut preferences_result = None;
                 match work {
+                    Ok(Work::Media(request)) => {
+                        let library = engine.snapshot().data_path;
+                        let factory = synchronization.media_provider_factory();
+                        let updates = updates.clone();
+                        thread::spawn(move || {
+                            let generation = request.generation();
+                            let request_id = request.request();
+                            let result = {
+                                // Even unavailable credentials preserve imported clipboard
+                                // bytes in a staged local file before reporting failure.
+                                let provider = factory().unwrap_or(None);
+                                crate::media::execute(
+                                    std::path::Path::new(&library),
+                                    request,
+                                    provider,
+                                )
+                            }
+                            .map_err(|error| format!("{error:#}"));
+                            let _ = updates.send(Update {
+                                snapshot: None,
+                                notice: None,
+                                editor_result: false,
+                                library_replaced: false,
+                                library_result: None,
+                                note_result: None,
+                                sync_status: None,
+                                storage_event: None,
+                                preferences: None,
+                                preferences_result: None,
+                                media_result: Some(crate::media::MediaResponse {
+                                    library,
+                                    generation,
+                                    request: request_id,
+                                    result,
+                                }),
+                            });
+                        });
+                    }
                     Ok(Work::Scoped { .. }) => continue,
                     Ok(Work::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                         if let Err(error) = engine.checkpoint() {
@@ -257,7 +311,9 @@ impl Worker {
                     Ok(Work::Apply(command)) => {
                         let existing_notes = if matches!(
                             &command,
-                            Command::CreateNote { .. } | Command::CreateNoteInFolder { .. }
+                            Command::CreateNote { .. }
+                                | Command::CreateNoteInFolder { .. }
+                                | Command::CreateNoteWithId { .. }
                         ) {
                             Some(
                                 engine
@@ -575,6 +631,7 @@ impl Worker {
                             storage_event,
                             preferences: Some(preferences.snapshot()),
                             preferences_result,
+                            media_result: None,
                         })
                         .is_err()
                 {
@@ -661,6 +718,28 @@ mod tests {
             panic!("storage request must complete");
         };
         result
+    }
+
+    #[test]
+    fn retained_draft_commit_reports_the_provided_note_id_and_collision() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let worker = Worker::start(root.join("studyapp.sqlite3"), None);
+        worker
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let note_id = "36b79f08-5128-43ab-a1cb-13f318c455f7";
+        let command = Command::CreateNoteWithId {
+            note_id: note_id.into(),
+            folder_id: None,
+            title: "draft".into(),
+            content: "original".into(),
+        };
+        let created = apply(&worker, command.clone());
+        assert_eq!(created.note_result.unwrap().unwrap(), note_id);
+        let rejected = apply(&worker, command);
+        assert!(rejected.note_result.unwrap().is_err());
+        assert_eq!(rejected.snapshot.unwrap().notes.len(), 1);
     }
 
     #[test]

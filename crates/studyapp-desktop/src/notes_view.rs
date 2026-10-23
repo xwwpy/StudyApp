@@ -2,13 +2,14 @@ use crate::controls::Button;
 use crate::{
     app::{EditorMode, StudyApp},
     components::*,
-    views::note_tip,
     workspace_layout::Pane,
 };
 use gpui_kit::{
     component::{
-        Disableable, Icon, IconName, Selectable, Sizable, button::ButtonVariants, input::Input,
-        menu::ContextMenuExt,
+        Disableable, Icon, IconName, Selectable, Sizable,
+        button::{Button as MenuButton, ButtonVariants},
+        input::Input,
+        menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
     },
     prelude::FluentBuilder,
     *,
@@ -16,28 +17,584 @@ use gpui_kit::{
 use studyapp_core::Snapshot;
 use studyapp_desktop::presentation::{display_path, stamp};
 
+#[derive(Clone, Copy)]
+enum ReaderAction {
+    Export,
+    Move,
+    Unmanage,
+    Relink,
+}
+
+/// The host places this above its normal content and hides the existing native
+/// child for the duration of an external hover. Rendering does not own the drag
+/// payload, inspect paths, or touch the editor document/selection.
+pub fn external_drop_overlay(
+    state: &crate::external_drop::ExternalDropState,
+    cx: &Context<StudyApp>,
+) -> impl IntoElement {
+    use crate::external_drop::DropBlock;
+    let (title, hint, color) = match state.blocked() {
+        Some(DropBlock::Busy) => ("暂时无法导入", "资料库正在处理中，请稍后重试", MUTED),
+        Some(DropBlock::Modal) => ("先完成当前操作", "关闭对话框后，再拖入文件", MUTED),
+        None => ("松开以导入", "Markdown、图片或文件夹", GREEN),
+    };
+    div()
+        .id("external-drop-overlay")
+        .test_support()
+        .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+            this.drop_external_files(paths.paths().to_vec(), window, cx);
+        }))
+        .absolute()
+        .inset_0()
+        .p_4()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(crate::theme::color(BG).opacity(0.96))
+        .child(
+            column()
+                .id("external-drop-surface")
+                .test_support()
+                .w_full()
+                .h_full()
+                .min_w_0()
+                .min_h_0()
+                .gap_2()
+                .items_center()
+                .justify_center()
+                .rounded_xl()
+                .border_2()
+                .border_color(crate::theme::color(color))
+                .bg(crate::theme::color(0xFFFFFF))
+                .child(
+                    div()
+                        .id("external-drop-plus")
+                        .test_support()
+                        .text_size(px(76.))
+                        .line_height(px(84.))
+                        .text_color(crate::theme::color(color))
+                        .child("＋"),
+                )
+                .child(heading(title).text_color(crate::theme::color(INK)))
+                .child(muted(hint))
+                .child(muted(format!("{} 个项目", state.item_count())).text_xs()),
+        )
+}
+
 impl StudyApp {
+    /// Menus participate in the same native-child visibility lifecycle as note
+    /// context menus. The token prevents a released old menu closing a new one.
+    pub(crate) fn library_menu_state(
+        owner: &WeakEntity<Self>,
+        cx: &mut Context<PopupMenu>,
+    ) -> Option<(studyapp_core::LibrarySort, bool, bool)> {
+        let opened = owner
+            .update(cx, |this, cx| {
+                this.snapshot.as_ref()?;
+                this.note_menu_sequence = this.note_menu_sequence.wrapping_add(1);
+                let token = this.note_menu_sequence;
+                this.active_note_menu = Some(token);
+                this.note_content
+                    .update(cx, |editor, cx| editor.set_visible(false, cx));
+                cx.notify();
+                Some((
+                    token,
+                    this.layout.library_sort,
+                    this.show_detached,
+                    this.library_controls_busy(cx),
+                ))
+            })
+            .ok()??;
+        let (token, sort, detached, busy) = opened;
+        let dismissed = owner.clone();
+        cx.subscribe_self(move |_, _: &DismissEvent, cx| {
+            let _ = dismissed.update(cx, |this, cx| {
+                if this.active_note_menu == Some(token) {
+                    this.active_note_menu = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        let released = owner.clone();
+        cx.on_release(move |_, cx| {
+            let _ = released.update(cx, |this, cx| {
+                if this.active_note_menu == Some(token) {
+                    this.active_note_menu = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        Some((sort, detached, busy))
+    }
+
+    pub(crate) fn library_controls_busy(&self, cx: &App) -> bool {
+        self.storage_busy
+            || self.media_busy()
+            || self.preferences_ui.busy
+            || self.preferences_ui.replacing
+            || self.note_saving
+            || self.has_modal(cx)
+    }
+
+    pub(crate) fn library_add_button(&self, cx: &Context<Self>) -> AnyElement {
+        let owner = cx.weak_entity();
+        MenuButton::new("library-add-menu")
+            .small()
+            .ghost()
+            .icon(IconName::Plus)
+            .accessibility_label("新建或导入")
+            .tooltip("新建或导入")
+            .cursor_pointer()
+            .disabled(self.library_controls_busy(cx))
+            .dropdown_menu(move |menu, _, cx| {
+                let Some((_, _, busy)) = Self::library_menu_state(&owner, cx) else {
+                    return menu;
+                };
+                let create_note = owner.clone();
+                let create_folder = owner.clone();
+                let import_files = owner.clone();
+                let import_folder = owner.clone();
+                let can_create = owner
+                    .update(cx, |this, cx| this.folders.read(cx).can_create_folder())
+                    .unwrap_or(false);
+                menu.min_w(px(196.))
+                    .item(
+                        PopupMenuItem::new("新建 Markdown")
+                            .icon(IconName::FileText)
+                            .disabled(busy)
+                            .on_click(move |_, window, cx| {
+                                let _ = create_note.update(cx, |this, cx| {
+                                    if !this.library_controls_busy(cx) {
+                                        this.new_note(window, cx);
+                                    }
+                                });
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("新建文件夹")
+                            .icon(IconName::Folder)
+                            .disabled(busy || !can_create)
+                            .on_click(move |_, window, cx| {
+                                let _ = create_folder.update(cx, |this, cx| {
+                                    if !this.library_controls_busy(cx) {
+                                        this.folders.update(cx, |panel, cx| {
+                                            panel.begin_create_folder(window, cx)
+                                        });
+                                    }
+                                });
+                            }),
+                    )
+                    .separator()
+                    .item(PopupMenuItem::new("导入文件…").disabled(busy).on_click(
+                        move |_, _, cx| {
+                            let _ = import_files.update(cx, |this, cx| {
+                                if !this.library_controls_busy(cx) {
+                                    this.settings_picker("import", None, cx);
+                                }
+                            });
+                        },
+                    ))
+                    .item(PopupMenuItem::new("导入文件夹…").disabled(busy).on_click(
+                        move |_, _, cx| {
+                            let _ = import_folder.update(cx, |this, cx| {
+                                if !this.library_controls_busy(cx) {
+                                    this.settings_picker("import-folder", None, cx);
+                                }
+                            });
+                        },
+                    ))
+            })
+            .into_any_element()
+    }
+
+    fn library_sort_button(&self, cx: &Context<Self>) -> AnyElement {
+        let owner = cx.weak_entity();
+        MenuButton::new("library-sort-menu")
+            .small()
+            .ghost()
+            .label("↕")
+            .accessibility_label("排序方式")
+            .tooltip("排序方式")
+            .cursor_pointer()
+            .disabled(self.library_controls_busy(cx))
+            .dropdown_menu(move |mut menu, _, cx| {
+                let Some((selected, _, busy)) = Self::library_menu_state(&owner, cx) else {
+                    return menu;
+                };
+                menu = menu.min_w(px(208.));
+                for (sort, label) in crate::note_actions::LIBRARY_SORT_OPTIONS {
+                    let action_owner = owner.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .checked(selected == sort)
+                            .disabled(busy)
+                            .on_click(move |_, _, cx| {
+                                let _ = action_owner.update(cx, |this, cx| {
+                                    if !this.library_controls_busy(cx) {
+                                        this.layout.library_sort = sort;
+                                        this.persist_layout(cx);
+                                    }
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
+    }
+
+    fn library_more_button(&self, cx: &Context<Self>) -> AnyElement {
+        let owner = cx.weak_entity();
+        MenuButton::new("library-more-menu")
+            .small()
+            .ghost()
+            .label("⋯")
+            .accessibility_label("笔记库选项")
+            .tooltip("笔记库选项")
+            .cursor_pointer()
+            .disabled(self.library_controls_busy(cx))
+            .dropdown_menu(move |menu, _, cx| {
+                let Some((_, detached, busy)) = Self::library_menu_state(&owner, cx) else {
+                    return menu;
+                };
+                let action_owner = owner.clone();
+                menu.min_w(px(208.)).item(
+                    PopupMenuItem::new("查看已取消管理")
+                        .checked(detached)
+                        .disabled(busy)
+                        .on_click(move |_, _, cx| {
+                            let _ = action_owner.update(cx, |this, cx| {
+                                if this.library_controls_busy(cx) {
+                                    return;
+                                }
+                                this.show_detached = !this.show_detached;
+                                this.selected_note = this.snapshot.as_ref().and_then(|s| {
+                                    s.notes
+                                        .iter()
+                                        .find(|n| {
+                                            n.detached == this.show_detached
+                                                && this.folders.read(cx).filter().matches(n)
+                                        })
+                                        .map(|n| n.id.clone())
+                                });
+                                this.selected_version = None;
+                                cx.notify();
+                            });
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn reader_more_button(
+        &self,
+        note: &studyapp_core::Note,
+        version: Option<String>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let owner = cx.weak_entity();
+        let note_id = note.id.clone();
+        let library = self.last_library.clone();
+        MenuButton::new("note-more-menu")
+            .small()
+            .ghost()
+            .label("⋯")
+            .cursor_pointer()
+            .accessibility_label("更多笔记操作")
+            .tooltip("更多笔记操作")
+            .disabled(self.library_controls_busy(cx))
+            .dropdown_menu(move |mut menu, _, cx| {
+                let Some((_, _, busy)) = Self::library_menu_state(&owner, cx) else {
+                    return menu;
+                };
+                let current = owner
+                    .update(cx, |this, cx| {
+                        let snapshot = this.snapshot.as_ref().filter(|s| s.data_path == library)?;
+                        let note = snapshot.notes.iter().find(|n| n.id == note_id)?.clone();
+                        Some((note, this.sync_panel.read(cx).status.busy))
+                    })
+                    .ok()
+                    .flatten();
+                let Some((note, sync_busy)) = current else {
+                    return menu
+                        .item(PopupMenuItem::new("笔记已移除或资料库已切换").disabled(true));
+                };
+                menu = menu.min_w(px(210.));
+                for (label, action, visible, disabled) in [
+                    ("导出 Markdown…", ReaderAction::Export, true, busy),
+                    ("移动到目录…", ReaderAction::Move, true, busy),
+                    (
+                        "取消管理…",
+                        ReaderAction::Unmanage,
+                        !note.detached,
+                        busy || sync_busy,
+                    ),
+                    (
+                        "重新关联文件…",
+                        ReaderAction::Relink,
+                        !note.managed && !note.detached,
+                        busy,
+                    ),
+                ] {
+                    if !visible {
+                        continue;
+                    }
+                    let action_owner = owner.clone();
+                    let action_id = note_id.clone();
+                    let action_library = library.clone();
+                    let action_version = version.clone();
+                    menu = menu.item(PopupMenuItem::new(label).disabled(disabled).on_click(
+                        move |_, _, cx| {
+                            let _ = action_owner.update(cx, |this, cx| {
+                                if this.library_controls_busy(cx)
+                                    || this.snapshot.as_ref().is_none_or(|s| {
+                                        s.data_path != action_library
+                                            || !s.notes.iter().any(|n| n.id == action_id)
+                                    })
+                                {
+                                    return;
+                                }
+                                match action {
+                                    ReaderAction::Export => {
+                                        this.export_note(action_id.clone(), action_version.clone())
+                                    }
+                                    ReaderAction::Move => this.folders.update(cx, |panel, cx| {
+                                        panel.begin_move_note(action_id.clone(), cx)
+                                    }),
+                                    ReaderAction::Unmanage => {
+                                        if this.sync_panel.read(cx).status.busy {
+                                            return;
+                                        }
+                                        this.confirmation = Some(
+                                            crate::editor_lifecycle::NoteConfirmation::Unmanage(
+                                                action_id.clone(),
+                                            ),
+                                        );
+                                        cx.notify();
+                                    }
+                                    ReaderAction::Relink => {
+                                        this.picker("relink", Some(action_id.clone()))
+                                    }
+                                }
+                            });
+                        },
+                    ));
+                }
+                menu
+            })
+            .into_any_element()
+    }
+
     pub fn notes(&self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let layout = self.effective_layout(window);
         let query = self.search.read(cx).value().to_lowercase();
-        let notes = snapshot
-            .notes
-            .iter()
-            .filter(|n| {
-                n.detached == self.show_detached && self.folders.read(cx).filter().matches(n)
-            })
-            .filter(|n| {
-                query.is_empty()
-                    || n.title.to_lowercase().contains(&query)
-                    || n.path.to_lowercase().contains(&query)
-                    || snapshot
-                        .versions
-                        .iter()
-                        .rev()
-                        .find(|v| v.note_id == n.id)
-                        .is_some_and(|v| v.content.to_lowercase().contains(&query))
-            })
+        let index = self.folders.read(cx).library_index();
+        let visible = self.folders.update(cx, |panel, _| {
+            panel.visible_notes(
+                &query,
+                self.layout.library_sort,
+                self.selected_note.as_deref(),
+                self.show_detached,
+            )
+        });
+        let notes = visible
+            .into_iter()
+            .filter_map(|position| snapshot.notes.get(position))
             .collect::<Vec<_>>();
+        let note_count = index
+            .ordered_notes(self.layout.library_sort)
+            .iter()
+            .filter_map(|&position| snapshot.notes.get(position))
+            .filter(|note| note.detached == self.show_detached && index.matches(&note.id, &query))
+            .count();
+        let mut note_rows: std::collections::HashMap<Option<String>, Vec<AnyElement>> =
+            std::collections::HashMap::new();
+        for note in notes {
+            let id = note.id.clone();
+            let drag = crate::note_actions::NoteDrag::new(note, snapshot);
+            let menu_note_id = id.clone();
+            let menu_owner = cx.weak_entity();
+            let metadata = index.note(&id);
+            let mut tip = metadata
+                .map(|m| format!("{}\n修改时间：{}", m.tip, m.updated_stamp))
+                .unwrap_or_default();
+            if snapshot.settings.show_file_paths {
+                tip.push_str(&format!("\n{}", display_path(&note.path)));
+            }
+            let chosen = self.selected_note.as_ref() == Some(&id);
+            let element = row()
+                .id(SharedString::from(format!("note-{id}")))
+                .test_support()
+                .px_2()
+                .h(px(32.))
+                .rounded_md()
+                .border_1()
+                .border_color(rgba(0))
+                .flex_shrink_0()
+                .min_w_0()
+                .gap_2()
+                .cursor_pointer()
+                .hover(|style| style.bg(crate::theme::color(BG)))
+                .when(chosen, |c| {
+                    c.bg(crate::theme::color(LIGHT))
+                        .border_color(crate::theme::color(BORDER))
+                })
+                .child(
+                    Icon::new(IconName::FileText)
+                        .small()
+                        .text_color(crate::theme::color(if note.managed && !note.detached {
+                            GREEN
+                        } else {
+                            MUTED
+                        })),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_sm()
+                        .child(note.title.clone()),
+                )
+                .when(
+                    metadata.is_some_and(|m| {
+                        m.status != studyapp_desktop::library_tree::StudyStatus::Recorded
+                    }),
+                    |r| {
+                        let status = metadata.unwrap().status;
+                        r.child(
+                            div()
+                                .id(SharedString::from(format!("note-status-{}", note.id)))
+                                .test_support()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(crate::theme::color(
+                                    if status == studyapp_desktop::library_tree::StudyStatus::Added
+                                    {
+                                        GREEN
+                                    } else {
+                                        0xA36400
+                                    },
+                                ))
+                                .child(
+                                    if status == studyapp_desktop::library_tree::StudyStatus::Added
+                                    {
+                                        "A"
+                                    } else {
+                                        "M"
+                                    },
+                                ),
+                        )
+                    },
+                )
+                .when(!note.managed || note.detached || note.missing, |r| {
+                    r.child(
+                        div()
+                            .id(SharedString::from(format!("note-source-{}", note.id)))
+                            .test_support()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(crate::theme::color(MUTED))
+                            .child(if note.missing {
+                                "失联"
+                            } else if note.detached {
+                                "已移除"
+                            } else {
+                                "跟踪"
+                            }),
+                    )
+                })
+                // Anchor within the sidebar so native editor children cannot
+                // cover learning/review timestamps near the row's right edge.
+                .tooltip(move |window, cx| sidebar_tooltip(tip.clone(), window, cx))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.media_busy() {
+                        return;
+                    }
+                    this.folders.update(cx, |panel, cx| {
+                        panel.align_note_context(&id, cx);
+                    });
+                    this.selected_note = Some(id.clone());
+                    this.selected_version = None;
+                    cx.notify();
+                }))
+                .on_drag(drag, |drag, source_offset, _, cx| {
+                    cx.new(|_| crate::note_actions::NoteDragPreview::new(drag, source_offset))
+                })
+                .context_menu(move |menu, window, cx| {
+                    let opened = menu_owner.update(cx, |this, cx| {
+                        let snapshot = this.snapshot.clone()?;
+                        let note = snapshot
+                            .notes
+                            .iter()
+                            .find(|n| n.id == menu_note_id)?
+                            .clone();
+                        this.note_menu_sequence = this.note_menu_sequence.wrapping_add(1);
+                        let token = this.note_menu_sequence;
+                        this.active_note_menu = Some(token);
+                        this.note_content
+                            .update(cx, |editor, cx| editor.set_visible(false, cx));
+                        cx.notify();
+                        Some((
+                            snapshot,
+                            note,
+                            token,
+                            this.storage_busy || this.media_busy(),
+                        ))
+                    });
+                    let Ok(Some((snapshot, note, token, busy))) = opened else {
+                        return menu;
+                    };
+                    let dismissed = menu_owner.clone();
+                    cx.subscribe_self(move |_, _: &DismissEvent, cx| {
+                        let _ = dismissed.update(cx, |this, cx| {
+                            if this.active_note_menu == Some(token) {
+                                this.active_note_menu = None;
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .detach();
+                    let released = menu_owner.clone();
+                    cx.on_release(move |_, cx| {
+                        let _ = released.update(cx, |this, cx| {
+                            if this.active_note_menu == Some(token) {
+                                this.active_note_menu = None;
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .detach();
+                    let action_owner = menu_owner.clone();
+                    crate::note_actions::note_context_menu(
+                        menu,
+                        &snapshot,
+                        &note,
+                        busy,
+                        window,
+                        cx,
+                        move |action, _, cx| {
+                            let _ = action_owner
+                                .update(cx, |this, cx| this.handle_note_action(action, cx));
+                        },
+                    )
+                });
+            note_rows
+                .entry(note.folder_id.clone())
+                .or_default()
+                .push(element.into_any_element());
+        }
+        let tree = self.folders.update(cx, |panel, cx| {
+            panel.library_tree(
+                note_rows,
+                &query,
+                self.layout.library_sort,
+                self.selected_note.as_deref(),
+                cx,
+            )
+        });
         let list = column()
             .id("notes-pane")
             .test_support()
@@ -47,25 +604,26 @@ impl StudyApp {
             .min_h_0()
             .min_w_0()
             .gap_2()
-            .bg(rgb(0xFFFFFF))
+            .bg(crate::theme::color(0xFFFFFF))
             .overflow_hidden()
             .child(
                 row()
-                    .px_3()
+                    .px_2()
+                    .gap_1()
                     .h(px(46.))
                     .flex_shrink_0()
                     .border_b_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(crate::theme::color(BORDER))
                     .child(
                         Button::new("toggle-folders")
                             .small()
                             .ghost()
                             .icon(IconName::PanelLeft)
-                            .accessibility_label("展开或收起笔记目录")
+                            .accessibility_label("展开或收起笔记库")
                             .tooltip(if self.layout.folders_visible {
-                                "收起笔记目录"
+                                "收起笔记库"
                             } else {
-                                "展开笔记目录"
+                                "展开笔记库"
                             })
                             .disabled(
                                 self.storage_busy
@@ -74,189 +632,25 @@ impl StudyApp {
                             )
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_folders(cx))),
                     )
-                    .child(Icon::new(IconName::FileText).small().text_color(rgb(GREEN)))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("笔记"),
+                            .child(if self.show_detached {
+                                "已取消管理"
+                            } else {
+                                "笔记库"
+                            }),
                     )
-                    .child(pill(notes.len().to_string(), BG)),
+                    .child(muted(note_count.to_string()).text_xs())
+                    .child(self.library_add_button(cx))
+                    .child(self.library_sort_button(cx))
+                    .child(self.library_more_button(cx)),
             )
             .child(div().px_2().child(Input::new(&self.search).cleanable(true)))
-            .child(
-                Button::new("show-detached-notes")
-                    .small()
-                    .ghost()
-                    .selected(self.show_detached)
-                    .label(if self.show_detached {
-                        "返回管理中的笔记"
-                    } else {
-                        "查看已取消管理"
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_detached = !this.show_detached;
-                        this.selected_note = this.snapshot.as_ref().and_then(|s| {
-                            s.notes
-                                .iter()
-                                .find(|n| {
-                                    n.detached == this.show_detached
-                                        && this.folders.read(cx).filter().matches(n)
-                                })
-                                .map(|n| n.id.clone())
-                        });
-                        this.selected_version = None;
-                        cx.notify();
-                    })),
-            )
-            .child(muted("拖入 Markdown 或文件夹").text_xs().px_3())
-            .child(
-                Button::new("import-note-folder")
-                    .small()
-                    .ghost()
-                    .label("导入文件夹")
-                    .on_click(cx.listener(|this, _, _, _| this.picker("import-folder", None))),
-            )
-            .child(
-                column()
-                    .id("note-list-scroll")
-                    .test_support()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .px_2()
-                    .pb_2()
-                    .gap_2()
-                    .overflow_y_scroll()
-                    .children(notes.into_iter().map(|note| {
-                        let id = note.id.clone();
-                        let drag = crate::note_actions::NoteDrag::new(note, snapshot);
-                        let menu_note_id = id.clone();
-                        let menu_owner = cx.weak_entity();
-                        let tip = note_tip(snapshot, &id);
-                        let chosen = self.selected_note.as_ref() == Some(&id);
-                        card()
-                            .id(SharedString::from(format!("note-{id}")))
-                            .test_support()
-                            .p_3()
-                            .rounded_lg()
-                            .flex_shrink_0()
-                            .min_w_0()
-                            .gap_2()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(BG)).border_color(rgb(0xCEDCD3)))
-                            .when(chosen, |c| c.border_color(rgb(GREEN)).bg(rgb(LIGHT)))
-                            .child(
-                                row()
-                                    .gap_2()
-                                    .min_w_0()
-                                    .child(
-                                        Icon::new(IconName::FileText)
-                                            .small()
-                                            .text_color(rgb(GREEN)),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .truncate()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(note.title.clone()),
-                                    ),
-                            )
-                            .child(
-                                muted(format!(
-                                    "{} 个版本  ·  {}",
-                                    snapshot.versions.iter().filter(|v| v.note_id == id).count(),
-                                    stamp(note.updated_at)
-                                ))
-                                .text_xs()
-                                .truncate(),
-                            )
-                            .when(snapshot.settings.show_file_paths, |c| {
-                                c.child(
-                                    muted(display_path(&note.path))
-                                        .id(SharedString::from(format!(
-                                            "note-row-path-{}",
-                                            note.id
-                                        )))
-                                        .test_support()
-                                        .truncate(),
-                                )
-                            })
-                            .when(note.missing, |c| c.child(pill("原文件失联", 0xFFF0E9)))
-                            // Anchor within the sidebar so native editor children cannot
-                            // cover learning/review timestamps near the row's right edge.
-                            .tooltip(move |window, cx| sidebar_tooltip(tip.clone(), window, cx))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.selected_note = Some(id.clone());
-                                this.selected_version = None;
-                                cx.notify();
-                            }))
-                            .on_drag(drag, |drag, source_offset, _, cx| {
-                                cx.new(|_| {
-                                    crate::note_actions::NoteDragPreview::new(drag, source_offset)
-                                })
-                            })
-                            .context_menu(move |menu, window, cx| {
-                                let opened = menu_owner.update(cx, |this, cx| {
-                                    let snapshot = this.snapshot.clone()?;
-                                    let note = snapshot
-                                        .notes
-                                        .iter()
-                                        .find(|n| n.id == menu_note_id)?
-                                        .clone();
-                                    this.note_menu_sequence =
-                                        this.note_menu_sequence.wrapping_add(1);
-                                    let token = this.note_menu_sequence;
-                                    this.active_note_menu = Some(token);
-                                    this.note_content
-                                        .update(cx, |editor, cx| editor.set_visible(false, cx));
-                                    cx.notify();
-                                    Some((snapshot, note, token, this.storage_busy))
-                                });
-                                let Ok(Some((snapshot, note, token, busy))) = opened else {
-                                    return menu;
-                                };
-                                let dismissed = menu_owner.clone();
-                                cx.subscribe_self(move |_, _: &DismissEvent, cx| {
-                                    let _ = dismissed.update(cx, |this, cx| {
-                                        if this.active_note_menu == Some(token) {
-                                            this.active_note_menu = None;
-                                            cx.notify();
-                                        }
-                                    });
-                                })
-                                .detach();
-                                let released = menu_owner.clone();
-                                cx.on_release(move |_, cx| {
-                                    let _ = released.update(cx, |this, cx| {
-                                        if this.active_note_menu == Some(token) {
-                                            this.active_note_menu = None;
-                                            cx.notify();
-                                        }
-                                    });
-                                })
-                                .detach();
-                                let action_owner = menu_owner.clone();
-                                crate::note_actions::note_context_menu(
-                                    menu,
-                                    &snapshot,
-                                    &note,
-                                    busy,
-                                    window,
-                                    cx,
-                                    move |action, _, cx| {
-                                        let _ = action_owner.update(cx, |this, cx| {
-                                            this.handle_note_action(action, cx)
-                                        });
-                                    },
-                                )
-                            })
-                    })),
-            );
+            .child(tree);
         let selected = snapshot
             .notes
             .iter()
@@ -266,9 +660,6 @@ impl StudyApp {
         } else if let Some(note) = selected {
             let id = note.id.clone();
             let managed = note.managed && !note.detached;
-            let move_id = id.clone();
-            let unmanage_id = id.clone();
-            let export_id = id.clone();
             let export_version = self.selected_version.clone();
             let versions: Vec<_> = snapshot
                 .versions
@@ -306,18 +697,12 @@ impl StudyApp {
                     row()
                         .flex_shrink_0()
                         .flex_wrap()
-                        .child(
-                            heading(note.title.clone())
-                                .max_w(px(280.))
-                                .min_w_0()
-                                .truncate(),
-                        )
-                        .child(div().flex_1())
+                        .child(heading(note.title.clone()).flex_1().min_w_0().truncate())
                         .child(
                             Button::new("record-note")
                                 .small()
                                 .primary()
-                                .label("记录学习")
+                                .label("记录")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_editor(EditorMode::Manual, window, cx)
                                 })),
@@ -327,66 +712,18 @@ impl StudyApp {
                                 .small()
                                 .ghost()
                                 .label(if historical {
-                                    "复制此版本后编辑"
+                                    "复制版本"
                                 } else if managed {
-                                    "编辑笔记"
+                                    "编辑"
                                 } else {
-                                    "复制后编辑"
+                                    "创建托管副本"
                                 })
                                 .disabled(self.storage_busy)
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.open_note_editor(copy, window, cx)
                                 })),
                         )
-                        .child(
-                            Button::new("export-note")
-                                .small()
-                                .ghost()
-                                .label("导出 Markdown")
-                                .on_click(cx.listener(move |this, _, _, _| {
-                                    this.export_note(export_id.clone(), export_version.clone())
-                                })),
-                        )
-                        .child(
-                            Button::new("move-note-folder")
-                                .small()
-                                .ghost()
-                                .label("移动到目录")
-                                .disabled(self.storage_busy)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.folders.update(cx, |panel, cx| {
-                                        panel.begin_move_note(move_id.clone(), cx)
-                                    });
-                                })),
-                        )
-                        .when(!note.detached, |r| {
-                            r.child(
-                                Button::new("unmanage-note")
-                                    .small()
-                                    .ghost()
-                                    .disabled(self.sync_panel.read(cx).status.busy)
-                                    .label("取消管理")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.confirmation = Some(
-                                            crate::editor_lifecycle::NoteConfirmation::Unmanage(
-                                                unmanage_id.clone(),
-                                            ),
-                                        );
-                                        cx.notify();
-                                    })),
-                            )
-                        })
-                        .when(!note.managed && !note.detached, |r| {
-                            r.child(
-                                Button::new("relink-note")
-                                    .small()
-                                    .ghost()
-                                    .label("重新关联")
-                                    .on_click(cx.listener(move |this, _, _, _| {
-                                        this.picker("relink", Some(id.clone()))
-                                    })),
-                            )
-                        }),
+                        .child(self.reader_more_button(note, export_version, cx)),
                 )
                 .when(note.detached, |c| {
                     c.child(muted("已取消管理 · 当前仅查看历史快照"))
@@ -441,10 +778,16 @@ impl StudyApp {
                         ),
                 )
                 .child(
-                    muted(note_tip(snapshot, &note.id).replace('\n', " · "))
-                        .truncate()
-                        .text_xs()
-                        .flex_shrink_0(),
+                    muted(
+                        index
+                            .note(&note.id)
+                            .map(|m| m.tip.clone())
+                            .unwrap_or_default()
+                            .replace('\n', " · "),
+                    )
+                    .truncate()
+                    .text_xs()
+                    .flex_shrink_0(),
                 );
             if self.history {
                 // At narrow widths, a vertical version rail would leave the
@@ -557,12 +900,7 @@ impl StudyApp {
                     })))
                 )))
             .child(row().items_stretch().gap_0().flex_1().min_h_0().min_w_0().w_full().overflow_hidden()
-                .when(self.layout.folders_visible, |view| view
-                    .child(div().id("folders-pane").test_support().w(layout.folders).h_full().min_h_0().min_w_0()
-                        .flex_shrink_0().bg(rgb(0xF7F9F6)).child(self.folders.clone()))
-                    .child(self.resize_handle(Pane::Folders, cx)))
-                .child(list)
-                .child(self.resize_handle(Pane::Notes, cx))
+                .when(self.layout.folders_visible, |view| view.child(list).child(self.resize_handle(Pane::Notes, cx)))
                 .child(div().id("document-pane").test_support().flex().flex_1().h_full().min_h_0().min_w_0().overflow_hidden().child(detail)))
     }
 }

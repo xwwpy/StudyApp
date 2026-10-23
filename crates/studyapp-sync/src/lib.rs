@@ -64,6 +64,44 @@ pub trait Provider: Send + Sync {
     fn write(&self, id: &str, content: &str, expected_revision: Option<&str>)
     -> Result<RemoteNote>;
     fn test_connection(&self) -> Result<()>;
+    /// Immutable assets have no overwrite or deletion operation and never enter note listings.
+    fn read_asset(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    fn write_asset(&self, key: &str, bytes: &[u8]) -> Result<()>;
+}
+
+pub fn validate_asset_key(key: &str) -> Result<()> {
+    let parts: Vec<_> = key.split('/').collect();
+    if parts.len() != 3 || parts[0] != "assets" {
+        return Err(SyncError::InvalidPath);
+    }
+    validate_id(parts[1])?;
+    let name = parts[2];
+    if name.len() > 240
+        || name.is_empty()
+        || name.starts_with('.')
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(SyncError::InvalidPath);
+    }
+    if !["png", "jpg", "jpeg", "gif", "webp", "bmp"]
+        .contains(&name.rsplit('.').next().unwrap_or(""))
+    {
+        return Err(SyncError::InvalidPath);
+    }
+    Ok(())
+}
+
+fn bounded_bytes(reader: impl Read) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_CONTENT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_CONTENT_BYTES {
+        return Err(SyncError::LimitExceeded);
+    }
+    Ok(bytes)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

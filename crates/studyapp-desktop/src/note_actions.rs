@@ -6,6 +6,13 @@ use gpui_kit::{
 use std::rc::Rc;
 use studyapp_core::{Note, Snapshot};
 
+pub const LIBRARY_SORT_OPTIONS: [(studyapp_core::LibrarySort, &str); 4] = [
+    (studyapp_core::LibrarySort::NameAscending, "名称 · A → Z"),
+    (studyapp_core::LibrarySort::NameDescending, "名称 · Z → A"),
+    (studyapp_core::LibrarySort::Newest, "修改时间 · 从新到旧"),
+    (studyapp_core::LibrarySort::Oldest, "修改时间 · 从旧到新"),
+];
+
 /// Drag only carries logical identity; neither dragging nor dropping touches files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoteDrag {
@@ -72,12 +79,17 @@ impl Render for NoteDragPreview {
                     .py_2()
                     .rounded_lg()
                     .border_1()
-                    .border_color(rgb(GREEN))
-                    .bg(rgb(LIGHT))
-                    .text_color(rgb(INK))
+                    .border_color(crate::theme::color(GREEN))
+                    .bg(crate::theme::color(LIGHT))
+                    .text_color(crate::theme::color(INK))
                     .text_sm()
                     .shadow_md()
-                    .child(div().flex_shrink_0().text_color(rgb(GREEN)).child("MD"))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(crate::theme::color(GREEN))
+                            .child("MD"),
+                    )
                     .child(div().min_w_0().truncate().child(self.title.clone())),
             )
     }

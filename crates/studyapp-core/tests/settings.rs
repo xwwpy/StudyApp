@@ -2,6 +2,68 @@ use serde_json::{Value, json};
 use studyapp_core::{Command, Engine, LayoutSettings, Settings};
 
 #[test]
+fn legacy_settings_supply_system_appearance_without_disk_migration() {
+    let settings: Settings = serde_json::from_value(json!({
+        "interval_minutes": 45, "answer_minutes": 3, "review_days": [1, 5]
+    }))
+    .unwrap();
+    let value = serde_json::to_value(settings).unwrap();
+    assert_eq!(value["appearance"]["mode"], "system");
+    assert_eq!(value["appearance"]["font_size"], 14);
+}
+
+#[test]
+fn unsafe_or_unreadable_custom_appearance_cannot_be_saved() {
+    let directory = tempfile::tempdir().unwrap().keep();
+    let mut engine = Engine::open(&directory.join("appearance.sqlite"), 1000).unwrap();
+    let original = engine.snapshot().settings;
+    for palette in [
+        json!({"accent":"red;url(javascript:x)","background":"#ffffff","surface":"#ffffff","text":"#202020"}),
+        json!({"accent":"#007aff","background":"#ffffff","surface":"#ffffff","text":"#ffffff"}),
+    ] {
+        let mut proposed = serde_json::to_value(&original).unwrap();
+        proposed["appearance"] = json!({"mode":"custom","active_preset":"unsafe","custom_presets":[{"id":"unsafe","name":"Unsafe","palette":palette}],"font_size":14,"spacing":8});
+        let proposed = serde_json::from_value(proposed).unwrap();
+        assert!(engine.apply(Command::SaveSettings(proposed), 1001).is_err());
+        assert_eq!(engine.snapshot().settings, original);
+    }
+}
+
+#[test]
+fn custom_theme_presets_round_trip_and_reject_missing_selection_and_duplicates() {
+    use studyapp_core::{AppearanceSettings, ThemeMode, ThemePalette, ThemePreset};
+    let mut appearance = AppearanceSettings {
+        mode: ThemeMode::Custom,
+        active_preset: Some("paper".into()),
+        custom_presets: vec![ThemePreset {
+            id: "paper".into(),
+            name: "Paper".into(),
+            palette: ThemePalette::default(),
+        }],
+        font_size: 16,
+        spacing: 12,
+    };
+    assert!(appearance.validate().is_ok());
+    assert_eq!(
+        serde_json::from_value::<AppearanceSettings>(serde_json::to_value(&appearance).unwrap())
+            .unwrap(),
+        appearance
+    );
+    appearance
+        .custom_presets
+        .push(appearance.custom_presets[0].clone());
+    assert!(appearance.validate().is_err());
+    appearance.custom_presets.pop();
+    appearance.active_preset = Some("missing".into());
+    assert!(appearance.validate().is_err());
+    appearance.active_preset = Some("paper".into());
+    for size in [0, 11, 23, u16::MAX] {
+        appearance.font_size = size;
+        assert!(appearance.validate().is_err());
+    }
+}
+
+#[test]
 fn legacy_settings_restore_default_workspace_layout() {
     let settings: Settings = serde_json::from_value(json!({
         "interval_minutes": 45, "answer_minutes": 3, "review_days": [1, 5]
@@ -10,8 +72,8 @@ fn legacy_settings_restore_default_workspace_layout() {
     assert_eq!(
         serde_json::to_value(settings).unwrap()["layout"],
         json!({
-            "navigation_width": 160, "folders_width": 144, "notes_width": 200,
-            "navigation_visible": true, "folders_visible": true
+            "navigation_width": 160, "folders_width": 144, "notes_width": 280,
+            "navigation_visible": true, "folders_visible": true, "library_sort": "name_ascending"
         })
     );
 }
@@ -26,6 +88,7 @@ fn workspace_layout_persists_without_changing_learning_or_path_settings() {
         notes_width: 320,
         navigation_visible: false,
         folders_visible: true,
+        library_sort: studyapp_core::LibrarySort::Newest,
     };
     for layout_first in [false, true] {
         let mut engine = Engine::open(&database, 1000).unwrap();
@@ -83,6 +146,7 @@ fn invalid_workspace_widths_are_rejected_without_persisting_changes() {
             notes_width,
             navigation_visible: false,
             folders_visible: true,
+            library_sort: studyapp_core::LibrarySort::Newest,
         };
         assert!(
             engine
@@ -205,6 +269,8 @@ fn rapid_updates(learning_first: bool) {
             review_days: vec![2, 6, 15],
             show_file_paths: !initially_visible,
             layout: Default::default(),
+            appearance: Default::default(),
+            images: Default::default(),
         };
         assert_eq!(
             engine.snapshot().settings,

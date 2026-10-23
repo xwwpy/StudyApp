@@ -11,7 +11,7 @@ async fn pause(cx: &AsyncApp) {
         .await;
 }
 
-async fn bridge(
+pub(crate) async fn bridge(
     window: AnyWindowHandle,
     editor: &Entity<MarkdownEditor>,
     mut action: Value,
@@ -64,6 +64,30 @@ async fn settled(window: AnyWindowHandle, view: &Entity<StudyApp>, cx: &mut Asyn
     panic!("native note operation timed out");
 }
 
+async fn dismiss_error_notice(window: AnyWindowHandle, view: &Entity<StudyApp>, cx: &mut AsyncApp) {
+    let dismissed = window
+        .update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            if window.try_find("dismiss-notice").is_some() {
+                window.click("dismiss-notice", cx);
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap();
+    if dismissed {
+        crate::smoke_library::until(
+            window,
+            view,
+            "error notification finished dismissal before recovery",
+            |app, cx| app.notifications.read(cx).visible_count() == 0,
+            cx,
+        )
+        .await;
+    }
+}
+
 pub async fn exercise(
     window: AnyWindowHandle,
     view: &Entity<StudyApp>,
@@ -73,7 +97,7 @@ pub async fn exercise(
     let editor = window
         .update(cx, |_, window, cx| {
             assert_eq!(view.read(cx).snapshot.as_ref().unwrap().notes.len(), 2);
-            window.click("new-note", cx);
+            crate::smoke_library::library_add(window, false, cx);
             view.update(cx, |app, cx| {
                 app.note_title
                     .update(cx, |s, cx| s.set_value("连续编辑测试", window, cx))
@@ -163,6 +187,7 @@ pub async fn exercise(
     );
     window
         .update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| app.clear_notices(cx));
             window.resize(size(px(1000.), px(700.)));
             window.render_frame(cx);
             editor.read(cx).inject_test_error(false);
@@ -171,6 +196,7 @@ pub async fn exercise(
     for _ in 0..5 {
         pause(cx).await;
     }
+    dismiss_error_notice(window, view, cx).await;
     window
         .update(cx, |_, window, cx| {
             assert!(editor.read(cx).error().is_some());
@@ -243,6 +269,7 @@ pub async fn exercise(
     settled(window, view, cx).await;
     window
         .update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| app.clear_notices(cx));
             window.render_frame(cx);
             editor.read(cx).inject_test_error(false);
         })
@@ -250,6 +277,7 @@ pub async fn exercise(
     for _ in 0..5 {
         pause(cx).await;
     }
+    dismiss_error_notice(window, view, cx).await;
     window
         .update(cx, |_, window, cx| {
             window.render_frame(cx);
@@ -263,9 +291,18 @@ pub async fn exercise(
         bridge(window, &editor, json!({"type":"snapshot"}), cx).await["readonly"],
         true
     );
+    #[cfg(windows)]
+    crate::smoke_visibility::managed_body_edit(window, view, &editor, cx).await;
     let (id, path) = window
         .update(cx, |_, window, cx| {
             let app = view.read(cx);
+            #[cfg(windows)]
+            assert!(
+                app.note_editor.is_some(),
+                "managed body click did not create draft: {:?}",
+                app.notice
+            );
+            #[cfg(not(windows))]
             assert!(app.note_editor.is_none(), "{:?}", app.notice);
             let id = app.selected_note.clone().unwrap();
             let note = app
@@ -279,6 +316,7 @@ pub async fn exercise(
             assert!(note.managed);
             let path = note.path.clone();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+            #[cfg(not(windows))]
             window.click("edit-note", cx);
             let crlf = "# 中文 🧠\r\n\r\n第二次保存，保留历史。\r\n";
             editor.update(cx, |e, cx| e.set_value(crlf.into(), window, cx));
@@ -308,7 +346,9 @@ pub async fn exercise(
     )
     .await;
     window
-        .update(cx, |_, window, cx| window.click("keep-note-draft", cx))
+        .update(cx, |_, window, cx| {
+            crate::smoke_library::editor_action(window, view, false, cx)
+        })
         .unwrap();
     settled(window, view, cx).await;
     window
@@ -331,7 +371,9 @@ pub async fn exercise(
     // Discard an active draft, then discard a separately persisted recovery draft.
     for recovered in [false, true] {
         window
-            .update(cx, |_, window, cx| window.click("new-note", cx))
+            .update(cx, |_, window, cx| {
+                crate::smoke_library::library_add(window, false, cx)
+            })
             .unwrap();
         bridge(
             window,
@@ -342,20 +384,19 @@ pub async fn exercise(
         .await;
         if recovered {
             window
-                .update(cx, |_, window, cx| window.click("keep-note-draft", cx))
+                .update(cx, |_, window, cx| {
+                    crate::smoke_library::editor_action(window, view, false, cx)
+                })
                 .unwrap();
             settled(window, view, cx).await;
         }
         window
             .update(cx, |_, window, cx| {
-                window.click(
-                    if recovered {
-                        "discard-recovered-draft"
-                    } else {
-                        "discard-note-draft"
-                    },
-                    cx,
-                );
+                if recovered {
+                    window.click("discard-recovered-draft", cx);
+                } else {
+                    crate::smoke_library::editor_action(window, view, true, cx);
+                }
                 window.click("confirm-note-action", cx);
             })
             .unwrap();
@@ -379,7 +420,7 @@ pub async fn exercise(
                 cx.notify();
             });
             window.render_frame(cx);
-            window.click("unmanage-note", cx);
+            crate::smoke_library::reader_action(window, 2, cx);
             window.click("confirm-note-action", cx);
         })
         .unwrap();
@@ -428,7 +469,10 @@ pub async fn exercise(
 pub async fn close_with_draft(window: AnyWindowHandle, view: &Entity<StudyApp>, cx: &mut AsyncApp) {
     let editor = window
         .update(cx, |_, window, cx| {
-            view.update(cx, |app, cx| app.new_note(window, cx));
+            view.update(cx, |app, cx| {
+                app.clear_notices(cx);
+                app.new_note(window, cx);
+            });
             window.render_frame(cx);
             view.read(cx).note_content.clone()
         })

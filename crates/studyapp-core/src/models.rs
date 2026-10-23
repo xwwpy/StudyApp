@@ -2,6 +2,15 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 /// Maximum number of logical folders from a root folder to a leaf.
 pub const MAX_FOLDER_DEPTH: usize = 8;
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LibrarySort {
+    #[default]
+    NameAscending,
+    NameDescending,
+    Newest,
+    Oldest,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct LayoutSettings {
@@ -10,6 +19,7 @@ pub struct LayoutSettings {
     pub notes_width: u32,
     pub navigation_visible: bool,
     pub folders_visible: bool,
+    pub library_sort: LibrarySort,
 }
 
 impl Default for LayoutSettings {
@@ -17,9 +27,10 @@ impl Default for LayoutSettings {
         Self {
             navigation_width: 160,
             folders_width: 144,
-            notes_width: 200,
+            notes_width: 280,
             navigation_visible: true,
             folders_visible: true,
+            library_sort: LibrarySort::default(),
         }
     }
 }
@@ -33,6 +44,10 @@ pub struct Settings {
     pub show_file_paths: bool,
     #[serde(default)]
     pub layout: LayoutSettings,
+    #[serde(default)]
+    pub appearance: crate::AppearanceSettings,
+    #[serde(default)]
+    pub images: crate::media_settings::ImageSettings,
 }
 /// Validated configuration, ready to install without another storage operation.
 pub struct PreparedSettings {
@@ -148,6 +163,13 @@ pub enum Command {
         content: String,
     },
     CreateNoteInFolder {
+        title: String,
+        content: String,
+        folder_id: Option<String>,
+    },
+    /// Commit a retained draft without changing the UUID used by its assets.
+    CreateNoteWithId {
+        note_id: String,
         title: String,
         content: String,
         folder_id: Option<String>,

@@ -43,6 +43,29 @@ fn checked_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
 }
 
 impl LocalFolderProvider {
+    fn asset_path(&self, key: &str, create: bool) -> Result<PathBuf> {
+        validate_asset_key(key)?;
+        self.ensure_dirs()?;
+        let mut path = self.root.join("StudyApp");
+        let parts: Vec<_> = key.split('/').collect();
+        for part in &parts[..2] {
+            path.push(part);
+            match checked_metadata(&path)? {
+                Some(m) if m.is_dir() => {}
+                Some(_) => return Err(SyncError::InvalidPath),
+                None if create => {
+                    fs::create_dir(&path)?;
+                }
+                None => return Ok(path.join(parts[2])),
+            }
+            if !checked_metadata(&path)?.is_some_and(|m| m.is_dir())
+                || !fs::canonicalize(&path)?.starts_with(&self.root)
+            {
+                return Err(SyncError::InvalidPath);
+            }
+        }
+        Ok(path.join(parts[2]))
+    }
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         // The chosen parent must exist; never create directories outside it.
@@ -155,6 +178,48 @@ impl LocalFolderProvider {
 }
 
 impl Provider for LocalFolderProvider {
+    fn read_asset(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let (_notes, _lock) = self.locked_dir()?;
+        let path = self.asset_path(key, false)?;
+        let Some(metadata) = checked_metadata(&path)? else {
+            return Ok(None);
+        };
+        if !metadata.is_file() {
+            return Err(SyncError::InvalidPath);
+        }
+        if metadata.len() > MAX_CONTENT_BYTES as u64 {
+            return Err(SyncError::LimitExceeded);
+        }
+        bounded_bytes(File::open(path)?).map(Some)
+    }
+    fn write_asset(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > MAX_CONTENT_BYTES {
+            return Err(SyncError::LimitExceeded);
+        }
+        let (notes, _lock) = self.locked_dir()?;
+        let target = self.asset_path(key, true)?;
+        if checked_metadata(&target)?.is_some() {
+            return Err(SyncError::Conflict);
+        }
+        let staged = self
+            .retained_dir(&notes)?
+            .join(format!("{}.asset-pending", uuid::Uuid::new_v4()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(staged, target).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                SyncError::Conflict
+            } else {
+                e.into()
+            }
+        })?;
+        Ok(())
+    }
     fn list(&self) -> Result<Vec<String>> {
         let (notes, _lock) = self.locked_dir()?;
         let mut ids = Vec::new();

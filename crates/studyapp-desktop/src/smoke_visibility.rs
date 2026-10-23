@@ -447,6 +447,16 @@ pub async fn capture_window(
     capture_visible(&state, path, cx).await;
 }
 
+pub(crate) async fn focus_body(
+    window: AnyWindowHandle,
+    editor: &Entity<MarkdownEditor>,
+    cx: &mut AsyncApp,
+) {
+    let state = visible(window, editor, cx).await;
+    click_body(&state);
+    assert_click_focused(window, editor, cx).await;
+}
+
 pub async fn type_into(
     window: AnyWindowHandle,
     editor: &Entity<MarkdownEditor>,
@@ -499,6 +509,7 @@ pub async fn first_open(
     let (editor, original) = window
         .update(cx, |_, window, cx| {
             view.update(cx, |app, cx| {
+                app.clear_notices(cx);
                 app.page = Page::Notes;
                 app.selected_note = app
                     .snapshot
@@ -524,22 +535,56 @@ pub async fn first_open(
         cx,
     )
     .await;
+    // The first fixture is an externally tracked source. A body click must
+    // preserve readonly policy; the explicit action creates a managed copy.
+    let readonly = snapshot(window, &editor, cx).await;
+    assert_eq!(readonly["readonly"], true);
+    click_body(&state);
+    for _ in 0..4 {
+        pause(cx).await;
+    }
+    assert!(
+        window
+            .update(cx, |_, _, cx| view.read(cx).note_editor.is_none())
+            .unwrap(),
+        "external source body click entered editing"
+    );
+    assert_eq!(snapshot(window, &editor, cx).await["readonly"], true);
     window
         .update(cx, |_, window, cx| window.click("edit-note", cx))
         .unwrap();
-    assert!(
-        window
-            .update(cx, |_, _, cx| view.read(cx).note_editor.is_some())
-            .unwrap(),
-        "edit button did not start a draft"
-    );
+    crate::smoke_library::until(
+        window,
+        view,
+        "explicit edit creates managed copy draft",
+        |app, _| app.note_editor.is_some(),
+        cx,
+    )
+    .await;
+    window
+        .update(cx, |_, _, cx| {
+            view.update(cx, |app, cx| app.clear_notices(cx))
+        })
+        .unwrap();
+    let state = visible(window, &editor, cx).await;
+    click_body(&state);
+    assert_click_focused(window, &editor, cx).await;
     let browser = snapshot(window, &editor, cx).await;
     assert_eq!(
         browser["readonly"], false,
         "editor still readonly: {browser}"
     );
+    assert_eq!(
+        browser["text"], readonly["text"],
+        "body click changed document content"
+    );
+    assert!(
+        browser["selection"]["anchor"].as_u64().unwrap() > 0,
+        "body click lost its position and put the caret at the start"
+    );
+    assert_eq!(browser["selection"]["anchor"], browser["selection"]["head"]);
+    let insertion = browser["selection"]["head"].as_u64().unwrap() as usize;
     let state = visible(window, &editor, cx).await;
-    click_body(&state);
     assert_click_focused(window, &editor, cx).await;
     enter_characters(window, &editor, &state, "native_keyboard_🧠", cx).await;
     for attempt in 0..80 {
@@ -548,6 +593,13 @@ pub async fn first_open(
             .update(cx, |_, _, cx| editor.read(cx).value().to_owned())
             .unwrap();
         if content.contains("native_keyboard_🧠") {
+            let prefix = String::from_utf16_lossy(
+                &original.encode_utf16().take(insertion).collect::<Vec<_>>(),
+            );
+            assert!(
+                content.starts_with(&format!("{prefix}native_keyboard_🧠")),
+                "typed text did not land at restored clicked caret"
+            );
             break;
         }
         if attempt == 79 {
@@ -625,7 +677,7 @@ pub async fn first_open(
     }
     window
         .update(cx, |_, window, cx| {
-            window.click("discard-note-draft", cx);
+            crate::smoke_library::editor_action(window, view, true, cx);
             window.click("confirm-note-action", cx);
         })
         .unwrap();
@@ -665,4 +717,48 @@ pub async fn first_open(
     } else {
         eprintln!("native first-open reading, click focus, keyboard input and undo passed");
     }
+}
+
+/// Automatic click-to-edit applies only to a managed current note. Keep this
+/// separate from first_open's external-source policy and input/undo fixture.
+pub(crate) async fn managed_body_edit(
+    window: AnyWindowHandle,
+    view: &Entity<StudyApp>,
+    editor: &Entity<MarkdownEditor>,
+    cx: &mut AsyncApp,
+) {
+    window
+        .update(cx, |_, _, cx| {
+            view.update(cx, |app, cx| app.clear_notices(cx))
+        })
+        .unwrap();
+    let native = visible(window, editor, cx).await;
+    let readonly = snapshot(window, editor, cx).await;
+    assert_eq!(readonly["readonly"], true);
+    assert_eq!(
+        readonly["canRequestEdit"], true,
+        "managed current note did not allow click-to-edit"
+    );
+    click_body(&native);
+    crate::smoke_library::until(
+        window,
+        view,
+        "managed body click starts draft",
+        |app, _| app.note_editor.is_some(),
+        cx,
+    )
+    .await;
+    let editable = snapshot(window, editor, cx).await;
+    assert_eq!(editable["readonly"], false);
+    assert_eq!(editable["text"], readonly["text"]);
+    assert_eq!(
+        editable["selection"]["head"], readonly["bodyClickPosition"],
+        "managed edit lost the actual readonly click position"
+    );
+    assert_eq!(
+        editable["selection"]["anchor"],
+        editable["selection"]["head"]
+    );
+    assert!(editable["selection"]["head"].as_u64().unwrap() > 0);
+    assert_click_focused(window, editor, cx).await;
 }

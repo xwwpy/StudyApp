@@ -508,6 +508,9 @@ pub async fn first_open(
     .unwrap();
     let (editor, original) = window
         .update(cx, |_, window, cx| {
+            if std::env::var_os("WW_STUDYAPP_SMOKE_SMALL_WINDOW").is_some() {
+                crate::smoke_library::resize(window, size(px(1024.), px(720.)));
+            }
             view.update(cx, |app, cx| {
                 app.clear_notices(cx);
                 app.page = Page::Notes;

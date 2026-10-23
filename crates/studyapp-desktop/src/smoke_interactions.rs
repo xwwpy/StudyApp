@@ -18,7 +18,7 @@ pub async fn exercise(
     settled(window, view, cx).await;
     window
         .update(cx, |_, window, cx| {
-            window.resize(size(px(1280.), px(900.)));
+            crate::smoke_library::resize(window, size(px(1280.), px(900.)));
             view.update(cx, |app, cx| {
                 app.clear_notices(cx);
                 app.page = Page::Notes;
@@ -700,22 +700,65 @@ pub async fn exercise(
                 .save(database.with_file_name("storage-contained-scroll.png"))
                 .unwrap();
             let old_top = window.find("storage-copy-list").bounds().origin.y;
-            // Wheel to the left of the inset card, outside its file-list bounds.
+            // A small window can leave the outer section at its bottom limit.
+            // First move up through its padding, then move down to the original
+            // position. Neither wheel may leak into the nested file list.
             let page = window.find("settings-section-scroll").bounds();
+            let outside = point(page.origin.x + px(5.), page.center().y);
+            let inner_offset = view.read(cx).storage_copy_scroll.offset();
+            // The outer div does not expose an app-owned ScrollHandle. Measure
+            // its actual range with one stable child's position at both ends,
+            // then use the bottom as a baseline that permits an upward move.
+            scroll_settings(window, 10000., cx);
+            let outer_top_anchor = window.find("storage-copy-list").bounds().origin.y;
+            scroll_settings(window, -10000., cx);
+            let outer_bottom_anchor = window.find("storage-copy-list").bounds().origin.y;
+            let outer_max = outer_top_anchor - outer_bottom_anchor;
+            let original_outer_offset = old_top - outer_top_anchor;
+            assert!(outer_max > px(0.), "outer-scroll fixture needs a nonzero actual range");
+            assert_eq!(view.read(cx).storage_copy_scroll.offset(), inner_offset);
+            eprintln!("outer wheel fixture: original_offset={original_outer_offset:?}; max={outer_max:?}; at_bottom={}; section={page:?}; list_before={old_top:?}; inner_offset={inner_offset:?}; inner_max={:?}", original_outer_offset == -outer_max, view.read(cx).storage_copy_scroll.max_offset());
             window.dispatch_event(
                 ScrollWheelEvent {
-                    position: point(page.origin.x + px(5.), initial.center().y),
-                    delta: ScrollDelta::Pixels(point(px(0.), px(-60.))),
+                    position: outside,
+                    delta: ScrollDelta::Pixels(point(px(0.), px(60.))),
                     ..Default::default()
                 }
                 .to_platform_input(),
                 cx,
             );
             window.render_frame(cx);
+            let raised_top = window.find("storage-copy-list").bounds().origin.y;
+            eprintln!("outer wheel up: list_top={raised_top:?}; offset={:?}", raised_top - outer_top_anchor);
             assert!(
-                window.find("storage-copy-list").bounds().origin.y < old_top,
+                raised_top > outer_bottom_anchor,
+                "Settings must scroll up outside the file list"
+            );
+            assert_eq!(view.read(cx).storage_copy_scroll.offset(), inner_offset);
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position: outside,
+                    delta: ScrollDelta::Pixels(point(px(0.), -(raised_top - outer_bottom_anchor))),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+            eprintln!("outer wheel down: list_top={:?}; offset={:?}", window.find("storage-copy-list").bounds().origin.y, window.find("storage-copy-list").bounds().origin.y - outer_top_anchor);
+            assert!(
+                window.find("storage-copy-list").bounds().origin.y < raised_top,
                 "Settings must scroll outside the file list"
             );
+            assert_eq!(
+                window.find("storage-copy-list").bounds().origin.y,
+                outer_bottom_anchor,
+                "outer wheel roundtrip did not restore the section position"
+            );
+            assert_eq!(view.read(cx).storage_copy_scroll.offset(), inner_offset);
+            scroll_settings(window, f32::from(old_top - outer_bottom_anchor), cx);
+            assert_eq!(window.find("storage-copy-list").bounds().origin.y, old_top, "outer boundary probe did not restore the original offset");
+            assert_eq!(view.read(cx).storage_copy_scroll.offset(), inner_offset);
             window.click("settings-section-appearance", cx);
             click_scrolled(window, "show-file-paths".into(), "page-scroll", cx);
             assert!(
@@ -770,7 +813,9 @@ pub async fn exercise(
     )
     .await;
     window
-        .update(cx, |_, window, _| window.resize(size(px(1000.), px(750.))))
+        .update(cx, |_, window, _| {
+            crate::smoke_library::resize(window, size(px(1000.), px(750.)))
+        })
         .unwrap();
     crate::smoke_visibility::capture(
         window,

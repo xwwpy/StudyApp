@@ -1111,7 +1111,7 @@ pub async fn exercise(
     };
     window
         .update(cx, |_, window, cx| {
-            window.resize(size(px(workspace_width), px(1000.)));
+            crate::smoke_library::resize(window, size(px(workspace_width), px(1000.)));
             view.update(cx, |app, cx| {
                 app.page = Page::Notes;
                 app.history = false;
@@ -1620,7 +1620,9 @@ pub async fn exercise(
     .await;
     unchanged(window, view, &editor, &baseline, &reader_key, cx).await;
     window
-        .update(cx, |_, window, _| window.resize(size(px(1000.), px(750.))))
+        .update(cx, |_, window, _| {
+            crate::smoke_library::resize(window, size(px(1000.), px(750.)))
+        })
         .unwrap();
     cx.background_executor()
         .timer(Duration::from_millis(150))

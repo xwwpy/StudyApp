@@ -16,6 +16,20 @@ use studyapp_core::{Command, Note};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Reproduce the hosted Windows runner's client-area limit without changing
+/// the desktop display or imposing a limit on ordinary application windows.
+pub(crate) fn resize(window: &mut Window, requested: Size<Pixels>) {
+    let requested = if std::env::var_os("WW_STUDYAPP_SMOKE_SMALL_WINDOW").is_some() {
+        size(
+            requested.width.min(px(1024.)),
+            requested.height.min(px(720.)),
+        )
+    } else {
+        requested
+    };
+    window.resize(requested);
+}
+
 /// Exercise the compact library dropdown and its keyboard navigation. PopupMenu
 /// items deliberately have no app-owned button IDs; the chosen item is asserted
 /// by each caller's resulting application state.
@@ -223,49 +237,87 @@ pub(crate) fn reveal_scrolled(window: &mut Window, id: SharedString, scroll: &st
     } else {
         scroll
     };
+    let mut diagnostic = String::new();
     for _ in 0..35 {
         window.render_frame(cx);
         let viewport = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
         let container = window.try_find(SharedString::from(scroll.to_owned()));
         let target = window.try_find(id.clone());
+        let outer = (!fixed_header)
+            .then(|| window.try_find("settings-section-scroll"))
+            .flatten();
+        let outer_clip = outer
+            .as_ref()
+            .map_or(viewport, |outer| viewport.intersect(&outer.bounds()));
+        let click_clip = container.as_ref().map_or(outer_clip, |container| {
+            outer_clip.intersect(&container.bounds())
+        });
+        diagnostic = format!(
+            "viewport={viewport:?}; target={:?}; inner={:?}; outer={:?}; click_clip={click_clip:?}",
+            target
+                .as_ref()
+                .map(|target| (target.visible(), target.bounds())),
+            container.as_ref().map(|container| container.bounds()),
+            outer.as_ref().map(|outer| outer.bounds())
+        );
         if let Some(target) = target.as_ref()
             && target.visible()
-            && viewport.contains(&target.bounds().center())
-            && container
-                .as_ref()
-                .is_some_and(|container| container.bounds().contains(&target.bounds().center()))
+            && click_clip.size.width > px(0.)
+            && click_clip.size.height > px(0.)
+            && click_clip.contains(&target.bounds().center())
         {
             return;
         }
-        let scroll = if container.is_some_and(|container| {
-            container.visible()
-                && container.bounds().origin.y + container.bounds().size.height
-                    <= viewport.size.height
-        }) {
-            scroll
-        } else {
-            settings_scroll
-        };
-        let scroll_bounds = window.find(SharedString::from(scroll.to_owned())).bounds();
-        let delta = if target
+        let nested = scroll != "page-scroll" && scroll != settings_scroll;
+        // A row can be inside the inner list while below the Settings clipping
+        // edge. Scrolling that list cannot reveal it when the list has no
+        // overflow; move its outer ancestor instead. A clipped list still
+        // receives its own wheel only through its actually visible portion.
+        let scroll_outer = nested
+            && (click_clip.size.height <= px(0.)
+                || target.as_ref().is_some_and(|target| {
+                    container.as_ref().is_some_and(|container| {
+                        container.bounds().contains(&target.bounds().center())
+                    }) && !outer_clip.contains(&target.bounds().center())
+                }));
+        let active_clip = if scroll_outer { outer_clip } else { click_clip };
+        let target_y = target
             .as_ref()
-            .is_some_and(|target| target.bounds().center().y < scroll_bounds.origin.y.max(px(0.)))
-        {
+            .map(|target| target.bounds().center().y)
+            .or_else(|| {
+                container
+                    .as_ref()
+                    .map(|container| container.bounds().center().y)
+            })
+            .unwrap_or(active_clip.bottom());
+        let delta = if target_y < active_clip.top() {
             160.
         } else {
             -160.
         };
-        if scroll == "page-scroll" || scroll == "settings-section-scroll" {
+        if scroll_outer || !nested {
             scroll_settings(window, delta, cx);
         } else {
-            window.scroll(
-                SharedString::from(scroll.to_owned()),
-                ScrollDelta::Pixels(point(px(0.), px(delta))),
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position: active_clip.center(),
+                    delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+                    ..Default::default()
+                }
+                .to_platform_input(),
                 cx,
             );
+            window.render_frame(cx);
         }
     }
-    panic!("could not reveal native button {id}");
+    if let Ok(folder) = std::env::var("WW_STUDYAPP_SMOKE_EVIDENCE_DIR") {
+        window
+            .render_to_image()
+            .unwrap()
+            .save(std::path::Path::new(&folder).join("scroll-reveal-failure.png"))
+            .unwrap();
+    }
+    panic!("could not reveal native button {id}; {diagnostic}");
 }
 
 /// Scroll in the section's padding, where nested file lists cannot consume it.
@@ -296,7 +348,7 @@ pub async fn exercise(
     settled(window, view, cx).await;
     let (editor, external_files) = window
         .update(cx, |_, window, cx| {
-            window.resize(size(px(1440.), px(1000.)));
+            crate::smoke_library::resize(window, size(px(1440.), px(1000.)));
             view.update(cx, |app, cx| {
                 app.clear_notices(cx);
                 assert!(app.note_editor.is_none() && app.recoverable_draft.is_none());
@@ -507,7 +559,9 @@ pub async fn exercise(
     )
     .await;
     window
-        .update(cx, |_, window, _| window.resize(size(px(1000.), px(700.))))
+        .update(cx, |_, window, _| {
+            crate::smoke_library::resize(window, size(px(1000.), px(700.)))
+        })
         .unwrap();
     for _ in 0..50 {
         pause(cx).await;
@@ -714,7 +768,7 @@ pub async fn exercise(
     assert_eq!(std::fs::read_to_string(&note.path).unwrap(), saved_content);
     window
         .update(cx, |_, window, cx| {
-            window.resize(size(px(1440.), px(1000.)));
+            crate::smoke_library::resize(window, size(px(1440.), px(1000.)));
             window.render_frame(cx);
         })
         .unwrap();
@@ -873,12 +927,11 @@ pub async fn exercise(
                     .iter()
                     .all(|(id, _, _)| { report.copies.iter().all(|copy| &copy.note_id != id) })
             );
-            click_scrolled(
-                window,
-                format!("delete-copy-{}", disposable.id).into(),
-                "storage-copy-list",
-                cx,
-            );
+            let delete = SharedString::from(format!("delete-copy-{}", disposable.id));
+            reveal_scrolled(window, delete.clone(), "storage-copy-list", cx);
+            eprintln!("storage delete fixture: viewport={:?}, target={:?}, inner={:?}, outer={:?}, save={:?}, notifications={:?}", window.viewport_size(), window.find(delete.clone()).bounds(), window.find("storage-copy-list").bounds(), window.find("settings-section-scroll").bounds(), window.find("save-settings").bounds(), view.read(cx).notifications.read(cx).test_state());
+            window.render_to_image().unwrap().save(database.with_file_name("storage-delete-before-click.png")).unwrap();
+            window.click(delete, cx);
             assert_eq!(view.read(cx).storage_confirm.as_ref(), Some(&disposable.id));
             window.render_frame(cx);
             assert!(window.find("modal-content-scroll").visible());

@@ -35,7 +35,7 @@ pub async fn exercise(
     settled(window, view, cx).await;
     window
         .update(cx, |_, window, cx| {
-            window.resize(size(px(1280.), px(900.)));
+            crate::smoke_library::resize(window, size(px(1280.), px(900.)));
             window.click(("nav", 4_usize), cx);
             window.render_frame(cx);
             view.update(cx, |app, cx| app.clear_notices(cx));

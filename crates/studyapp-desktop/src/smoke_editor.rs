@@ -188,7 +188,7 @@ pub async fn exercise(
     window
         .update(cx, |_, window, cx| {
             view.update(cx, |app, cx| app.clear_notices(cx));
-            window.resize(size(px(1000.), px(700.)));
+            crate::smoke_library::resize(window, size(px(1000.), px(700.)));
             window.render_frame(cx);
             editor.read(cx).inject_test_error(false);
         })
@@ -213,7 +213,7 @@ pub async fn exercise(
     );
     window
         .update(cx, |_, window, cx| {
-            window.resize(size(px(1280.), px(860.)));
+            crate::smoke_library::resize(window, size(px(1280.), px(860.)));
             window.render_frame(cx);
         })
         .unwrap();

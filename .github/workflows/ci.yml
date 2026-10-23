@@ -83,6 +83,7 @@ jobs:
             ${{ env.SMOKE_DIR }}/library-smoke-result.txt
             ${{ env.SMOKE_DIR }}/interactions-smoke-result.txt
             ${{ env.SMOKE_DIR }}/workspace-smoke-result.txt
+            ${{ env.SMOKE_DIR }}/native-shortcut-settings-result.txt
             ${{ env.SMOKE_DIR }}/workspace-saved-layout.json
             ${{ env.SMOKE_DIR }}/*.log
           if-no-files-found: warn

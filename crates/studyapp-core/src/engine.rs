@@ -70,6 +70,31 @@ impl Engine {
         self.state
             .snapshot(self.path.to_string_lossy().into_owned())
     }
+    pub fn prepare_settings(&self, settings: Settings) -> Result<PreparedSettings> {
+        settings.validate()?;
+        let pending: i64 =
+            self.conn
+                .query_row("SELECT count(*) FROM write_intents", [], |row| row.get(0))?;
+        ensure!(
+            pending == 0,
+            "笔记写入尚未恢复完成，请先排除文件占用后再保存设置"
+        );
+        Ok(PreparedSettings { settings })
+    }
+
+    /// The file-backed configuration has already committed. No fallible I/O is
+    /// permitted here; subsequent checkpoints refresh SQLite's legacy mirror.
+    pub fn install_prepared_settings(&mut self, prepared: PreparedSettings) {
+        if self.state.timer.active_seconds == 0 {
+            self.state.timer.target_seconds = u64::from(prepared.settings.interval_minutes) * 60;
+        }
+        self.state.settings = prepared.settings;
+    }
+
+    pub fn restore_preserving_settings(&mut self, path: &Path, now: i64) -> Result<String> {
+        self.recover_writes()?;
+        self.restore_with_settings(path, now, Some(self.state.settings.clone()))
+    }
     pub fn apply(&mut self, command: Command, now: i64) -> Result<String> {
         self.recover_writes()?;
         if let Command::Backup(path) = &command {
@@ -720,11 +745,25 @@ impl Engine {
         Ok(())
     }
     fn restore(&mut self, path: &Path, now: i64) -> Result<String> {
+        self.restore_with_settings(path, now, None)
+    }
+
+    fn restore_with_settings(
+        &mut self,
+        path: &Path,
+        now: i64,
+        settings: Option<Settings>,
+    ) -> Result<String> {
         let source = self.safe_destination(path)?;
         if !source.is_file() {
             bail!("找不到备份文件");
         }
         let mut restored = storage::verified_backup(&source)?;
+        let preserving_settings = settings.is_some();
+        if let Some(settings) = settings {
+            Self::save_settings(&mut restored, settings)?;
+            restored.validate()?;
+        }
         let pre = self
             .path
             .with_file_name(format!("studyapp-before-restore-{now}-{}.sqlite", id()));
@@ -735,7 +774,15 @@ impl Engine {
         let writes = crate::managed::restore_writes(&mut restored, &self.path, now)?;
         crate::notes::scan_external(&mut restored, true, now);
         self.write_managed(restored, writes, true)?;
-        Ok(format!("资料库已恢复；恢复前备份：{}", pre.display()))
+        Ok(format!(
+            "{}；恢复前备份：{}",
+            if preserving_settings {
+                "学习资料已恢复，当前设置已保留"
+            } else {
+                "资料库已恢复"
+            },
+            pre.display()
+        ))
     }
     fn write_managed(
         &mut self,
@@ -770,6 +817,70 @@ fn unique(ids: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod managed_storage_tests {
     use super::*;
+
+    #[test]
+    fn preferences_cannot_commit_while_an_old_managed_write_can_replace_live_state() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let engine = Engine::open(&dir.join("pending.sqlite"), 1000).unwrap();
+        let original = engine.snapshot().settings;
+        // Recovery of a pending intent may install its entire older state.
+        // Refuse a new independent preference publication until it is recovered.
+        engine
+            .conn
+            .execute("INSERT INTO write_intents(id,data) VALUES(1,'{}')", [])
+            .unwrap();
+        assert!(engine.prepare_settings(original.clone()).is_err());
+        assert_eq!(engine.snapshot().settings, original);
+    }
+
+    #[test]
+    fn prepared_preferences_do_not_write_and_restore_can_preserve_current_settings() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let database = dir.join("preferences.sqlite");
+        let mut engine = Engine::open(&database, 1000).unwrap();
+        let backup = dir.join("learning-backup.sqlite");
+        engine.apply(Command::Backup(backup.clone()), 1000).unwrap();
+        let original = engine.snapshot().settings;
+        let mut settings = original.clone();
+        settings.interval_minutes = 30;
+        settings.layout.folders_visible = false;
+        let prepared = engine.prepare_settings(settings.clone()).unwrap();
+        assert_eq!(engine.snapshot().settings, original);
+        engine.install_prepared_settings(prepared);
+        assert_eq!(engine.snapshot().settings, settings);
+        assert_eq!(engine.snapshot().timer.target_seconds, 1800);
+        let stored = storage::load(&engine.conn).unwrap().unwrap();
+        assert_eq!(
+            stored.settings, original,
+            "installation must not write SQLite"
+        );
+        engine.restore_preserving_settings(&backup, 1001).unwrap();
+        assert_eq!(engine.snapshot().settings, settings);
+        assert_eq!(engine.snapshot().timer.target_seconds, 1800);
+        assert_eq!(
+            storage::load(&engine.conn).unwrap().unwrap().settings,
+            settings
+        );
+        engine.apply(Command::Restore(backup), 1002).unwrap();
+        assert_eq!(
+            engine.snapshot().settings,
+            original,
+            "standalone core restore stays compatible"
+        );
+    }
+
+    #[test]
+    fn prepared_preferences_preserve_an_active_timer_cycle() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let mut engine = Engine::open(&dir.join("preferences.sqlite"), 1000).unwrap();
+        let mut settings = engine.snapshot().settings;
+        settings.interval_minutes = 5;
+        let prepared = engine.prepare_settings(settings).unwrap();
+        engine.tick(1001, 1).unwrap();
+        engine.install_prepared_settings(prepared);
+        assert_eq!(engine.snapshot().timer.active_seconds, 1);
+        assert_eq!(engine.snapshot().timer.target_seconds, 3600);
+    }
 
     #[test]
     fn unsupported_hard_links_never_leave_a_blocking_write_intent() {

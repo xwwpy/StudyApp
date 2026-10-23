@@ -5,8 +5,9 @@ use gpui_kit::component::{
     text::Text,
 };
 use gpui_kit::{
-    AnyElement, App, ClickEvent, ElementId, InteractiveElement, Interactivity, IntoElement,
-    ParentElement, RenderOnce, SharedString, StyleRefinement, Styled, Window,
+    AnyElement, App, ClickEvent, ElementId, Entity, InteractiveElement, Interactivity, IntoElement,
+    ParentElement, Pixels, Point, Render, RenderOnce, SharedString, StyleRefinement, Styled,
+    Window,
 };
 
 /// Application buttons share one cursor policy while the component retains
@@ -66,6 +67,17 @@ impl AppButton {
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.inner = self.inner.on_click(handler);
+        self
+    }
+
+    /// Register drag on the same base surface as click/focus, so crossing the
+    /// drag threshold uses GPUI's existing suppression of the pending click.
+    pub fn on_drag<T: 'static, V: Render + 'static>(
+        mut self,
+        value: T,
+        constructor: impl Fn(&T, Point<Pixels>, &mut Window, &mut App) -> Entity<V> + 'static,
+    ) -> Self {
+        self.inner.interactivity().on_drag(value, constructor);
         self
     }
 
@@ -376,6 +388,82 @@ mod tests {
             window.click("loading", cx);
         });
         assert_eq!(clicks.get(), 1);
+    }
+
+    #[cfg(feature = "ui-test")]
+    #[gpui_kit::test]
+    fn button_drag_preserves_click_and_context_menu_routing(cx: &mut TestAppContext) {
+        use gpui_kit::{
+            AppContext, MouseButton,
+            component::menu::{ContextMenuExt, PopupMenuItem},
+            point, px,
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        struct Preview;
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().child("Folder")
+            }
+        }
+        struct Fixture {
+            clicks: Rc<Cell<usize>>,
+            drags: Rc<Cell<usize>>,
+            menus: Rc<Cell<usize>>,
+        }
+        impl Render for Fixture {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let clicks = self.clicks.clone();
+                let drags = self.drags.clone();
+                let menus = self.menus.clone();
+                Button::new("folder-drag-facade")
+                    .label("Folder")
+                    .w(gpui_kit::px(160.))
+                    .h(gpui_kit::px(40.))
+                    .on_click(move |_, _, _| clicks.set(clicks.get() + 1))
+                    .on_drag("folder", move |_, _, _, cx| {
+                        drags.set(drags.get() + 1);
+                        cx.new(|_| Preview)
+                    })
+                    .context_menu(move |menu, _, _| {
+                        menus.set(menus.get() + 1);
+                        menu.item(PopupMenuItem::new("Rename"))
+                    })
+            }
+        }
+        cx.update(gpui_kit::init);
+        let clicks = Rc::new(Cell::new(0));
+        let drags = Rc::new(Cell::new(0));
+        let menus = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let clicks = clicks.clone();
+            let drags = drags.clone();
+            let menus = menus.clone();
+            move |_, _| Fixture {
+                clicks,
+                drags,
+                menus,
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let start = point(px(24.), px(20.));
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(start, MouseButton::Left, Default::default());
+        assert_eq!(clicks.get(), 1);
+        assert_eq!(drags.get(), 0);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        let moved = start + point(px(28.), px(0.));
+        cx.simulate_mouse_move(moved, MouseButton::Left, Default::default());
+        assert_eq!(drags.get(), 1);
+        cx.simulate_mouse_up(moved, MouseButton::Left, Default::default());
+        assert_eq!(clicks.get(), 1, "Dropping cannot also select the source");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_mouse_down(start, MouseButton::Right, Default::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(menus.get(), 1);
+        assert_eq!(drags.get(), 1, "Right-click cannot begin a directory drag");
     }
 
     #[cfg(feature = "ui-test")]

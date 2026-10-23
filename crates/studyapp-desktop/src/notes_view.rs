@@ -56,6 +56,24 @@ impl StudyApp {
                     .flex_shrink_0()
                     .border_b_1()
                     .border_color(rgb(BORDER))
+                    .child(
+                        Button::new("toggle-folders")
+                            .small()
+                            .ghost()
+                            .icon(IconName::PanelLeft)
+                            .accessibility_label("展开或收起笔记目录")
+                            .tooltip(if self.layout.folders_visible {
+                                "收起笔记目录"
+                            } else {
+                                "展开笔记目录"
+                            })
+                            .disabled(
+                                self.storage_busy
+                                    || self.preferences_ui.busy
+                                    || self.preferences_ui.replacing,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_folders(cx))),
+                    )
                     .child(Icon::new(IconName::FileText).small().text_color(rgb(GREEN)))
                     .child(
                         div()
@@ -539,9 +557,10 @@ impl StudyApp {
                     })))
                 )))
             .child(row().items_stretch().gap_0().flex_1().min_h_0().min_w_0().w_full().overflow_hidden()
-                .child(div().id("folders-pane").test_support().w(layout.folders).h_full().min_h_0().min_w_0()
-                    .flex_shrink_0().bg(rgb(0xF7F9F6)).child(self.folders.clone()))
-                .child(self.resize_handle(Pane::Folders, cx))
+                .when(self.layout.folders_visible, |view| view
+                    .child(div().id("folders-pane").test_support().w(layout.folders).h_full().min_h_0().min_w_0()
+                        .flex_shrink_0().bg(rgb(0xF7F9F6)).child(self.folders.clone()))
+                    .child(self.resize_handle(Pane::Folders, cx)))
                 .child(list)
                 .child(self.resize_handle(Pane::Notes, cx))
                 .child(div().id("document-pane").test_support().flex().flex_1().h_full().min_h_0().min_w_0().overflow_hidden().child(detail)))

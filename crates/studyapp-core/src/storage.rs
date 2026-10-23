@@ -53,7 +53,7 @@ impl Default for Settings {
     }
 }
 impl Settings {
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         self.layout.validate()?;
         ensure!(
             (5..=240).contains(&self.interval_minutes),
@@ -74,9 +74,9 @@ impl Settings {
 impl crate::LayoutSettings {
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
-            (144..=320).contains(&self.navigation_width)
-                && (144..=360).contains(&self.folders_width)
-                && (180..=440).contains(&self.notes_width),
+            (128..=320).contains(&self.navigation_width)
+                && (112..=360).contains(&self.folders_width)
+                && (160..=440).contains(&self.notes_width),
             "面板宽度超出允许范围"
         );
         Ok(())

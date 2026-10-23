@@ -14,6 +14,8 @@ pub struct MarkdownChanged;
 #[derive(Clone)]
 pub enum MarkdownEvent {
     Save,
+    CancelResize,
+    Shortcut(String),
     Flushed(u64),
     Error(String),
 }
@@ -43,6 +45,13 @@ enum Message {
     },
     Save {
         generation: u64,
+    },
+    CancelResize {
+        generation: u64,
+    },
+    Shortcut {
+        generation: u64,
+        action: String,
     },
     Error {
         generation: Option<u64>,
@@ -74,6 +83,7 @@ pub struct MarkdownEditor {
     pending: Option<(u64, Instant)>,
     recovering: bool,
     request: u64,
+    shortcuts: std::collections::BTreeMap<String, String>,
     #[cfg(feature = "ui-test")]
     pub(crate) test_results: std::collections::HashMap<String, serde_json::Value>,
     _poll: Task<()>,
@@ -109,6 +119,7 @@ impl MarkdownEditor {
             pending: None,
             recovering: false,
             request: 0,
+            shortcuts: crate::shortcuts::default_bindings(),
             #[cfg(feature = "ui-test")]
             test_results: Default::default(),
             _poll: poll,
@@ -153,8 +164,28 @@ impl MarkdownEditor {
 
     fn load(&mut self, cx: &mut Context<Self>) {
         let payload = serde_json::json!({"generation": self.document.generation(), "text": self.document.text(), "readonly": self.readonly});
-        if let Err(error) = self.evaluate(&format!("window.studyappEditor.load({payload});")) {
+        let shortcuts = serde_json::to_string(&self.shortcuts).expect("string map serializes");
+        if let Err(error) = self.evaluate(&format!("window.studyappEditor.setShortcuts({shortcuts}); window.studyappEditor.load({payload});")) {
             self.fail(format!("无法载入编辑器：{error:#}"), cx);
+        }
+    }
+
+    pub fn set_shortcuts(
+        &mut self,
+        shortcuts: std::collections::BTreeMap<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shortcuts == shortcuts {
+            return;
+        }
+        self.shortcuts = shortcuts;
+        if self.ready && self.error.is_none() {
+            let value = serde_json::to_string(&self.shortcuts).expect("string map serializes");
+            if let Err(error) =
+                self.evaluate(&format!("window.studyappEditor.setShortcuts({value});"))
+            {
+                self.fail(format!("无法更新快捷键：{error:#}"), cx);
+            }
         }
     }
 
@@ -308,6 +339,23 @@ impl MarkdownEditor {
                             cx.emit(MarkdownEvent::Save);
                         }
                     }
+                    Message::CancelResize { generation } => {
+                        if generation == self.document.generation() && self.visible {
+                            cx.emit(MarkdownEvent::CancelResize);
+                        }
+                    }
+                    Message::Shortcut { generation, action } => {
+                        if generation == self.document.generation()
+                            && self.visible
+                            && self.pending.is_none()
+                            && action.starts_with("app.")
+                            && crate::shortcuts::SHORTCUT_ACTIONS
+                                .iter()
+                                .any(|entry| entry.id == action)
+                        {
+                            cx.emit(MarkdownEvent::Shortcut(action));
+                        }
+                    }
                     Message::Error {
                         generation,
                         message,
@@ -440,6 +488,20 @@ impl MarkdownEditor {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WebView 尚未创建"))?
             .insert_text(text)
+    }
+
+    #[cfg(all(windows, feature = "ui-test"))]
+    pub(crate) fn dispatch_key(
+        &self,
+        key: &str,
+        code: &str,
+        modifiers: u32,
+        virtual_key: i32,
+    ) -> anyhow::Result<mpsc::Receiver<Result<(), String>>> {
+        self.host
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WebView 尚未创建"))?
+            .dispatch_key(key, code, modifiers, virtual_key)
     }
 
     #[cfg(all(windows, feature = "ui-test"))]

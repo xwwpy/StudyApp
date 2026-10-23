@@ -259,6 +259,25 @@ fn click_body(state: &Value) {
     );
 }
 
+async fn assert_click_focused(
+    window: AnyWindowHandle,
+    editor: &Entity<MarkdownEditor>,
+    cx: &mut AsyncApp,
+) {
+    // WebView focus is delivered asynchronously across its renderer process.
+    // Wait for the original real click; never set focus or synthesize another.
+    for attempt in 0..20 {
+        pause(cx).await;
+        let focus = window
+            .update(cx, |_, _, cx| editor.read(cx).native_state().unwrap())
+            .unwrap();
+        if focus["focused"] == true {
+            return;
+        }
+        assert!(attempt < 19, "click did not focus editor: {focus}");
+    }
+}
+
 fn type_text(state: &Value, text: &str) {
     let inputs: Vec<_> = text
         .encode_utf16()
@@ -441,14 +460,7 @@ pub async fn type_into(
     );
     let state = visible(window, editor, cx).await;
     click_body(&state);
-    pause(cx).await;
-    let focus = window
-        .update(cx, |_, _, cx| editor.read(cx).native_state().unwrap())
-        .unwrap();
-    assert_eq!(
-        focus["focused"], true,
-        "click did not focus editor: {focus}"
-    );
+    assert_click_focused(window, editor, cx).await;
     enter_characters(window, editor, &state, text, cx).await;
     for attempt in 0..80 {
         pause(cx).await;
@@ -528,14 +540,7 @@ pub async fn first_open(
     );
     let state = visible(window, &editor, cx).await;
     click_body(&state);
-    pause(cx).await;
-    let focus = window
-        .update(cx, |_, _, cx| editor.read(cx).native_state().unwrap())
-        .unwrap();
-    assert_eq!(
-        focus["focused"], true,
-        "click did not focus editor: {focus}"
-    );
+    assert_click_focused(window, &editor, cx).await;
     enter_characters(window, &editor, &state, "native_keyboard_🧠", cx).await;
     for attempt in 0..80 {
         pause(cx).await;

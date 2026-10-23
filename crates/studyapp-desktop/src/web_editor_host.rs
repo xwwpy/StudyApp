@@ -338,6 +338,65 @@ mod windows_host {
         }
 
         #[cfg(feature = "ui-test")]
+        pub fn dispatch_key(
+            &self,
+            key: &str,
+            code: &str,
+            modifiers: u32,
+            virtual_key: i32,
+        ) -> Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>> {
+            use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+            use windows::core::{HSTRING, w};
+            let parameters = |kind| {
+                HSTRING::from(
+                    serde_json::json!({
+                        "type": kind, "key": key, "code": code,
+                        "modifiers": modifiers, "windowsVirtualKeyCode": virtual_key
+                    })
+                    .to_string(),
+                )
+            };
+            let down = parameters("rawKeyDown");
+            let up = parameters("keyUp");
+            let webview = self.webview.webview();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let callback =
+                CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |status, _| {
+                    if let Err(error) = status {
+                        let _ = sender.send(Err(error.to_string()));
+                        return Ok(());
+                    }
+                    let complete_sender = sender.clone();
+                    let complete = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+                        move |status, _| {
+                            let _ = complete_sender.send(status.map_err(|error| error.to_string()));
+                            Ok(())
+                        },
+                    ));
+                    // Send key-up only after Chromium processed key-down.
+                    if let Err(error) = unsafe {
+                        webview.CallDevToolsProtocolMethod(
+                            w!("Input.dispatchKeyEvent"),
+                            &up,
+                            &complete,
+                        )
+                    } {
+                        let _ = sender.send(Err(error.to_string()));
+                    }
+                    Ok(())
+                }));
+            unsafe {
+                self.webview.webview().CallDevToolsProtocolMethod(
+                    w!("Input.dispatchKeyEvent"),
+                    &down,
+                    &callback,
+                )
+            }
+            .context("无法发送浏览器快捷键")?;
+            Ok(receiver)
+        }
+
+        #[cfg(feature = "ui-test")]
         pub fn capture_png(
             &self,
             path: PathBuf,

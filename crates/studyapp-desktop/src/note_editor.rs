@@ -180,6 +180,9 @@ impl StudyApp {
     }
 
     pub fn new_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.guard_settings(crate::settings_ui::SettingsContinuation::NewNote, cx) {
+            return;
+        }
         #[cfg(feature = "ui-test")]
         eprintln!("native new_note: requested");
         if self.confirmation.is_some() || self.storage_busy {

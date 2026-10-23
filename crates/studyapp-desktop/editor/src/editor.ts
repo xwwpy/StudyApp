@@ -1,6 +1,11 @@
 import { ChangeSet, Compartment, EditorSelection, EditorState, Extension, Text, Transaction } from "@codemirror/state";
 import { drawSelection, EditorView, keymap, placeholder, ViewUpdate } from "@codemirror/view";
-import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
+import {
+  addCursorAbove, addCursorBelow, copyLineDown, copyLineUp, cursorMatchingBracket,
+  deleteGroupBackward, deleteGroupForward, deleteLine, history, indentLess, indentMore,
+  indentSelection, insertBlankLine, moveLineDown, moveLineUp, redoSelection, selectAll,
+  selectLine, selectParentSyntax, toggleBlockComment, toggleComment, toggleTabFocusMode, undoSelection
+} from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { syntaxHighlighting } from "@codemirror/language";
 import { codeHighlighting, fencedLanguage } from "./languages";
@@ -8,6 +13,7 @@ import { renderedMarkdown } from "./decorations";
 import { formatCommand } from "./formatting";
 import { documentBudget, documentLimits, MAX_DOCUMENT_BYTES, MAX_TRANSACTION_PATCHES, stringBytes } from "./limits";
 import { incompleteScalars, scalarText, splitsScalar } from "./unicode";
+import { eventBinding, resolveBindings, typingKeymap } from "./shortcuts";
 
 interface Load { generation: number; text: string; readonly: boolean; }
 interface TestAction { type: string; request?: string | number; from?: number; to?: number; text?: string; anchor?: number; head?: number; name?: string; edits?: number; }
@@ -15,6 +21,7 @@ interface Bridge {
   load(value: Load): void;
   setReadonly(value: boolean): void;
   setSource(value: boolean): void;
+  setShortcuts(bindings: Record<string, string>): void;
   command(name: string): boolean;
   flush(value: { request: number }): Promise<void>;
   test?: (value: TestAction) => unknown;
@@ -29,6 +36,8 @@ declare global {
 
 const readOnlyMode = new Compartment();
 const renderingMode = new Compartment();
+const shortcutsMode = new Compartment();
+let bindings = resolveBindings({});
 let generation = 0;
 let revision = 0;
 let source = false;
@@ -65,6 +74,8 @@ function clearWarning(): void {
 function updateToolbar(): void {
   for (const button of toolbar.querySelectorAll<HTMLButtonElement>("button[data-command]")) {
     button.disabled = button.dataset.command !== "source" && (view.state.readOnly || pendingFlush);
+    const binding = bindings[`editor.${button.dataset.command}`];
+    button.title = `${button.getAttribute("aria-label") ?? ""}${binding ? ` · ${binding.replaceAll(";", " / ")}` : ""}`;
   }
   sourceButton.setAttribute("aria-pressed", String(source));
   if (!status.classList.contains("error") && !status.classList.contains("warning")) status.textContent = pendingFlush ? "正在确认输入…" : view.state.readOnly ? "只读" : "";
@@ -134,13 +145,88 @@ function publishChanges(update: ViewUpdate): void {
     else publishPatchSet(pending.base.doc, pending.changes);
   }
 }
+const editorCommands: Readonly<Record<string, (view: EditorView) => boolean>> = Object.freeze({
+  "undo-selection": undoSelection,
+  "redo-selection": redoSelection,
+  "move-line-up": moveLineUp,
+  "move-line-down": moveLineDown,
+  "copy-line-up": copyLineUp,
+  "copy-line-down": copyLineDown,
+  "add-cursor-above": addCursorAbove,
+  "add-cursor-below": addCursorBelow,
+  "insert-blank-line": insertBlankLine,
+  "select-line": selectLine,
+  "select-parent-syntax": selectParentSyntax,
+  "indent-less": indentLess,
+  "indent-more": indentMore,
+  "indent-selection": indentSelection,
+  "delete-line": deleteLine,
+  "matching-bracket": cursorMatchingBracket,
+  "toggle-comment": toggleComment,
+  "toggle-block-comment": toggleBlockComment,
+  "toggle-tab-focus": toggleTabFocusMode,
+  "select-all": selectAll,
+  "delete-group-backward": deleteGroupBackward,
+  "delete-group-forward": deleteGroupForward
+});
 function command(name: string): boolean {
+  if (typeof name !== "string" || !loaded || view.composing || pendingFlush) return false;
+  name = name.startsWith("editor.") ? name.slice(7) : name;
   if (name === "source") { setSource(!source); return true; }
   if (name === "save") { post({ type: "save", generation, revision }); return true; }
-  if (pendingFlush) return false;
-  const result = formatCommand(view, name);
+  if (view.state.readOnly) return false;
+  const result = Object.hasOwn(editorCommands, name) ? editorCommands[name](view) : formatCommand(view, name);
   if (result) view.focus();
   return result;
+}
+function shortcutLookup(values: Record<string, string>): Map<string, string> {
+  const lookup = new Map<string, string>();
+  for (const [action, binding] of Object.entries(values)) {
+    for (const alternative of binding.split(";").filter(Boolean)) lookup.set(alternative, action);
+  }
+  return lookup;
+}
+let activeShortcutLookup = shortcutLookup(bindings);
+const knownShortcutKeys = new Set(activeShortcutLookup.keys());
+function handleShortcut(event: KeyboardEvent, lookup: Map<string, string>): boolean {
+  if (event.defaultPrevented || view.composing) return false;
+  const binding = eventBinding(event);
+  const action = binding && lookup.get(binding);
+  if (!action) {
+    // Chromium emits beforeinput(historyUndo/historyRedo) for its own Ctrl+Z/Y
+    // defaults. Consuming retired bindings prevents that hidden fallback.
+    if (binding && knownShortcutKeys.has(binding)) {
+      event.preventDefault();
+      return true;
+    }
+    return false;
+  }
+  // Once matched, consume even a readonly/no-op command, so browser commands
+  // cannot activate and a physical keydown cannot save or route twice.
+  event.preventDefault();
+  if (event.repeat || pendingFlush) return true;
+  if (action.startsWith("app.")) post({ type: "shortcut", action, generation });
+  else command(action);
+  return true;
+}
+function shortcutExtensions(values: Record<string, string>): Extension {
+  const lookup = shortcutLookup(values);
+  return EditorView.domEventHandlers({ keydown: event => handleShortcut(event, lookup) });
+}
+function setShortcuts(values: Record<string, string>): void {
+  let resolved: Record<string, string>;
+  try { resolved = resolveBindings(values); }
+  catch (cause) {
+    // Invalid configuration never changes live bindings or poisons note saving.
+    warning(`快捷键配置无效：${cause instanceof Error ? cause.message : String(cause)}`);
+    return;
+  }
+  view.dispatch({ effects: shortcutsMode.reconfigure(shortcutExtensions(resolved)) });
+  bindings = resolved;
+  activeShortcutLookup = shortcutLookup(resolved);
+  for (const binding of activeShortcutLookup.keys()) knownShortcutKeys.add(binding);
+  clearWarning();
+  updateToolbar();
 }
 function extensions(readonly: boolean, rawText = ""): Extension[] {
   return [
@@ -152,12 +238,8 @@ function extensions(readonly: boolean, rawText = ""): Extension[] {
     placeholder("从这里开始记录，支持 Markdown…"),
     EditorView.contentAttributes.of({ "aria-label": "笔记正文", spellcheck: "false", tabindex: "0" }),
     EditorView.updateListener.of(publishChanges),
-    keymap.of([
-      { key: "Mod-s", run: () => command("save"), preventDefault: true },
-      { key: "Mod-b", run: () => command("bold") },
-      { key: "Mod-i", run: () => command("italic") },
-      ...historyKeymap, ...defaultKeymap, indentWithTab
-    ]),
+    shortcutsMode.of(shortcutExtensions(bindings)),
+    keymap.of(typingKeymap),
     EditorView.domEventHandlers({
       dragover(event) { if (event.dataTransfer?.types.includes("Files")) { event.preventDefault(); return true; } return false; },
       drop(event) { if (event.dataTransfer?.files.length) { event.preventDefault(); return true; } return false; }
@@ -251,12 +333,16 @@ toolbar.addEventListener("click", event => {
   if (button && !button.disabled) command(button.dataset.command!);
 });
 document.addEventListener("keydown", event => {
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
-    event.preventDefault();
-    // Editor keymap consumes this first when focused; defaultPrevented does not
-    // indicate consumption here because it was just set by this listener.
-    if (!view.hasFocus) command("save");
+  // Native divider capture can coexist with WebView keyboard focus. Forward
+  // Escape before CodeMirror consumes it, without changing editor semantics.
+  if (event.key === "Escape" && !event.isComposing && event.keyCode !== 229 && !view.composing && !event.repeat) {
+    post({ type: "cancelResize", generation });
   }
+}, { capture: true });
+document.addEventListener("keydown", event => {
+  // Toolbar focus uses exactly the same configured bindings. Focused content
+  // was already handled by the compartment; don't dispatch a second time.
+  if (!view.hasFocus) handleShortcut(event, activeShortcutLookup);
 });
 document.addEventListener("click", event => {
   if ((event.target as Element).closest("a")) event.preventDefault();
@@ -264,7 +350,7 @@ document.addEventListener("click", event => {
 window.addEventListener("error", event => error(`编辑器错误：${event.message}`));
 window.addEventListener("unhandledrejection", () => error("编辑器操作未完成，请保留当前内容并重试"));
 
-const bridge: Bridge = { load, setReadonly, setSource, command, flush };
+const bridge: Bridge = { load, setReadonly, setSource, setShortcuts, command, flush };
 if (window.__STUDYAPP_EDITOR_TEST__ === true) {
   const snapshot = () => ({
     generation, revision, text: view.state.doc.toString(), normalizedText: view.state.doc.toString(),

@@ -42,9 +42,32 @@ pub struct SyncStatus {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct Persisted {
     settings: SyncSettings,
     protected_password: Vec<u8>,
+    baselines: BTreeMap<String, Baseline>,
+    last_success: Option<i64>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CredentialPayload {
+    pub target: SyncTarget,
+    pub target_epoch: String,
+    pub protected_password: Vec<u8>,
+    #[serde(default)]
+    pub legacy_state_compatible: bool,
+}
+
+pub(crate) struct PreparedSyncConfiguration {
+    settings: SyncSettings,
+    pub credentials: CredentialPayload,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SyncState {
+    target: SyncTarget,
+    target_epoch: String,
     baselines: BTreeMap<String, Baseline>,
     last_success: Option<i64>,
 }
@@ -53,12 +76,47 @@ pub struct SyncRuntime {
     path: PathBuf,
     data: Persisted,
     pub status: SyncStatus,
+    credentials: CredentialPayload,
+    categorized: bool,
 }
 
 pub struct SyncCompletion {
     pub plans: Vec<NotePlan>,
     pub errors: Vec<String>,
     pub test_only: bool,
+}
+
+pub(crate) fn validate_settings(settings: &SyncSettings) -> Result<()> {
+    ensure!(
+        settings
+            .auto_minutes
+            .is_none_or(|m| (5..=1440).contains(&m)),
+        "自动同步间隔应为 5–1440 分钟"
+    );
+    match &settings.target {
+        SyncTarget::WebDav { url, username } => {
+            ensure!(!username.trim().is_empty(), "请填写 WebDAV 用户名");
+            ensure!(
+                url.len() <= 4096 && username.len() <= 1024,
+                "服务器地址或用户名过长"
+            );
+            // This constructor only validates parameters and never contacts the server.
+            let _ = WebDavProvider::new(url, username, "")?;
+        }
+        SyncTarget::Folder { path } => {
+            ensure!(
+                path.len() <= 32_768
+                    && !path.trim().is_empty()
+                    && Path::new(path).is_absolute()
+                    && !Path::new(path)
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir)),
+                "请选择不含上级跳转的绝对同步目录"
+            );
+        }
+        SyncTarget::Disabled => {}
+    }
+    Ok(())
 }
 
 // UUIDv8: deterministic application-defined identity for a downloaded copy.
@@ -79,6 +137,163 @@ fn remote_copy_id(source: &str, content: &str) -> String {
 }
 
 impl SyncRuntime {
+    fn read_legacy(database: &Path) -> Result<Persisted> {
+        let path = database.with_file_name("sync-config.json");
+        if !path.try_exists()? {
+            return Ok(Persisted::default());
+        }
+        let _guards = crate::storage_backend::guard_directories(
+            path.parent().context("资料库目录不存在")?,
+            false,
+        )?;
+        let file = crate::storage_backend::plain_handle(&path, false, true)?;
+        ensure!(
+            file.metadata()?.len() <= 8 * 1024 * 1024,
+            "旧同步配置文件超过限制"
+        );
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        file.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 8 * 1024 * 1024, "旧同步配置文件超过限制");
+        serde_json::from_slice(&bytes).context("旧同步配置无法读取，原文件已保留")
+    }
+
+    pub(crate) fn legacy_configuration(
+        database: &Path,
+    ) -> Result<(SyncSettings, CredentialPayload)> {
+        let data = Self::read_legacy(database)?;
+        Ok((
+            data.settings.clone(),
+            CredentialPayload {
+                target: data.settings.target,
+                target_epoch: crate::preferences::unique_revision(),
+                protected_password: data.protected_password,
+                legacy_state_compatible: true,
+            },
+        ))
+    }
+
+    pub(crate) fn from_configuration(
+        database: &Path,
+        settings: SyncSettings,
+        credentials: CredentialPayload,
+    ) -> Result<Self> {
+        validate_settings(&settings)?;
+        ensure!(
+            credentials.target == settings.target,
+            "同步凭据与配置目标不匹配"
+        );
+        let path = database.with_file_name("sync-state.json");
+        let mut data = Persisted {
+            settings: settings.clone(),
+            protected_password: credentials.protected_password.clone(),
+            ..Default::default()
+        };
+        if path.try_exists()? {
+            let _guards = crate::storage_backend::guard_directories(
+                path.parent().context("资料库目录不存在")?,
+                false,
+            )?;
+            let file = crate::storage_backend::plain_handle(&path, false, true)?;
+            ensure!(
+                file.metadata()?.len() <= 8 * 1024 * 1024,
+                "同步运行状态超过限制"
+            );
+            let state: SyncState = serde_json::from_reader(file)?;
+            if state.target == settings.target && state.target_epoch == credentials.target_epoch {
+                data.baselines = state.baselines;
+                data.last_success = state.last_success;
+            }
+        } else if credentials.legacy_state_compatible {
+            let legacy = Self::read_legacy(database)?;
+            if legacy.settings.target == settings.target {
+                data.baselines = legacy.baselines;
+                data.last_success = legacy.last_success;
+            }
+        }
+        let status = SyncStatus {
+            library: database.to_string_lossy().into_owned(),
+            settings,
+            busy: false,
+            last_success: data.last_success,
+            message: "尚未同步；笔记和学习记录始终保存在本机".into(),
+            credential_saved: !data.protected_password.is_empty(),
+        };
+        Ok(Self {
+            path,
+            data,
+            status,
+            credentials,
+            categorized: true,
+        })
+    }
+
+    pub(crate) fn prepare_configuration(
+        &self,
+        settings: SyncSettings,
+        password: Option<Zeroizing<String>>,
+    ) -> Result<PreparedSyncConfiguration> {
+        validate_settings(&settings)?;
+        let changed_target = settings.target != self.data.settings.target;
+        ensure!(
+            !self.status.busy || (settings == self.data.settings && password.is_none()),
+            "同步正在运行，请完成后再修改同步设置"
+        );
+        let encrypted = match &settings.target {
+            SyncTarget::WebDav { .. } => match password {
+                Some(password) => {
+                    ensure!(
+                        !password.is_empty() && password.len() <= 64 * 1024,
+                        "请填写有效的 WebDAV 密码或应用密码"
+                    );
+                    crate::credentials::protect(&password)?
+                }
+                None => {
+                    ensure!(
+                        !changed_target,
+                        "目标已改变，请重新填写此 WebDAV 服务的密码"
+                    );
+                    // Keep the original ciphertext even if another user's DPAPI key
+                    // cannot decrypt it. Unrelated preference edits must remain usable.
+                    self.data.protected_password.clone()
+                }
+            },
+            SyncTarget::Disabled | SyncTarget::Folder { .. } => vec![],
+        };
+        let credentials = CredentialPayload {
+            target: settings.target.clone(),
+            target_epoch: if changed_target {
+                crate::preferences::unique_revision()
+            } else {
+                self.credentials.target_epoch.clone()
+            },
+            protected_password: encrypted,
+            legacy_state_compatible: !changed_target && self.credentials.legacy_state_compatible,
+        };
+        Ok(PreparedSyncConfiguration {
+            settings,
+            credentials,
+        })
+    }
+
+    pub(crate) fn install_configuration(&mut self, prepared: PreparedSyncConfiguration) {
+        let changed_target = self.credentials.target_epoch != prepared.credentials.target_epoch;
+        if changed_target {
+            self.data.baselines.clear();
+            self.data.last_success = None;
+        }
+        self.data.settings = prepared.settings.clone();
+        self.data.protected_password = prepared.credentials.protected_password.clone();
+        self.credentials = prepared.credentials;
+        self.status.settings = prepared.settings;
+        self.status.last_success = self.data.last_success;
+        self.status.credential_saved = !self.data.protected_password.is_empty();
+        if !self.status.busy {
+            self.status.message = "设置已保存；可先测试连接，再开始同步".into();
+        }
+    }
+
+    #[cfg(test)]
     pub fn load(database: &Path) -> Self {
         let path = database.with_file_name("sync-config.json");
         let loaded = (|| -> Result<Persisted> {
@@ -106,20 +321,48 @@ impl SyncRuntime {
             message,
             busy: false,
         };
-        Self { path, data, status }
+        let credentials = CredentialPayload {
+            target: data.settings.target.clone(),
+            target_epoch: crate::preferences::unique_revision(),
+            protected_password: data.protected_password.clone(),
+            legacy_state_compatible: true,
+        };
+        Self {
+            path,
+            data,
+            status,
+            credentials,
+            categorized: false,
+        }
     }
 
     fn persist(&self) -> Result<()> {
+        let _guards = crate::storage_backend::guard_directories(
+            self.path.parent().context("同步目录不存在")?,
+            false,
+        )?;
+        if self.path.try_exists()? {
+            let _ = crate::storage_backend::plain_handle(&self.path, false, false)?;
+        }
         let temporary = self.path.with_file_name(format!(
-            "sync-config-{}.tmp",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ".sync-state-{}.next",
+            crate::preferences::unique_revision()
         ));
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        let bytes = serde_json::to_vec_pretty(&self.data)?;
+        let bytes = if self.categorized {
+            serde_json::to_vec_pretty(&SyncState {
+                target: self.data.settings.target.clone(),
+                target_epoch: self.credentials.target_epoch.clone(),
+                baselines: self.data.baselines.clone(),
+                last_success: self.data.last_success,
+            })?
+        } else {
+            serde_json::to_vec_pretty(&self.data)?
+        };
         ensure!(
             bytes.len() <= 8 * 1024 * 1024,
             "同步配置超过容量限制；请新建独立同步目标"
@@ -131,6 +374,7 @@ impl SyncRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn configure(
         &mut self,
         settings: SyncSettings,

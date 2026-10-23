@@ -38,16 +38,25 @@ fn storage_copy_list(scroll: &ScrollHandle) -> Stateful<Div> {
 
 impl StudyApp {
     pub fn storage_work(&mut self, work: Work, cx: &mut Context<Self>) {
+        let migrating = matches!(&work, Work::MigrateLibrary(_));
         if self.storage_busy
             || self.note_saving
             || self.draft_discard.is_some()
             || self.draft_persist.is_some()
+            || self.preferences_ui.busy
+            || self.preferences_ui.replacing
+            || (migrating && self.sync_panel.read(cx).status.busy)
         {
             return;
         }
         self.storage_busy = true;
         self.folders
             .update(cx, |panel, cx| panel.set_busy(true, cx));
+        if migrating {
+            self.preferences_ui.replacing = true;
+            self.sync_panel
+                .update(cx, |panel, cx| panel.set_editing_locked(true, cx));
+        }
         if self
             .worker
             .sender
@@ -60,12 +69,20 @@ impl StudyApp {
             self.storage_busy = false;
             self.folders
                 .update(cx, |panel, cx| panel.set_busy(false, cx));
+            if migrating {
+                self.preferences_ui.replacing = false;
+                self.sync_panel
+                    .update(cx, |panel, cx| panel.set_editing_locked(false, cx));
+            }
             self.notice = Some(Err("后台服务已停止，请重新启动应用".into()));
         }
         cx.notify();
     }
 
     pub fn choose_storage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.guard_settings(crate::settings_ui::SettingsContinuation::Migrate, cx) {
+            return;
+        }
         if self.storage_busy
             || self.note_saving
             || self.draft_loading
@@ -85,10 +102,20 @@ impl StudyApp {
     }
 
     pub fn pick_migration(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.storage_busy
+            || self.preferences_ui.busy
+            || self.preferences_ui.replacing
+            || self.sync_panel.read(cx).status.busy
+        {
+            return;
+        }
+        let library = self.last_library.clone();
         self.storage_busy = true;
         self.storage_confirm = None;
         self.folders
             .update(cx, |panel, cx| panel.set_busy(true, cx));
+        self.sync_panel
+            .update(cx, |panel, cx| panel.set_editing_locked(true, cx));
         cx.spawn_in(window, async move |this, cx| {
             let path = cx
                 .background_executor()
@@ -99,11 +126,18 @@ impl StudyApp {
                 })
                 .await;
             let _ = this.update_in(cx, |this, _, cx| {
+                // A reply from another library must not release the new
+                // library's operation locks or migrate its data.
+                if library != this.last_library {
+                    return;
+                }
                 this.storage_busy = false;
                 this.folders
                     .update(cx, |panel, cx| panel.set_busy(false, cx));
+                this.sync_panel
+                    .update(cx, |panel, cx| panel.set_editing_locked(false, cx));
                 if let Some(path) = path {
-                    this.storage_work(Work::MigrateLibrary(path), cx);
+                    this.accept_picker_result(library, Work::MigrateLibrary(path), cx);
                 }
                 cx.notify();
             });
@@ -113,7 +147,8 @@ impl StudyApp {
     }
 
     pub fn storage_view(&self, cx: &mut Context<Self>) -> Div {
-        let blocked = self.storage_busy || self.sync_panel.read(cx).status.busy;
+        let blocked =
+            self.storage_busy || self.preferences_ui.busy || self.sync_panel.read(cx).status.busy;
         let show_file_paths = self
             .snapshot
             .as_ref()
@@ -148,6 +183,9 @@ impl StudyApp {
                                 .child(Button::new(SharedString::from(format!("copy-history-{id}")))
                                     .small().ghost().label("历史与恢复").disabled(blocked || self.note_editor.is_some())
                                     .on_click(cx.listener(move |this, _, _, cx| {
+                                        if this.guard_settings(crate::settings_ui::SettingsContinuation::ViewNote(history_id.clone()), cx) {
+                                            return;
+                                        }
                                         this.selected_note = Some(history_id.clone());
                                         this.selected_version = this.snapshot.as_ref().and_then(|s|
                                             s.versions.iter().rev().find(|v| v.note_id == history_id).map(|v| v.id.clone()));
@@ -159,6 +197,9 @@ impl StudyApp {
                                     .small().ghost().label("删除托管副本")
                                     .disabled(blocked || !copy.deletable || in_draft)
                                     .on_click(cx.listener(move |this, _, _, cx| {
+                                        if this.guard_settings(crate::settings_ui::SettingsContinuation::ConfirmDeleteCopy(id.clone()), cx) {
+                                            return;
+                                        }
                                         this.storage_confirm = Some(id.clone()); cx.notify();
                                     }))))
                             .when(show_file_paths, |v| v.child(muted(display_path(&copy.path))

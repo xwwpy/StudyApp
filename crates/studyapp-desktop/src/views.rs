@@ -850,31 +850,7 @@ impl StudyApp {
     }
 
     pub fn settings(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
-        column().child(card().child(heading("学习节奏"))
-            .child(row().items_start()
-                .child(column().flex_1().gap_2().child(muted("询问间隔（5–240 分钟）")).child(Input::new(&self.interval)))
-                .child(column().flex_1().gap_2().child(muted("回答期限（1–30 分钟）")).child(Input::new(&self.deadline))))
-            .child(column().gap_2().child(muted("复习间隔（天，以逗号分隔）")).child(Input::new(&self.review_days)))
-            .child(muted("询问间隔从下一时间段生效；复习间隔只影响新建计划。暂停和休眠期间不累计学习时间。"))
-            .child(Button::new("save-settings").primary().label("保存设置").on_click(cx.listener(|this, _, _, cx| {
-                let result = (|| -> anyhow::Result<Command> {
-                    Ok(Command::SaveLearningSettings {
-                        interval_minutes: this.interval.read(cx).value().trim().parse().map_err(|_| anyhow::anyhow!("询问间隔必须是整数"))?,
-                        answer_minutes: this.deadline.read(cx).value().trim().parse().map_err(|_| anyhow::anyhow!("回答期限必须是整数"))?,
-                        review_days: this.review_days.read(cx).value().replace('，', ",").split(',').map(|s| s.trim().parse::<u32>().map_err(|_| anyhow::anyhow!("复习间隔请填写逗号分隔的正整数"))).collect::<anyhow::Result<Vec<_>>>()?,
-                    })
-                })();
-                match result { Ok(command) => this.send(command, cx), Err(e) => { this.notice = Some(Err(e.to_string())); cx.notify(); } }
-            }))))
-            .child(card().child(heading("显示"))
-                .child(Checkbox::new("show-file-paths")
-                    .label("显示笔记文件的存储路径")
-                    .checked(snapshot.settings.show_file_paths)
-                    .disabled(self.storage_busy)
-                    .on_click(cx.listener(|this, checked, _, cx| {
-                        this.send(Command::SetShowFilePaths(*checked), cx);
-                    })))
-                .child(muted("默认隐藏笔记列表、详情、编辑区及空间管理中的文件地址。此选择自动保存在当前资料库；右键仍可定位或复制路径。")))
+        column().child(self.preference_controls(cx))
             .child(card().child(heading("数据保存"))
                 .child(row().child(pill("✓ 本地资料库", LIGHT)).child(muted("可在下方配置笔记文件同步")))
                 .child(muted(studyapp_desktop::presentation::display_path(&snapshot.data_path)))
@@ -882,10 +858,10 @@ impl StudyApp {
                     .disabled(self.storage_busy || self.note_saving || self.sync_panel.read(cx).status.busy)
                     .label("更改保存位置并迁移")
                     .on_click(cx.listener(|this, _, window, cx| this.choose_storage(window, cx))))
-                    .child(Button::new("switch-library").disabled(self.storage_busy).label("打开其他资料库").on_click(cx.listener(|this, _, _, _| this.picker("library", None))))
-                    .child(Button::new("backup").label("导出备份").on_click(cx.listener(|this, _, _, _| this.picker("backup", None))))
-                    .child(Button::new("restore").label("从备份恢复").on_click(cx.listener(|this, _, _, _| this.picker("restore", None)))))
-                .child(muted("迁移会复制笔记、历史、草稿和同步设置到新的空目录，保留原资料，正常启动时记住新位置。使用 --data-dir 的独立运行不修改默认位置。")))
+                    .child(Button::new("switch-library").disabled(self.storage_busy).label("打开其他资料库").on_click(cx.listener(|this, _, _, cx| this.settings_picker("library", None, cx))))
+                    .child(Button::new("backup").label("导出备份").on_click(cx.listener(|this, _, _, cx| this.settings_picker("backup", None, cx))))
+                    .child(Button::new("restore").label("从备份恢复").on_click(cx.listener(|this, _, _, cx| this.settings_picker("restore", None, cx)))))
+                .child(muted("迁移会复制笔记、历史、草稿和同步设置到新的空目录，保留原资料，正常启动时记住新位置。恢复备份只恢复学习资料，保留当前配置。使用 --data-dir 的独立运行不修改默认位置。")))
             .child(self.storage_view(cx))
             .child(self.sync_panel.clone())
             .child(card().child(heading("账户与微信登录"))

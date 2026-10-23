@@ -18,11 +18,13 @@ use std::sync::mpsc;
 #[derive(Clone, Debug)]
 pub enum SyncEvent {
     Feedback(Result<String, String>),
+    SaveRequested,
 }
 
 pub struct SyncPanel {
     sender: mpsc::Sender<Work>,
     pub status: SyncStatus,
+    pub editing_locked: bool,
     pub target: usize,
     pub folder: Entity<InputState>,
     pub url: Entity<InputState>,
@@ -31,14 +33,39 @@ pub struct SyncPanel {
     interval: Entity<InputState>,
     automatic: bool,
     initialized: bool,
-    picked_sender: mpsc::Sender<(String, std::path::PathBuf)>,
-    picked: mpsc::Receiver<(String, std::path::PathBuf)>,
+    picker_epoch: u64,
+    picked_sender: mpsc::Sender<(String, u64, std::path::PathBuf)>,
+    picked: mpsc::Receiver<(String, u64, std::path::PathBuf)>,
 }
 
 impl EventEmitter<SyncEvent> for SyncPanel {}
 
 impl SyncPanel {
-    fn has_unsaved_changes(&self, cx: &App) -> bool {
+    fn invalidate_folder_picker(&mut self) {
+        self.picker_epoch = self.picker_epoch.wrapping_add(1);
+    }
+
+    /// Locking begins a new draft epoch, even if a failed save later unlocks
+    /// without replacing settings. Its older native picker can no longer edit.
+    pub fn set_editing_locked(&mut self, locked: bool, cx: &mut Context<Self>) {
+        if self.editing_locked != locked {
+            if locked {
+                self.invalidate_folder_picker();
+            }
+            self.editing_locked = locked;
+            cx.notify();
+        }
+    }
+
+    fn begin_folder_picker(&mut self) -> Option<(String, u64)> {
+        if self.editing_locked || self.status.busy || self.target != 1 {
+            return None;
+        }
+        self.invalidate_folder_picker();
+        Some((self.status.library.clone(), self.picker_epoch))
+    }
+
+    pub fn has_unsaved_changes(&self, cx: &App) -> bool {
         let target_matches = match (&self.status.settings.target, self.target) {
             (SyncTarget::Disabled, 0) => true,
             (SyncTarget::Folder { path }, 1) => path == self.folder.read(cx).value().trim(),
@@ -65,6 +92,7 @@ impl SyncPanel {
         let panel = Self {
             sender,
             status: SyncStatus::default(),
+            editing_locked: false,
             target: 0,
             folder: input("选择本地文件夹、网盘同步目录或 NAS 路径", window, cx),
             url: input("https://dav.example.com/path/", window, cx),
@@ -73,6 +101,7 @@ impl SyncPanel {
             interval: input("5–1440 分钟", window, cx),
             automatic: false,
             initialized: false,
+            picker_epoch: 0,
             picked_sender,
             picked,
         };
@@ -106,6 +135,7 @@ impl SyncPanel {
             cx.emit(SyncEvent::Feedback(Err(status.message.clone())));
         }
         if opening_library || status.settings != self.status.settings {
+            self.invalidate_folder_picker();
             self.target = match &status.settings.target {
                 SyncTarget::Disabled => 0,
                 SyncTarget::Folder { path } => {
@@ -138,8 +168,13 @@ impl SyncPanel {
     }
 
     pub fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        while let Ok((library, path)) = self.picked.try_recv() {
-            if library != self.status.library {
+        while let Ok((library, epoch, path)) = self.picked.try_recv() {
+            if library != self.status.library || epoch != self.picker_epoch {
+                continue;
+            }
+            // Consume this request once, even when a current lock rejects it.
+            self.invalidate_folder_picker();
+            if self.editing_locked || self.status.busy || self.target != 1 {
                 continue;
             }
             self.folder.update(cx, |s, cx| {
@@ -149,55 +184,87 @@ impl SyncPanel {
         }
     }
 
-    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let result = (|| -> anyhow::Result<()> {
-            let target = match self.target {
-                1 => SyncTarget::Folder {
-                    path: self.folder.read(cx).value().trim().into(),
-                },
-                2 => SyncTarget::WebDav {
-                    url: self.url.read(cx).value().trim().into(),
-                    username: self.username.read(cx).value().trim().into(),
-                },
-                _ => SyncTarget::Disabled,
-            };
-            let auto_minutes = if self.automatic {
-                Some(
-                    self.interval
-                        .read(cx)
-                        .value()
-                        .trim()
-                        .parse()
-                        .map_err(|_| anyhow::anyhow!("自动同步间隔必须为整数"))?,
-                )
-            } else {
-                None
-            };
-            let raw = self.password.read(cx).value().to_string();
-            let password = (!raw.is_empty()).then(|| zeroize::Zeroizing::new(raw));
-            self.sender
-                .send(Work::Scoped {
-                    library: self.status.library.clone(),
-                    work: Box::new(Work::ConfigureSync {
-                        settings: SyncSettings {
-                            target,
-                            auto_minutes,
-                        },
-                        password,
-                    }),
-                })
-                .map_err(|_| anyhow::anyhow!("后台服务已停止"))?;
-            self.password
-                .update(cx, |s, cx| s.set_value("", window, cx));
-            Ok(())
-        })();
-        if let Err(error) = result {
-            cx.emit(SyncEvent::Feedback(Err(error.to_string())));
+    pub fn draft_settings(
+        &self,
+        cx: &App,
+    ) -> anyhow::Result<(SyncSettings, Option<zeroize::Zeroizing<String>>)> {
+        let target = match self.target {
+            1 => SyncTarget::Folder {
+                path: self.folder.read(cx).value().trim().into(),
+            },
+            2 => SyncTarget::WebDav {
+                url: self.url.read(cx).value().trim().into(),
+                username: self.username.read(cx).value().trim().into(),
+            },
+            _ => SyncTarget::Disabled,
+        };
+        let auto_minutes = if self.automatic {
+            Some(
+                self.interval
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("自动同步间隔必须为整数"))?,
+            )
+        } else {
+            None
+        };
+        let raw = self.password.read(cx).value().to_string();
+        let password = (!raw.is_empty()).then(|| zeroize::Zeroizing::new(raw));
+        Ok((
+            SyncSettings {
+                target,
+                auto_minutes,
+            },
+            password,
+        ))
+    }
+
+    pub fn reset_draft(
+        &mut self,
+        settings: SyncSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.invalidate_folder_picker();
+        self.target = match &settings.target {
+            SyncTarget::Disabled => 0,
+            SyncTarget::Folder { path } => {
+                self.folder
+                    .update(cx, |input, cx| input.set_value(path.clone(), window, cx));
+                1
+            }
+            SyncTarget::WebDav { url, username } => {
+                self.url
+                    .update(cx, |input, cx| input.set_value(url.clone(), window, cx));
+                self.username.update(cx, |input, cx| {
+                    input.set_value(username.clone(), window, cx)
+                });
+                2
+            }
+        };
+        self.automatic = settings.auto_minutes.is_some();
+        self.interval.update(cx, |input, cx| {
+            input.set_value(settings.auto_minutes.unwrap_or(15).to_string(), window, cx)
+        });
+        self.password
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        cx.notify();
+    }
+
+    fn save(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editing_locked || self.status.busy {
+            return;
         }
+        cx.emit(SyncEvent::SaveRequested);
         cx.notify();
     }
 
     fn start(&mut self, test_only: bool, cx: &mut Context<Self>) {
+        if self.editing_locked || self.status.busy {
+            return;
+        }
         if self.has_unsaved_changes(cx) {
             cx.emit(SyncEvent::Feedback(Err(
                 "同步设置有未保存的修改，请先保存。".into(),
@@ -221,13 +288,17 @@ impl SyncPanel {
 
 impl Render for SyncPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let busy = self.status.busy;
+        let busy = self.status.busy || self.editing_locked;
         let unsaved = self.has_unsaved_changes(cx);
         let mut panel = card().child(heading("笔记文件同步"))
             .child(muted("连接自己的 WebDAV 或文件夹/NAS。同步 Markdown 文件，完整历史和学习记录由本地资料库与备份管理。"))
             .child(row().children(["关闭同步", "文件夹 / NAS", "WebDAV"].into_iter().enumerate().map(|(i, label)| {
                 Button::new(("sync-target", i)).label(label).selected(self.target == i).disabled(busy)
-                    .on_click(cx.listener(move |this, _, _, cx| { this.target = i; cx.notify(); }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.editing_locked || this.status.busy { return; }
+                        if this.target != i { this.invalidate_folder_picker(); }
+                        this.target = i; cx.notify();
+                    }))
             })));
         if self.target == 1 {
             panel = panel.child(
@@ -238,14 +309,16 @@ impl Render for SyncPanel {
                             .label("选择文件夹")
                             .disabled(busy)
                             .on_click(cx.listener(|this, _, _, _| {
+                                let Some((library, epoch)) = this.begin_folder_picker() else {
+                                    return;
+                                };
                                 let sender = this.picked_sender.clone();
-                                let library = this.status.library.clone();
                                 std::thread::spawn(move || {
                                     if let Some(path) = rfd::FileDialog::new()
                                         .set_title("选择同步根目录")
                                         .pick_folder()
                                     {
-                                        let _ = sender.send((library, path));
+                                        let _ = sender.send((library, epoch, path));
                                     }
                                 });
                             })),
@@ -266,9 +339,12 @@ impl Render for SyncPanel {
                 }));
         }
         panel.child(row().child(Checkbox::new("auto-sync").label("自动同步").checked(self.automatic).disabled(busy)
-            .on_click(cx.listener(|this, checked, _, cx| { this.automatic = *checked; cx.notify(); })))
+            .on_click(cx.listener(|this, checked, _, cx| {
+                if this.editing_locked || this.status.busy { return; }
+                this.automatic = *checked; cx.notify();
+            })))
             .child(Input::new(&self.interval).disabled(busy || !self.automatic).w(px(150.))).child(muted("分钟")))
-            .child(row().child(Button::new("save-sync-settings").primary().label("保存同步设置").disabled(busy).on_click(cx.listener(|this, _, window, cx| this.save(window, cx))))
+            .child(row().child(Button::new("save-sync-settings").primary().label("保存全部设置").disabled(busy).on_click(cx.listener(|this, _, window, cx| this.save(window, cx))))
                 .child(Button::new("test-sync").label("测试连接").disabled(busy || unsaved || matches!(self.status.settings.target, SyncTarget::Disabled)).on_click(cx.listener(|this, _, _, cx| this.start(true, cx))))
                 .child(Button::new("sync-now").label(if busy { "正在同步…" } else { "立即同步" }).disabled(busy || unsaved || matches!(self.status.settings.target, SyncTarget::Disabled)).on_click(cx.listener(|this, _, _, cx| this.start(false, cx)))))
             .child(muted(if unsaved { "同步设置有未保存的修改，请先保存。" } else { "使用已保存的同步设置" }))
@@ -340,5 +416,118 @@ mod feedback_tests {
             matches!(feedback.borrow().as_slice(), [SyncEvent::Feedback(Err(error))] if error.contains("同步配置无法读取"))
         );
         drop(subscription);
+    }
+}
+
+#[cfg(all(test, feature = "ui-test"))]
+mod picker_tests {
+    use super::SyncPanel;
+    use crate::sync_runtime::{SyncSettings, SyncStatus, SyncTarget};
+    use gpui_kit::TestAppContext;
+    use std::sync::mpsc;
+
+    fn status(library: &str, path: &str) -> SyncStatus {
+        SyncStatus {
+            library: library.into(),
+            settings: SyncSettings {
+                target: SyncTarget::Folder { path: path.into() },
+                auto_minutes: None,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[gpui_kit::test]
+    fn only_the_latest_picker_can_change_the_current_draft(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (sender, _receiver) = mpsc::channel();
+        let (panel, cx) = cx.add_window_view(|window, cx| SyncPanel::new(sender, window, cx));
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.accept(status("library-a", "saved"), false, window, cx);
+                let old = panel.begin_folder_picker().unwrap();
+                let current = panel.begin_folder_picker().unwrap();
+                panel
+                    .picked_sender
+                    .send((old.0, old.1, "stale".into()))
+                    .unwrap();
+                panel
+                    .picked_sender
+                    .send((current.0.clone(), current.1, "chosen".into()))
+                    .unwrap();
+                panel
+                    .picked_sender
+                    .send((current.0, current.1, "duplicate".into()))
+                    .unwrap();
+                panel.poll(window, cx);
+                assert_eq!(panel.folder.read(cx).value(), "chosen");
+            })
+        });
+    }
+
+    #[gpui_kit::test]
+    fn reset_or_library_round_trip_invalidates_delayed_picker_results(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (sender, _receiver) = mpsc::channel();
+        let (panel, cx) = cx.add_window_view(|window, cx| SyncPanel::new(sender, window, cx));
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.accept(status("library-a", "saved"), false, window, cx);
+                let before_reset = panel.begin_folder_picker().unwrap();
+                panel.reset_draft(status("library-a", "reset").settings, window, cx);
+                panel
+                    .picked_sender
+                    .send((before_reset.0, before_reset.1, "stale-reset".into()))
+                    .unwrap();
+                panel.poll(window, cx);
+                assert_eq!(panel.folder.read(cx).value(), "reset");
+                let before_switch = panel.begin_folder_picker().unwrap();
+                panel.accept(status("library-b", "other"), false, window, cx);
+                panel.accept(status("library-a", "restored"), false, window, cx);
+                panel
+                    .picked_sender
+                    .send((before_switch.0, before_switch.1, "stale-library".into()))
+                    .unwrap();
+                panel.poll(window, cx);
+                assert_eq!(panel.folder.read(cx).value(), "restored");
+            })
+        });
+    }
+
+    #[gpui_kit::test]
+    fn editing_lock_retires_open_picker_even_if_reply_arrives_after_unlock(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (sender, _receiver) = mpsc::channel();
+        let (panel, cx) = cx.add_window_view(|window, cx| SyncPanel::new(sender, window, cx));
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.accept(status("library-a", "saved"), false, window, cx);
+                let before_save = panel.begin_folder_picker().unwrap();
+                panel.set_editing_locked(true, cx);
+                assert!(panel.begin_folder_picker().is_none());
+                panel
+                    .picked_sender
+                    .send((before_save.0.clone(), before_save.1, "while-locked".into()))
+                    .unwrap();
+                panel.poll(window, cx);
+                assert_eq!(panel.folder.read(cx).value(), "saved");
+                panel.set_editing_locked(false, cx);
+                panel
+                    .picked_sender
+                    .send((before_save.0, before_save.1, "after-unlock".into()))
+                    .unwrap();
+                panel.poll(window, cx);
+                assert_eq!(panel.folder.read(cx).value(), "saved");
+                let valid = panel.begin_folder_picker().unwrap();
+                panel
+                    .picked_sender
+                    .send((valid.0, valid.1, "new-picker".into()))
+                    .unwrap();
+                panel.poll(window, cx);
+                assert_eq!(panel.folder.read(cx).value(), "new-picker");
+            })
+        });
     }
 }

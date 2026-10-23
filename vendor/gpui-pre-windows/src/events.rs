@@ -157,7 +157,7 @@ impl WindowsWindowInner {
             WM_SETTINGCHANGE => self.handle_system_settings_changed(handle, wparam, lparam),
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
             WM_SHOWWINDOW => self.handle_window_visibility_changed(handle, wparam),
-            WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
+            WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(handle, lparam),
             WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
             DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
@@ -1156,17 +1156,32 @@ impl WindowsWindowInner {
         None
     }
 
-    fn handle_cursor_changed(&self, lparam: LPARAM) -> Option<isize> {
-        let had_cursor = self.state.current_cursor.get().is_some();
-
-        self.state.current_cursor.set(if lparam.0 == 0 {
+    fn handle_cursor_changed(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+        let cursor = if lparam.0 == 0 {
             None
         } else {
             Some(HCURSOR(lparam.0 as _))
-        });
+        };
+        let previous = self.state.current_cursor.replace(cursor);
 
-        if had_cursor != self.state.current_cursor.get().is_some() {
-            unsafe { SetCursor(self.state.current_cursor.get()) };
+        // StudyApp: a hand -> resize change is Some -> Some. Waiting for the
+        // next WM_SETCURSOR leaves a stationary pointer showing the old shape.
+        // This message is broadcast, so only the window owning the client
+        // pointer (or its capture) may update the actual OS cursor.
+        let mut point = POINT::default();
+        let mut client = RECT::default();
+        let owns_pointer = unsafe {
+            GetCapture() == handle
+                || (GetCursorPos(&mut point).is_ok()
+                    && WindowFromPoint(point) == handle
+                    && ScreenToClient(handle, &mut point).as_bool()
+                    && GetClientRect(handle, &mut client).is_ok()
+                    && point.x >= client.left && point.x < client.right
+                    && point.y >= client.top && point.y < client.bottom)
+        };
+        if previous != cursor && owns_pointer && unsafe { IsWindowEnabled(handle).as_bool() } {
+            let visible = self.state.cursor_visible.load(Ordering::Relaxed);
+            unsafe { SetCursor(if visible { cursor } else { None }) };
         }
 
         Some(0)

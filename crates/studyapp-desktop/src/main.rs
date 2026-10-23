@@ -12,10 +12,15 @@ mod folders_ui;
 mod history_preview;
 mod imports;
 mod markdown_editor;
+mod native_shortcuts;
 mod note_actions;
 mod note_commands;
 mod note_editor;
 mod notes_view;
+mod preferences;
+mod resize_overlay;
+mod settings_ui;
+mod shortcuts;
 mod smoke;
 #[cfg(feature = "ui-test")]
 mod smoke_editor;

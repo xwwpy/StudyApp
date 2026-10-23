@@ -4,8 +4,9 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     component::{
         Disableable, Icon, IconName, Placement, Selectable, Sizable,
-        button::ButtonVariants,
+        button::{Button as MenuButton, ButtonVariants},
         input::{Input, InputEvent, InputState},
+        menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
     },
     *,
 };
@@ -58,6 +59,58 @@ struct FolderRow {
     has_children: bool,
 }
 
+/// Logical identity only. Drop resolves it against the latest library snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderDrag {
+    pub folder_id: String,
+    pub library_path: String,
+    pub title: String,
+}
+
+struct FolderDragPreview {
+    title: String,
+    source_offset: Point<Pixels>,
+}
+
+impl Render for FolderDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        anchored()
+            .position_mode(AnchoredPositionMode::Local)
+            .position(self.source_offset + point(px(12.), px(12.)))
+            .snap_to_window()
+            .child(
+                row()
+                    .id("folder-drag-preview")
+                    .test_support()
+                    .w(px(200.))
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(GREEN))
+                    .bg(rgb(LIGHT))
+                    .shadow_md()
+                    .child(Icon::new(IconName::Folder).small().text_color(rgb(GREEN)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .child(self.title.clone()),
+                    ),
+            )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FolderMenuAction {
+    Create,
+    Rename,
+    Move,
+    Delete,
+}
+
 #[derive(Clone)]
 enum FolderAction {
     Create {
@@ -95,6 +148,8 @@ pub struct FolderPanel {
     action: Option<FolderAction>,
     error: Option<String>,
     busy: bool,
+    active_menu: Option<u64>,
+    menu_sequence: u64,
 }
 
 impl EventEmitter<FolderEvent> for FolderPanel {}
@@ -129,6 +184,8 @@ impl FolderPanel {
             action: None,
             error: None,
             busy: false,
+            active_menu: None,
+            menu_sequence: 0,
         }
     }
 
@@ -146,6 +203,10 @@ impl FolderPanel {
 
     pub fn modal_open(&self) -> bool {
         self.action.is_some()
+    }
+
+    pub fn overlay_open(&self) -> bool {
+        self.action.is_some() || self.active_menu.is_some()
     }
 
     pub fn modal_initial_focus(&self, cx: &App) -> Option<FocusHandle> {
@@ -216,7 +277,7 @@ impl FolderPanel {
     }
 
     pub fn accept(&mut self, snapshot: Arc<Snapshot>, window: &mut Window, cx: &mut Context<Self>) {
-        let had_action = self.action.is_some();
+        let had_overlay = self.overlay_open();
         let library_changed = self
             .snapshot
             .as_ref()
@@ -247,6 +308,7 @@ impl FolderPanel {
         if library_changed {
             self.collapsed.clear();
             self.action = None;
+            self.active_menu = None;
             self.error = None;
             self.name
                 .update(cx, |input, cx| input.set_value("", window, cx));
@@ -267,7 +329,7 @@ impl FolderPanel {
             self.error = None;
         }
         self.snapshot = Some(snapshot);
-        if had_action && self.action.is_none() {
+        if had_overlay && !self.overlay_open() {
             cx.emit(FolderEvent::OverlayChanged(false));
         }
         if library_changed
@@ -349,11 +411,12 @@ impl FolderPanel {
     }
 
     fn can_drop_note(&self, drag: &NoteDrag, destination: Option<String>) -> bool {
-        self.snapshot.as_ref().is_some_and(|snapshot| {
-            drag.move_action(destination)
-                .resolve(snapshot, self.busy)
-                .is_ok()
-        })
+        !self.overlay_open()
+            && self.snapshot.as_ref().is_some_and(|snapshot| {
+                drag.move_action(destination)
+                    .resolve(snapshot, self.busy)
+                    .is_ok()
+            })
     }
 
     fn drop_note(&mut self, drag: &NoteDrag, destination: Option<String>, cx: &mut Context<Self>) {
@@ -367,7 +430,35 @@ impl FolderPanel {
         cx.notify();
     }
 
-    fn note_drop_target(
+    fn can_drop_folder(&self, drag: &FolderDrag, destination: Option<&str>) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            valid_folder_drop(
+                drag,
+                &snapshot.data_path,
+                &snapshot.folders,
+                destination,
+                self.busy || self.overlay_open(),
+            )
+        })
+    }
+
+    fn drop_folder(
+        &mut self,
+        drag: &FolderDrag,
+        destination: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_drop_folder(drag, destination.as_deref()) {
+            return;
+        }
+        cx.emit(FolderEvent::Command(Command::MoveFolder {
+            folder_id: drag.folder_id.clone(),
+            parent_id: destination,
+        }));
+        cx.notify();
+    }
+
+    fn folder_drop_target(
         &self,
         id: SharedString,
         destination: Option<String>,
@@ -377,6 +468,9 @@ impl FolderPanel {
         let hover_destination = destination.clone();
         let check_panel = cx.entity().downgrade();
         let check_destination = destination.clone();
+        let folder_hover_panel = cx.weak_entity();
+        let folder_hover_destination = destination.clone();
+        let folder_destination = destination.clone();
         div()
             .id(id)
             .w_full()
@@ -396,18 +490,169 @@ impl FolderPanel {
                     style
                 }
             })
+            .drag_over::<FolderDrag>(move |style, drag, _, cx| {
+                if folder_hover_panel.upgrade().is_some_and(|panel| {
+                    panel
+                        .read(cx)
+                        .can_drop_folder(drag, folder_hover_destination.as_deref())
+                }) {
+                    style.bg(rgb(LIGHT)).border_color(rgb(GREEN))
+                } else {
+                    style
+                }
+            })
             .can_drop(move |value, _, cx| {
-                value.downcast_ref::<NoteDrag>().is_some_and(|drag| {
-                    check_panel.upgrade().is_some_and(|panel| {
-                        panel
-                            .read(cx)
-                            .can_drop_note(drag, check_destination.clone())
-                    })
+                check_panel.upgrade().is_some_and(|panel| {
+                    let panel = panel.read(cx);
+                    if let Some(drag) = value.downcast_ref::<NoteDrag>() {
+                        panel.can_drop_note(drag, check_destination.clone())
+                    } else if let Some(drag) = value.downcast_ref::<FolderDrag>() {
+                        panel.can_drop_folder(drag, check_destination.as_deref())
+                    } else {
+                        false
+                    }
                 })
             })
             .on_drop(cx.listener(move |this, drag: &NoteDrag, _, cx| {
                 this.drop_note(drag, destination.clone(), cx);
             }))
+            .on_drop(cx.listener(move |this, drag: &FolderDrag, _, cx| {
+                this.drop_folder(drag, folder_destination.clone(), cx);
+            }))
+    }
+
+    fn begin_menu_action(
+        &mut self,
+        library: &str,
+        id: &str,
+        action: FolderMenuAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy || self.action.is_some() {
+            return;
+        }
+        let Some(snapshot) = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.data_path == library)
+        else {
+            return;
+        };
+        let Some(folder) = snapshot
+            .folders
+            .iter()
+            .find(|folder| folder.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        match action {
+            FolderMenuAction::Create => {
+                if self
+                    .rows
+                    .iter()
+                    .any(|row| row.id == id && row.depth + 1 < MAX_FOLDER_DEPTH)
+                {
+                    self.edit_name(
+                        FolderAction::Create {
+                            parent_id: Some(id.to_owned()),
+                        },
+                        String::new(),
+                        window,
+                        cx,
+                    );
+                }
+            }
+            FolderMenuAction::Rename => self.edit_name(
+                FolderAction::Rename {
+                    folder_id: id.to_owned(),
+                },
+                folder.name,
+                window,
+                cx,
+            ),
+            FolderMenuAction::Move => {
+                self.action = Some(FolderAction::MoveFolder {
+                    folder_id: id.to_owned(),
+                    destination: folder.parent_id,
+                });
+                self.opened_action(cx);
+            }
+            FolderMenuAction::Delete if empty_folder(snapshot, id) => {
+                self.action = Some(FolderAction::Delete {
+                    folder_id: id.to_owned(),
+                });
+                self.opened_action(cx);
+            }
+            FolderMenuAction::Delete => {}
+        }
+    }
+
+    fn close_menu(&mut self, token: u64, cx: &mut Context<Self>) {
+        if self.active_menu == Some(token) {
+            self.active_menu = None;
+            cx.emit(FolderEvent::OverlayChanged(self.overlay_open()));
+            cx.notify();
+        }
+    }
+
+    fn row_menu(
+        owner: WeakEntity<Self>,
+        library: String,
+        id: String,
+        mut menu: PopupMenu,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let opened = owner.update(cx, |this, cx| {
+            let snapshot = this
+                .snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.data_path == library)?;
+            let row = this.rows.iter().find(|row| row.id == id)?;
+            if this.busy || this.action.is_some() {
+                return None;
+            }
+            let can_create = row.depth + 1 < MAX_FOLDER_DEPTH;
+            let can_delete = empty_folder(snapshot, &id);
+            this.menu_sequence = this.menu_sequence.wrapping_add(1);
+            let token = this.menu_sequence;
+            this.active_menu = Some(token);
+            cx.emit(FolderEvent::OverlayChanged(true));
+            cx.notify();
+            Some((token, can_create, can_delete))
+        });
+        let Ok(Some((token, can_create, can_delete))) = opened else {
+            return menu;
+        };
+        let dismissed = owner.clone();
+        cx.subscribe_self(move |_, _: &DismissEvent, cx| {
+            let _ = dismissed.update(cx, |this, cx| this.close_menu(token, cx));
+        })
+        .detach();
+        let released = owner.clone();
+        cx.on_release(move |_, cx| {
+            let _ = released.update(cx, |this, cx| this.close_menu(token, cx));
+        })
+        .detach();
+        for (label, action, enabled) in [
+            ("新建子目录", FolderMenuAction::Create, can_create),
+            ("重命名", FolderMenuAction::Rename, true),
+            ("移动目录", FolderMenuAction::Move, true),
+            ("删除空目录", FolderMenuAction::Delete, can_delete),
+        ] {
+            let action_owner = owner.clone();
+            let action_library = library.clone();
+            let action_id = id.clone();
+            menu = menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(
+                move |_, window, cx| {
+                    let _ = action_owner.update(cx, |this, cx| {
+                        this.begin_menu_action(&action_library, &action_id, action, window, cx)
+                    });
+                },
+            ));
+        }
+        menu
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
@@ -767,7 +1012,7 @@ impl Render for FolderPanel {
                     .on_click(cx.listener(|this, _, _, cx| this.set_filter(FolderFilter::All, cx))),
             )
             .child(
-                self.note_drop_target("folder-drop-root".into(), None, cx)
+                self.folder_drop_target("folder-drop-root".into(), None, cx)
                     .test_support()
                     .child(
                         Button::new("folders-root")
@@ -776,6 +1021,8 @@ impl Render for FolderPanel {
                             .w_full()
                             .icon(IconName::Inbox)
                             .label(format!("未分类  {}", self.root_count))
+                            .tooltip("笔记移到未分类；目录移到根目录")
+                            .tooltip_placement(Placement::Left)
                             .selected(self.filter == FolderFilter::Root)
                             .disabled(self.busy)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -792,6 +1039,21 @@ impl Render for FolderPanel {
             let expanded = !self.collapsed.contains(&id);
             let count = self.counts.get(&id).copied().unwrap_or(0);
             let chosen = selected_id.as_ref() == Some(&id);
+            let library = self
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.data_path.clone())
+                .unwrap_or_default();
+            let drag = FolderDrag {
+                folder_id: id.clone(),
+                library_path: library.clone(),
+                title: folder.name.clone(),
+            };
+            let menu_owner = cx.weak_entity();
+            let menu_id = id.clone();
+            let menu_library = library.clone();
+            let keyboard_owner = cx.weak_entity();
+            let keyboard_id = id.clone();
             let mut entry = row().gap_0().min_w_0().flex_shrink_0().children(
                 (0..folder.depth.min(MAX_FOLDER_DEPTH)).map(|_| {
                     div()
@@ -823,6 +1085,7 @@ impl Render for FolderPanel {
                             folder.name
                         ))
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
                             if !this.collapsed.remove(&collapse_id) {
                                 this.collapsed.insert(collapse_id.clone());
                             }
@@ -834,140 +1097,112 @@ impl Render for FolderPanel {
             }
             let tip = format!("{} · 直接包含 {count} 份笔记", folder.path);
             tree = tree.child(
-                self.note_drop_target(format!("folder-drop-{id}").into(), Some(id.clone()), cx)
+                self.folder_drop_target(format!("folder-drop-{id}").into(), Some(id.clone()), cx)
                     .test_support()
+                    .debug_selector({
+                        let selector = format!("folder-drop-{id}");
+                        move || selector
+                    })
+                    .aria_selected(chosen)
                     .when(chosen, |style| {
                         style.bg(rgb(LIGHT)).border_color(rgb(0xBDD7C8))
                     })
                     .tooltip(move |window, cx| sidebar_tooltip(tip.clone(), window, cx))
                     .child(
-                        entry.child(
-                            Button::new(SharedString::from(format!("folder-row-{id}")))
+                        entry
+                            .child(
+                                Button::new(SharedString::from(format!("folder-row-{id}")))
+                                    .small()
+                                    .ghost()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .px_1()
+                                    .accessibility_label(format!("{}，{count} 份笔记", folder.name))
+                                    .child(
+                                        row()
+                                            .w_full()
+                                            .min_w_0()
+                                            .gap_1()
+                                            .child(
+                                                Icon::new(if expanded {
+                                                    IconName::FolderOpen
+                                                } else {
+                                                    IconName::FolderClosed
+                                                })
+                                                .small()
+                                                .text_color(rgb(GREEN)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .text_left()
+                                                    .child(folder.name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_xs()
+                                                    .text_color(rgb(MUTED))
+                                                    .child(count.to_string()),
+                                            ),
+                                    )
+                                    .when(!self.busy && self.action.is_none(), |button| {
+                                        button.on_drag(drag, |drag, source_offset, _, cx| {
+                                            cx.new(|_| FolderDragPreview {
+                                                title: drag.title.clone(),
+                                                source_offset,
+                                            })
+                                        })
+                                    })
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_filter(FolderFilter::Folder(id.clone()), cx)
+                                    })),
+                            )
+                            .child(
+                                MenuButton::new(SharedString::from(format!(
+                                    "folder-menu-{keyboard_id}"
+                                )))
                                 .small()
                                 .ghost()
-                                .flex_1()
-                                .min_w_0()
-                                .px_1()
-                                .accessibility_label(format!("{}，{count} 份笔记", folder.name))
-                                .child(
-                                    row()
-                                        .w_full()
-                                        .min_w_0()
-                                        .gap_1()
-                                        .child(
-                                            Icon::new(if expanded {
-                                                IconName::FolderOpen
-                                            } else {
-                                                IconName::FolderClosed
-                                            })
-                                            .small()
-                                            .text_color(rgb(GREEN)),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_left()
-                                                .child(folder.name.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .text_xs()
-                                                .text_color(rgb(MUTED))
-                                                .child(count.to_string()),
-                                        ),
-                                )
-                                .selected(chosen)
+                                .label("⋯")
+                                .w(px(18.))
+                                .px_0()
+                                .flex_shrink_0()
+                                .cursor_pointer()
+                                .accessibility_label(format!("{}的目录操作", folder.name))
+                                .tooltip("目录操作（也可右键目录）")
                                 .disabled(self.busy)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.set_filter(FolderFilter::Folder(id.clone()), cx)
-                                })),
-                        ),
-                    ),
+                                .dropdown_menu(
+                                    move |menu, _, cx| {
+                                        Self::row_menu(
+                                            keyboard_owner.clone(),
+                                            library.clone(),
+                                            keyboard_id.clone(),
+                                            menu,
+                                            cx,
+                                        )
+                                    },
+                                ),
+                            ),
+                    )
+                    .context_menu(move |menu, _, cx| {
+                        Self::row_menu(
+                            menu_owner.clone(),
+                            menu_library.clone(),
+                            menu_id.clone(),
+                            menu,
+                            cx,
+                        )
+                    }),
             );
         }
         if self.rows.is_empty() {
             tree = tree.child(muted("新建目录，按主题整理笔记。").text_xs().p_2());
         }
         panel = panel.child(tree);
-        if let Some(folder_id) = selected_id {
-            let rename_id = folder_id.clone();
-            let move_id = folder_id.clone();
-            let can_delete = !self.busy
-                && self
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| empty_folder(snapshot, &folder_id));
-            panel = panel.child(
-                row()
-                    .p_2()
-                    .gap_1()
-                    .flex_wrap()
-                    .flex_shrink_0()
-                    .border_t_1()
-                    .border_color(rgb(BORDER))
-                    .child(
-                        Button::new("folder-rename")
-                            .small()
-                            .ghost()
-                            .label("重命名")
-                            .disabled(self.busy)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let name = this.folder_name(&rename_id);
-                                this.edit_name(
-                                    FolderAction::Rename {
-                                        folder_id: rename_id.clone(),
-                                    },
-                                    name,
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    )
-                    .child(
-                        Button::new("folder-move")
-                            .small()
-                            .ghost()
-                            .label("移动")
-                            .disabled(self.busy)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let destination = this
-                                    .snapshot
-                                    .as_ref()
-                                    .and_then(|snapshot| {
-                                        snapshot.folders.iter().find(|folder| folder.id == move_id)
-                                    })
-                                    .and_then(|folder| folder.parent_id.clone());
-                                this.action = Some(FolderAction::MoveFolder {
-                                    folder_id: move_id.clone(),
-                                    destination,
-                                });
-                                this.opened_action(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("folder-delete")
-                            .small()
-                            .ghost()
-                            .label("删除")
-                            .tooltip(if can_delete {
-                                "删除这个空目录"
-                            } else {
-                                "先移出全部笔记和子目录，才能删除"
-                            })
-                            .tooltip_placement(Placement::Left)
-                            .disabled(!can_delete)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.action = Some(FolderAction::Delete {
-                                    folder_id: folder_id.clone(),
-                                });
-                                this.opened_action(cx);
-                            })),
-                    ),
-            );
-        }
         panel
     }
 }
@@ -1095,6 +1330,23 @@ fn valid_destination(rows: &[FolderRow], moving: &str, destination: Option<&str>
             .find(|row| row.id == id)
             .is_some_and(|row| accepts_destination(row, moving, subtree_height)),
     }
+}
+
+fn valid_folder_drop(
+    drag: &FolderDrag,
+    library: &str,
+    folders: &[NoteFolder],
+    destination: Option<&str>,
+    blocked: bool,
+) -> bool {
+    if blocked || drag.library_path != library {
+        return false;
+    }
+    let Some(source) = folders.iter().find(|folder| folder.id == drag.folder_id) else {
+        return false;
+    };
+    source.parent_id.as_deref() != destination
+        && valid_destination(&folder_rows(folders), &drag.folder_id, destination)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1255,6 +1507,104 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn directory_drop_revalidates_identity_hierarchy_and_latest_parent() {
+        let folders = vec![
+            folder("parent", "Parent", None),
+            folder("moving", "Moving", Some("parent")),
+            folder("child", "Child", Some("moving")),
+            folder("other", "Other", None),
+        ];
+        let drag = FolderDrag {
+            folder_id: "moving".into(),
+            library_path: "current".into(),
+            title: "Moving".into(),
+        };
+        for destination in [Some("parent"), Some("moving"), Some("child"), Some("gone")] {
+            assert!(!valid_folder_drop(
+                &drag,
+                "current",
+                &folders,
+                destination,
+                false
+            ));
+        }
+        assert!(!valid_folder_drop(
+            &drag,
+            "other-library",
+            &folders,
+            Some("other"),
+            false
+        ));
+        assert!(!valid_folder_drop(
+            &drag,
+            "current",
+            &folders,
+            Some("other"),
+            true
+        ));
+        assert!(!valid_folder_drop(
+            &drag,
+            "current",
+            &[],
+            Some("other"),
+            false
+        ));
+        assert!(valid_folder_drop(
+            &drag,
+            "current",
+            &folders,
+            Some("other"),
+            false
+        ));
+        assert!(valid_folder_drop(&drag, "current", &folders, None, false));
+        let mut latest = folders;
+        latest[1].parent_id = Some("other".into());
+        assert!(!valid_folder_drop(
+            &drag,
+            "current",
+            &latest,
+            Some("other"),
+            false
+        ));
+    }
+
+    #[::core::prelude::v1::test]
+    fn directory_drop_checks_the_whole_subtree_depth() {
+        let folders: Vec<_> = (0..8)
+            .map(|level| {
+                folder(
+                    &level.to_string(),
+                    "Level",
+                    (level > 0).then(|| (level - 1).to_string()).as_deref(),
+                )
+            })
+            .chain([
+                folder("moving", "Moving", None),
+                folder("child", "Child", Some("moving")),
+            ])
+            .collect();
+        let drag = FolderDrag {
+            folder_id: "moving".into(),
+            library_path: "current".into(),
+            title: "Moving".into(),
+        };
+        assert!(!valid_folder_drop(
+            &drag,
+            "current",
+            &folders,
+            Some("6"),
+            false
+        ));
+        assert!(valid_folder_drop(
+            &drag,
+            "current",
+            &folders,
+            Some("5"),
+            false
+        ));
+    }
+
+    #[::core::prelude::v1::test]
     fn names_are_trimmed_and_unique_only_among_siblings() {
         let folders = [
             folder("a", "Research", None),
@@ -1277,7 +1627,9 @@ mod tests {
 
 #[cfg(all(test, feature = "ui-test"))]
 mod ui_tests {
-    use super::{FolderAction, FolderEvent, FolderPanel};
+    use super::{
+        FolderAction, FolderDrag, FolderEvent, FolderFilter, FolderMenuAction, FolderPanel,
+    };
     use gpui_kit::{
         AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Render, TestAppContext,
         VisualTestContext, Window,
@@ -1356,6 +1708,139 @@ mod ui_tests {
         cx.update(|window, cx| {
             _ = window.draw(cx);
         });
+    }
+
+    #[gpui_kit::test]
+    fn selecting_a_directory_preserves_row_bounds_and_paints_one_surface(cx: &mut TestAppContext) {
+        use gpui_kit::{Styled, px};
+        struct CompactHost {
+            panel: Entity<FolderPanel>,
+        }
+        impl Render for CompactHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                gpui_kit::div()
+                    .w(px(144.))
+                    .h(px(600.))
+                    .child(self.panel.clone())
+            }
+        }
+        cx.update(gpui_kit::init);
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let panel = cx.new(|cx| {
+                let mut panel = FolderPanel::new(window, cx);
+                panel.accept(panel_snapshot(), window, cx);
+                panel
+            });
+            cx.observe(&panel, |_, _, cx| cx.notify()).detach();
+            CompactHost { panel }
+        });
+        let panel = cx.read(|cx| host.read(cx).panel.clone());
+        draw(cx);
+        let before = cx
+            .debug_bounds("folder-drop-existing")
+            .expect("Directory row is mounted");
+        panel.update(cx, |panel, cx| {
+            panel.set_filter(FolderFilter::Folder("existing".into()), cx)
+        });
+        draw(cx);
+        let after = cx.debug_bounds("folder-drop-existing").unwrap();
+        assert_eq!(
+            before, after,
+            "Selecting must not change directory dimensions"
+        );
+        let (bounds, surfaces) = cx.update(|window, _| {
+            // Painted quads use pixel-snapped bounds. Bounds::contains is
+            // half-open, so it deliberately excludes an identical bottom/right
+            // edge; use closed interval comparisons for rectangle containment.
+            let bounds = window.pixel_snap_bounds(after).scale(window.scale_factor());
+            let surfaces = window
+                .painted_quads()
+                .into_iter()
+                .filter(|quad| {
+                    !quad.background.is_transparent()
+                        && quad.bounds.left() >= bounds.left()
+                        && quad.bounds.top() >= bounds.top()
+                        && quad.bounds.right() <= bounds.right()
+                        && quad.bounds.bottom() <= bounds.bottom()
+                })
+                .collect::<Vec<_>>();
+            (bounds, surfaces)
+        });
+        assert_eq!(
+            surfaces.len(),
+            1,
+            "Only the outer directory row paints the selected background"
+        );
+        assert_eq!(
+            surfaces[0].bounds, bounds,
+            "The selected surface covers the whole row"
+        );
+        assert_eq!(
+            surfaces[0].background,
+            gpui_kit::rgb(crate::components::LIGHT).into()
+        );
+    }
+
+    #[gpui_kit::test]
+    fn directory_hover_is_read_only_and_release_emits_one_move(cx: &mut TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let (host, cx) = cx.add_window_view(|window, cx| TestHost::new("New", window, cx));
+        let panel = cx.read(|cx| host.read(cx).panel.clone());
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let observed = commands.clone();
+        cx.update(|window, cx| {
+            cx.subscribe(&panel, move |_, event: &FolderEvent, _| {
+                if let FolderEvent::Command(command) = event {
+                    observed.borrow_mut().push(command.clone());
+                }
+            })
+            .detach();
+            panel.update(cx, |panel, cx| {
+                panel.cancel_action(cx);
+                let mut snapshot = (*panel_snapshot()).clone();
+                snapshot.folders.push(NoteFolder {
+                    id: "destination".into(),
+                    name: "Destination".into(),
+                    parent_id: None,
+                });
+                panel.accept(Arc::new(snapshot), window, cx);
+                let drag = FolderDrag {
+                    folder_id: "existing".into(),
+                    library_path: "C:/test-library".into(),
+                    title: "Existing".into(),
+                };
+                assert!(panel.can_drop_folder(&drag, Some("destination")));
+                assert!(commands.borrow().is_empty(), "Hover cannot emit a move");
+                panel.drop_folder(&drag, Some("destination".into()), cx);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(commands.borrow().len(), 1);
+        assert!(
+            matches!(&commands.borrow()[0], Command::MoveFolder { folder_id, parent_id } if folder_id == "existing" && parent_id.as_deref() == Some("destination"))
+        );
+    }
+
+    #[gpui_kit::test]
+    fn menu_actions_use_the_clicked_directory_and_keep_a_new_modal_visible(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (host, cx) = cx.add_window_view(|window, cx| TestHost::new("New", window, cx));
+        let panel = cx.read(|cx| host.read(cx).panel.clone());
+        cx.update(|window, cx| panel.update(cx, |panel, cx| {
+            panel.cancel_action(cx);
+            panel.set_filter(FolderFilter::All, cx);
+            panel.active_menu = Some(7);
+            panel.begin_menu_action("C:/wrong-library", "existing", FolderMenuAction::Rename, window, cx);
+            assert!(!panel.modal_open());
+            panel.begin_menu_action("C:/test-library", "existing", FolderMenuAction::Rename, window, cx);
+            assert!(matches!(&panel.action, Some(FolderAction::Rename { folder_id }) if folder_id == "existing"));
+            panel.close_menu(7, cx);
+            assert!(panel.overlay_open());
+            assert!(panel.modal_open());
+        }));
     }
 
     #[cfg(feature = "ui-test")]

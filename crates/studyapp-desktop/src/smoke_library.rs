@@ -415,13 +415,31 @@ pub async fn exercise(
     window
         .update(cx, |_, window, _| window.resize(size(px(1000.), px(700.))))
         .unwrap();
-    for _ in 0..3 {
+    for _ in 0..50 {
         pause(cx).await;
+        if window
+            .update(cx, |_, window, _| {
+                let actual = window.viewport_size();
+                (actual.width - px(1000.)).abs() <= px(1.)
+                    && (actual.height - px(700.)).abs() <= px(1.)
+            })
+            .unwrap()
+        {
+            break;
+        }
     }
     window
         .update(cx, |_, window, cx| {
-            assert!(window.viewport_size().width <= px(1001.));
-            assert!(window.viewport_size().height <= px(701.));
+            assert!(
+                window.viewport_size().width <= px(1001.),
+                "resize did not settle: {:?}",
+                window.viewport_size()
+            );
+            assert!(
+                window.viewport_size().height <= px(701.),
+                "resize did not settle: {:?}",
+                window.viewport_size()
+            );
             window.click("history-tab", cx);
             window.render_frame(cx);
             assert!(

@@ -10,8 +10,8 @@ fn legacy_settings_restore_default_workspace_layout() {
     assert_eq!(
         serde_json::to_value(settings).unwrap()["layout"],
         json!({
-            "navigation_width": 184, "folders_width": 176, "notes_width": 240,
-            "navigation_visible": true
+            "navigation_width": 160, "folders_width": 144, "notes_width": 200,
+            "navigation_visible": true, "folders_visible": true
         })
     );
 }
@@ -25,6 +25,7 @@ fn workspace_layout_persists_without_changing_learning_or_path_settings() {
         folders_width: 240,
         notes_width: 320,
         navigation_visible: false,
+        folders_visible: true,
     };
     for layout_first in [false, true] {
         let mut engine = Engine::open(&database, 1000).unwrap();
@@ -68,11 +69,11 @@ fn invalid_workspace_widths_are_rejected_without_persisting_changes() {
     let mut engine = Engine::open(&database, 1000).unwrap();
     let original = engine.snapshot().settings;
     for (navigation_width, folders_width, notes_width) in [
-        (143, 176, 240),
+        (127, 176, 240),
         (321, 176, 240),
-        (184, 143, 240),
+        (184, 111, 240),
         (184, 361, 240),
-        (184, 176, 179),
+        (184, 176, 159),
         (184, 176, 441),
         (u32::MAX, 176, 240),
     ] {
@@ -81,6 +82,7 @@ fn invalid_workspace_widths_are_rejected_without_persisting_changes() {
             folders_width,
             notes_width,
             navigation_visible: false,
+            folders_visible: true,
         };
         assert!(
             engine

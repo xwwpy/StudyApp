@@ -136,8 +136,8 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
             cx.background_executor().timer(Duration::from_secs(1)).await;
             window.update(cx, |_, _, cx| {
                 let app = view.read(cx);
-                assert_eq!(app.snapshot.as_ref().unwrap().settings.interval_minutes, 25);
-                assert_eq!(app.interval.read(cx).value().as_ref(), "25");
+                assert_eq!(app.snapshot.as_ref().unwrap().settings.interval_minutes, 10, "restore preserves independently saved preferences");
+                assert_eq!(app.interval.read(cx).value().as_ref(), "10");
                 assert!(app.editor.is_none());
             }).expect("restore refreshed interface");
             window.update(cx, |_, window, cx| {

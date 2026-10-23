@@ -15,7 +15,7 @@ under Apache-2.0. The original `LICENSE-APACHE` is included.
 ## Change
 
 In `src/directx_renderer.rs`, create the DirectComposition target with
-`topmost = false`. This is the only behavioral modification.
+`topmost = false`.
 
 Microsoft documents that `topmost = true` places the visual tree above the
 window's native children. GPUI's opaque card background therefore hid the
@@ -31,3 +31,17 @@ keyboard input. Browser DOM state and CDP screenshots do not test this issue.
 
 Re-evaluate this patch when upgrading GPUI. Do not remove it merely because
 browser-only tests pass.
+
+In `src/events.rs`, immediately update the actual Win32 cursor when its
+handle changes, including `Some(hand)` to `Some(resize)`. Upstream only
+compares whether a handle exists, so a stationary pointer can retain the
+previous shape until another `WM_SETCURSOR` arrives. This was reproduced by
+the native CI hand-to-divider check. Since the message is broadcast, only
+the window currently owning client-area pointer input or mouse capture may
+call `SetCursor`; native child windows, non-client resizing and cursor
+visibility retain their own behavior.
+
+The regression moves once per target and reads the actual UI-thread
+`GetCursor` handle, requiring a non-null expected hand/resize/arrow. A
+non-null global `GetCursorInfo` handle must also agree; suppressed CI
+desktop cursors may have a null global handle.

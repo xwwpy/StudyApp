@@ -66,7 +66,7 @@ try {
         if ($package.source -match '^registry\+') {
             $notices.Add("## $($package.name) $($package.version)`n`nLicense expression: $($package.license)`n`nSource: https://crates.io/api/v1/crates/$($package.name)/$($package.version)/download`n")
         } elseif (-not $package.source -and $package.name -eq 'gpui-pre-windows' -and $package.version -eq '0.3.9' -and [IO.Path]::GetFullPath($root) -eq [IO.Path]::GetFullPath((Join-Path $repoRoot 'vendor/gpui-pre-windows'))) {
-            $notices.Add("## gpui-pre-windows 0.3.9 (modified)`n`nLicense: Apache-2.0. WW-StudyApp changes the native composition target to draw behind child windows. Full patched source, original license and provenance are included in third-party/gpui-pre-windows-0.3.9/. See STUDYAPP-PATCH.md there.`n`nSource: https://github.com/xwwpy/StudyApp/tree/v$Version/vendor/gpui-pre-windows`n")
+            $notices.Add("## gpui-pre-windows 0.3.9 (modified)`n`nLicense: Apache-2.0. WW-StudyApp changes the native composition target to draw behind child windows and applies posted cursor shape changes immediately when the window owns the pointer. Full patched source, original license and provenance are included in third-party/gpui-pre-windows-0.3.9/. See STUDYAPP-PATCH.md there.`n`nSource: https://github.com/xwwpy/StudyApp/tree/v$Version/vendor/gpui-pre-windows`n")
             foreach ($sourceFile in (Get-ChildItem -LiteralPath $root -File -Recurse)) {
                 $relativeSource = [IO.Path]::GetRelativePath($root, $sourceFile.FullName)
                 $sourceDestination = Join-Path $staging "third-party/gpui-pre-windows-0.3.9/$relativeSource"

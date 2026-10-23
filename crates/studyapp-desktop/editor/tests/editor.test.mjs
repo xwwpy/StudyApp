@@ -5,6 +5,7 @@ import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import { normalizeBinding, resolveBindings, shortcutDefaults } from "../src/shortcuts.ts";
 
 const root = fileURLToPath(new URL("../dist/", import.meta.url));
 let server, browser, base;
@@ -55,6 +56,10 @@ async function setup(text = "", testEnabled = true) {
 async function action(page, value) { return page.evaluate(value => window.studyappEditor.test(value), value); }
 async function state(page) { return action(page, { type: "snapshot" }); }
 async function select(page, anchor, head = anchor) { return action(page, { type: "select", anchor, head }); }
+async function shortcuts(page, bindings) {
+  assert.equal(await page.evaluate(() => typeof window.studyappEditor.setShortcuts), "function", "shortcut bridge must support live reconfiguration");
+  await page.evaluate(bindings => window.studyappEditor.setShortcuts(bindings), bindings);
+}
 function replayRawChanges(raw, messages, preferredEol) {
   for (const [index, message] of messages.entries()) {
     assert.ok(message.changes.length <= 4096, `emitted ${message.changes.length} patches`);
@@ -73,6 +78,26 @@ function replayRawChanges(raw, messages, preferredEol) {
   }
   return raw;
 }
+
+test("shortcut registry matches the native allowlist and validation rejects conflicts and platform keys", async () => {
+  const native = await readFile(new URL("../../src/shortcuts.rs", import.meta.url), "utf8");
+  const entries = [...native.matchAll(/\(\s*"((?:app|editor)\.[^"]+)",\s*"[^"]+",\s*"[^"]+",\s*"([^"]*)"\s*,?\s*\)/g)]
+    .map(([, action, binding]) => [action, binding]);
+  assert.equal(entries.length, Object.keys(shortcutDefaults).length);
+  assert.deepEqual(Object.fromEntries(entries), shortcutDefaults);
+  assert.deepEqual(resolveBindings({}), shortcutDefaults);
+  assert.equal(normalizeBinding(" control + shift + s ; f8 "), "Ctrl+Shift+S;F8");
+  assert.equal(normalizeBinding("alt + Ctrl + ["), "Ctrl+Alt+BracketLeft");
+  assert.equal(normalizeBinding(" "), "");
+  for (const binding of [
+    "A", "Shift+A", "Ctrl", "Ctrl++S", "Ctrl+Ctrl+S", "Ctrl+S;", "Ctrl+S;control+s",
+    "Win+S", "Meta+S", "Alt+F4", "Alt+Tab", "Alt+Space", "Ctrl+Space", "Ctrl+Shift+Space",
+    "Ctrl+Alt+Delete", "Ctrl+Shift+Escape", "Ctrl+C", "Shift+Insert", "Ctrl+Home", "Alt+ArrowLeft", "F25", "F01"
+  ]) assert.throws(() => normalizeBinding(binding), undefined, binding);
+  assert.throws(() => resolveBindings({ "editor.save": "Ctrl+B" }));
+  assert.throws(() => resolveBindings({ "app.arbitrary-code": "Ctrl+Q" }));
+  assert.equal(resolveBindings({ "editor.save": "Ctrl+B", "editor.bold": "" })["editor.save"], "Ctrl+B");
+});
 
 test("bundled editor starts with one continuous editable Markdown surface", async () => {
   const { page, errors } = await setup("# 连续编辑\n\n正文包含 **粗体** 和 *强调*。\n\n- 第一项\n- 第二项\n\n结尾");
@@ -542,6 +567,179 @@ test("readonly, save key, and production test isolation", async () => {
   const production = await setup("secure", false);
   assert.equal(await production.page.evaluate(() => typeof window.studyappEditor.test), "undefined");
   await production.page.close();
+});
+
+test("shortcut remap saves once, removes old bindings, updates tooltips and restores defaults", async () => {
+  const { page } = await setup("editable");
+  await select(page, 0, 8);
+  await shortcuts(page, { "editor.save": "shift + control + s", "editor.bold": "Ctrl+Alt+B" });
+  await page.keyboard.press("Control+s");
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "save").length), 0);
+  await page.keyboard.press("Control+Shift+s");
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "save").length), 1);
+  await page.keyboard.press("Control+b");
+  assert.equal((await state(page)).text, "editable");
+  await page.keyboard.press("Control+Alt+b");
+  assert.equal((await state(page)).text, "**editable**");
+  assert.match(await page.locator('[data-command="bold"]').getAttribute("title"), /Ctrl\+Alt\+B/);
+  await shortcuts(page, { "editor.save": "", "editor.bold": "" });
+  await page.keyboard.press("Control+s");
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "save").length), 1);
+  assert.doesNotMatch(await page.locator('[data-command="bold"]').getAttribute("title"), /Ctrl/);
+  await shortcuts(page, {});
+  await page.keyboard.press("Control+s");
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "save").length), 2);
+  await page.locator("#source-toggle").focus();
+  await page.keyboard.press("Control+s");
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "save").length), 3);
+  await page.close();
+});
+
+test("shifted digit shortcut keys match physical digits even when Windows reports punctuation", async () => {
+  const { page } = await setup("digits");
+  await select(page, 0, 6);
+  await shortcuts(page, { "editor.save": "Ctrl+Shift+1", "editor.bold": "Ctrl+Shift+2" });
+  await page.keyboard.press("Control+Shift+Digit1");
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "save").length), 1);
+  await page.keyboard.press("Control+Shift+Digit2");
+  assert.equal((await state(page)).text, "**digits**");
+  await page.close();
+});
+
+test("shortcut remap preserves selection, revision and undo history while replacing all history aliases", async () => {
+  const { page } = await setup("original");
+  await select(page, 0, 8);
+  await page.keyboard.insertText("edited");
+  const before = await state(page);
+  await shortcuts(page, { "editor.undo": "Ctrl+Alt+Z", "editor.redo": "Ctrl+Alt+Y" });
+  const remapped = await state(page);
+  assert.equal(remapped.text, before.text);
+  assert.equal(remapped.revision, before.revision);
+  assert.deepEqual(remapped.selection, before.selection);
+  await page.keyboard.press("Control+z");
+  assert.equal((await state(page)).text, "edited");
+  await page.keyboard.press("Control+Alt+z");
+  assert.equal((await state(page)).text, "original");
+  await page.keyboard.press("Control+y");
+  await page.keyboard.press("Control+Shift+z");
+  assert.equal((await state(page)).text, "original");
+  await page.keyboard.press("Control+Alt+y");
+  assert.equal((await state(page)).text, "edited");
+  await shortcuts(page, {});
+  await page.keyboard.press("Control+z");
+  await page.keyboard.press("Control+Shift+z");
+  assert.equal((await state(page)).text, "edited");
+  await page.close();
+});
+
+test("shortcut remap routes native actions with generation and suppresses repeats, IME and pending flush", async () => {
+  const { page } = await setup("中文");
+  await select(page, 0);
+  await shortcuts(page, { "app.new": "Ctrl+Alt+N" });
+  await page.keyboard.press("Control+Alt+n");
+  assert.deepEqual(await page.evaluate(() => window.messages.filter(m => m.type === "shortcut")), [
+    { type: "shortcut", action: "app.new", generation: 41 }
+  ]);
+  await page.evaluate(() => {
+    for (const flags of [{ repeat: true }, { isComposing: true }, { keyCode: 229 }]) {
+      document.querySelector(".cm-content").dispatchEvent(new KeyboardEvent("keydown", { key: "n", ctrlKey: true, altKey: true, bubbles: true, cancelable: true, ...flags }));
+    }
+  });
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "shortcut").length), 1);
+  await page.evaluate(() => {
+    void window.studyappEditor.flush({ request: 22 });
+    document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "n", ctrlKey: true, altKey: true, bubbles: true, cancelable: true }));
+    document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "shortcut").length), 1);
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "save").length), 0);
+  await page.waitForFunction(() => window.messages.some(m => m.type === "flush" && m.request === 22));
+  await page.evaluate(() => window.studyappEditor.load({ generation: 42, text: "next", readonly: false }));
+  await select(page, 0);
+  await page.keyboard.press("Control+Alt+n");
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "shortcut").at(-1).generation), 42);
+  await page.close();
+});
+
+test("focused Escape forwards one generation-scoped resize cancellation before CodeMirror consumes it", async () => {
+  const { page } = await setup("中文编辑保持原文");
+  await select(page, 0, 3);
+  const before = await state(page);
+  await page.keyboard.press("Escape");
+  assert.deepEqual(await page.evaluate(() => window.messages.filter(m => m.type === "cancelResize")), [
+    { type: "cancelResize", generation: 41 }
+  ]);
+  const after = await state(page);
+  assert.equal(after.text, before.text);
+  assert.equal(after.revision, before.revision);
+  assert.deepEqual(after.selection, { anchor: 3, head: 3 }, "normal CodeMirror Escape must still collapse the selection");
+  await page.evaluate(() => {
+    window.studyappEditor.load({ generation: 42, text: "next", readonly: false });
+    document.querySelector(".cm-content").addEventListener("keydown", event => {
+      if (event.key === "Escape") event.stopPropagation();
+    });
+  });
+  await select(page, 0);
+  await page.keyboard.press("Escape");
+  assert.deepEqual(await page.evaluate(() => window.messages.filter(m => m.type === "cancelResize")), [
+    { type: "cancelResize", generation: 41 }, { type: "cancelResize", generation: 42 }
+  ]);
+  await page.evaluate(() => {
+    for (const flags of [{ isComposing: true }, { keyCode: 229 }, { repeat: true }]) {
+      document.querySelector(".cm-content").dispatchEvent(new KeyboardEvent("keydown", {
+        key: "Escape", bubbles: true, cancelable: true, ...flags
+      }));
+    }
+  });
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "cancelResize").length), 2);
+  assert.equal((await state(page)).text, "next");
+  assert.equal((await state(page)).revision, 0);
+  await page.close();
+});
+
+test("shortcut malformed maps are rejected atomically without changing the document or active bindings", async () => {
+  const { page, errors } = await setup("kept");
+  await select(page, 0);
+  await shortcuts(page, { "editor.save": "Ctrl+Shift+S" });
+  for (const invalid of [
+    { "editor.bold": "Ctrl+Shift+S" }, { "app.unknown": "Ctrl+Q" }, { "editor.save": "Alt+F4" },
+    { "editor.save": "Win+S" }, { "editor.save": "Ctrl+Space" }, { "editor.save": "A" },
+    { "editor.save": "Shift+A" }, { "editor.save": "Ctrl+Shift+S;" }, { "editor.save": 42 }, null, []
+  ]) {
+    // A partial map starts from defaults, so force the duplicate inside the same update.
+    const candidate = invalid && !Array.isArray(invalid) ? { "editor.save": "Ctrl+Shift+S", ...invalid } : invalid;
+    await shortcuts(page, candidate);
+  }
+  await page.keyboard.press("Control+Shift+s");
+  assert.equal(await page.evaluate(() => window.messages.filter(m => m.type === "save").length), 1);
+  assert.equal((await state(page)).text, "kept");
+  assert.equal((await state(page)).revision, 0);
+  assert.deepEqual(errors, []);
+  assert.match(await page.locator("#editor-status").innerText(), /快捷键/);
+  await page.close();
+});
+
+test("CodeMirror command bindings can be moved or cleared while normal navigation and readonly remain intact", async () => {
+  const { page } = await setup("one\ntwo");
+  await select(page, 0);
+  await shortcuts(page, { "editor.move-line-down": "Ctrl+Alt+J", "editor.delete-line": "", "editor.indent-more": "Ctrl+Alt+I" });
+  await page.keyboard.press("Alt+ArrowDown");
+  assert.equal((await state(page)).text, "one\ntwo");
+  await page.keyboard.press("Control+Alt+j");
+  assert.equal((await state(page)).text, "two\none");
+  await page.keyboard.press("Control+Shift+k");
+  assert.equal((await state(page)).text, "two\none");
+  await page.keyboard.press("Control+Home");
+  assert.deepEqual((await state(page)).selection, { anchor: 0, head: 0 });
+  await page.keyboard.press("ArrowRight");
+  assert.equal((await state(page)).selection.head, 1);
+  await page.keyboard.press("Control+Alt+i");
+  assert.match((await state(page)).text, /^\s+two/);
+  const before = await state(page);
+  await page.evaluate(() => window.studyappEditor.setReadonly(true));
+  await page.keyboard.press("Control+Alt+j");
+  assert.equal((await state(page)).text, before.text);
+  await page.close();
 });
 
 test("oversized UTF-8 paste is rejected atomically and editing remains available", async () => {

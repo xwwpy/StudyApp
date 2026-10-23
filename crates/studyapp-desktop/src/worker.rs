@@ -1,3 +1,4 @@
+use crate::preferences::{PreferenceSnapshot, PreferencesStore, SavePreferences};
 use crate::storage_backend::StorageEvent;
 use std::{
     path::PathBuf,
@@ -13,14 +14,11 @@ pub enum Work {
         work: Box<Work>,
     },
     Apply(Command),
+    SavePreferences(SavePreferences),
     ImportPaths(Vec<PathBuf>),
     PreparedImport {
         generation: u64,
         selection: crate::imports::ImportSelection,
-    },
-    ConfigureSync {
-        settings: crate::sync_runtime::SyncSettings,
-        password: Option<zeroize::Zeroizing<String>>,
     },
     StartSync {
         test_only: bool,
@@ -43,9 +41,12 @@ pub struct Update {
     pub notice: Option<Result<String, String>>,
     pub editor_result: bool,
     pub library_replaced: bool,
+    pub library_result: Option<Result<(), String>>,
     pub note_result: Option<Result<String, String>>,
     pub sync_status: Option<crate::sync_runtime::SyncStatus>,
     pub storage_event: Option<StorageEvent>,
+    pub preferences: Option<PreferenceSnapshot>,
+    pub preferences_result: Option<Result<(), String>>,
 }
 
 pub struct Worker {
@@ -70,7 +71,15 @@ fn launch_sync(
     Ok(())
 }
 
-fn open_library(path: &std::path::Path, now: i64) -> anyhow::Result<(std::fs::File, Engine)> {
+fn open_library(
+    path: &std::path::Path,
+    now: i64,
+) -> anyhow::Result<(
+    std::fs::File,
+    Engine,
+    PreferencesStore,
+    crate::sync_runtime::SyncRuntime,
+)> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -83,8 +92,49 @@ fn open_library(path: &std::path::Path, now: i64) -> anyhow::Result<(std::fs::Fi
     lock.try_lock().map_err(|_| {
         anyhow::anyhow!("该资料库正在另一个 WW-StudyApp 窗口中使用，请先关闭那个窗口")
     })?;
-    let engine = Engine::open(path, now)?;
-    Ok((lock, engine))
+    let mut engine = Engine::open(path, now)?;
+    let database = PathBuf::from(engine.snapshot().data_path);
+    let (preferences, synchronization) = PreferencesStore::open(&database, &mut engine)?;
+    Ok((lock, engine, preferences, synchronization))
+}
+
+fn save_scoped_settings(
+    command: Command,
+    preferences: &mut PreferencesStore,
+    synchronization: &mut crate::sync_runtime::SyncRuntime,
+    engine: &mut Engine,
+    now: i64,
+) -> anyhow::Result<String> {
+    let current = preferences.snapshot();
+    let mut settings = current.settings;
+    match command {
+        Command::SaveSettings(next) => settings = next,
+        Command::SaveLearningSettings {
+            interval_minutes,
+            answer_minutes,
+            review_days,
+        } => {
+            settings.interval_minutes = interval_minutes;
+            settings.answer_minutes = answer_minutes;
+            settings.review_days = review_days;
+        }
+        Command::SetShowFilePaths(visible) => settings.show_file_paths = visible,
+        Command::SaveLayout(layout) => settings.layout = layout,
+        Command::Restore(path) => return engine.restore_preserving_settings(&path, now),
+        other => return engine.apply(other, now),
+    }
+    preferences.save(
+        SavePreferences {
+            expected_revision: current.revision,
+            settings,
+            shortcuts: current.shortcuts,
+            sync: current.sync,
+            password: None,
+        },
+        engine,
+        synchronization,
+    )?;
+    Ok("设置已保存".into())
 }
 
 impl Worker {
@@ -93,7 +143,7 @@ impl Worker {
         let (updates, receiver) = mpsc::channel();
         let command_sender = sender.clone();
         let handle = thread::spawn(move || {
-            let (mut library_lock, mut engine) =
+            let (mut library_lock, mut engine, mut preferences, mut synchronization) =
                 match open_library(&path, chrono::Utc::now().timestamp()) {
                     Ok(library) => library,
                     Err(error) => {
@@ -102,14 +152,16 @@ impl Worker {
                             notice: Some(Err(format!("无法打开资料库：{error:#}"))),
                             editor_result: false,
                             library_replaced: false,
+                            library_result: None,
                             note_result: None,
                             sync_status: None,
                             storage_event: None,
+                            preferences: None,
+                            preferences_result: None,
                         });
                         return;
                     }
                 };
-            let mut synchronization = crate::sync_runtime::SyncRuntime::load(&path);
             let mut generation = 0_u64;
             let mut last_sync_attempt = Instant::now();
             let _ = updates.send(Update {
@@ -117,9 +169,12 @@ impl Worker {
                 notice: None,
                 editor_result: false,
                 library_replaced: false,
+                library_result: None,
                 note_result: None,
                 sync_status: Some(synchronization.status.clone()),
                 storage_event: None,
+                preferences: Some(preferences.snapshot()),
+                preferences_result: None,
             });
             let mut last_tick = Instant::now();
             let mut last_scan = Instant::now();
@@ -155,14 +210,25 @@ impl Worker {
                                     | Work::MigrateLibrary(_)
                             )
                             .then(|| StorageEvent::Finished(Err(error.clone())));
+                            let preferences_result =
+                                matches!(work.as_ref(), Work::SavePreferences(_))
+                                    .then(|| Err(error.clone()));
+                            let library_result = matches!(
+                                work.as_ref(),
+                                Work::SwitchLibrary(_) | Work::Apply(Command::Restore(_))
+                            )
+                            .then(|| Err(error.clone()));
                             let _ = updates.send(Update {
                                 snapshot: Some(Arc::new(engine.snapshot())),
                                 notice: Some(Err(error)),
                                 editor_result,
                                 library_replaced: false,
+                                library_result,
                                 note_result,
                                 sync_status: None,
                                 storage_event,
+                                preferences: Some(preferences.snapshot()),
+                                preferences_result,
                             });
                             continue;
                         }
@@ -175,9 +241,11 @@ impl Worker {
                 let mut changed = false;
                 let mut editor_result = false;
                 let mut library_replaced = false;
+                let mut library_result = None;
                 let mut note_result = None;
                 let mut sync_changed = false;
                 let mut storage_event = None;
+                let mut preferences_result = None;
                 match work {
                     Ok(Work::Scoped { .. }) => continue,
                     Ok(Work::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -223,7 +291,14 @@ impl Worker {
                             }
                             .into())
                         } else {
-                            engine.apply(command, now).map_err(|e| format!("{e:#}"))
+                            save_scoped_settings(
+                                command,
+                                &mut preferences,
+                                &mut synchronization,
+                                &mut engine,
+                                now,
+                            )
+                            .map_err(|e| format!("{e:#}"))
                         };
                         if existing_notes.is_some() || saved_note.is_some() {
                             note_result = Some(match &result {
@@ -245,15 +320,24 @@ impl Worker {
                             });
                         }
                         library_replaced = restoring && result.is_ok();
+                        library_result =
+                            restoring.then(|| result.as_ref().map(|_| ()).map_err(Clone::clone));
                         if library_replaced {
                             generation += 1;
-                            synchronization = crate::sync_runtime::SyncRuntime::load(
-                                std::path::Path::new(&engine.snapshot().data_path),
-                            );
                             last_sync_attempt = Instant::now();
                             sync_changed = true;
                         }
                         notice = Some(result);
+                        changed = true;
+                    }
+                    Ok(Work::SavePreferences(request)) => {
+                        let result = preferences
+                            .save(request, &mut engine, &mut synchronization)
+                            .map_err(|error| format!("{error:#}"));
+                        notice = Some(result.clone().map(|()| "全部设置已保存".into()));
+                        preferences_result = Some(result);
+                        last_sync_attempt = Instant::now();
+                        sync_changed = true;
                         changed = true;
                     }
                     Ok(Work::ImportPaths(paths)) => {
@@ -284,17 +368,6 @@ impl Worker {
                                 format!("{}；{}", message, selection.warnings.join("；"))
                             }
                         }));
-                        changed = true;
-                    }
-                    Ok(Work::ConfigureSync { settings, password }) => {
-                        notice = Some(
-                            synchronization
-                                .configure(settings, password)
-                                .map(|()| "同步设置已保存".into())
-                                .map_err(|e| e.to_string()),
-                        );
-                        last_sync_attempt = Instant::now();
-                        sync_changed = true;
                         changed = true;
                     }
                     Ok(Work::StartSync { test_only }) => {
@@ -338,7 +411,7 @@ impl Worker {
                             );
                             engine.checkpoint()?;
                             std::fs::create_dir_all(&directory)?;
-                            let (next_lock, next) =
+                            let (next_lock, next, next_preferences, next_sync) =
                                 open_library(&directory.join("studyapp.sqlite3"), now)?;
                             if let Some(config) = &location_config {
                                 let snapshot = next.snapshot();
@@ -348,6 +421,8 @@ impl Worker {
                                 crate::storage_backend::persist_location(config, directory)?;
                             }
                             engine = next;
+                            preferences = next_preferences;
+                            synchronization = next_sync;
                             library_lock = next_lock;
                             last_tick = Instant::now();
                             Ok("已切换资料库，原资料仍保存在原目录".into())
@@ -355,13 +430,12 @@ impl Worker {
                         library_replaced = result.is_ok();
                         if library_replaced {
                             generation += 1;
-                            synchronization = crate::sync_runtime::SyncRuntime::load(
-                                std::path::Path::new(&engine.snapshot().data_path),
-                            );
                             last_sync_attempt = Instant::now();
                             sync_changed = true;
                         }
-                        notice = Some(result.map_err(|e| format!("{e:#}")));
+                        let result = result.map_err(|e| format!("{e:#}"));
+                        library_result = Some(result.as_ref().map(|_| ()).map_err(Clone::clone));
+                        notice = Some(result);
                         changed = true;
                     }
                     Ok(Work::RefreshStorage) => {
@@ -404,7 +478,8 @@ impl Worker {
                                     &directory,
                                     now,
                                 )?;
-                                let (next_lock, next) = open_library(&database, now)?;
+                                let (next_lock, next, next_preferences, next_sync) =
+                                    open_library(&database, now)?;
                                 let report = crate::storage_backend::inspect(&next.snapshot())?;
                                 if let Some(config) = &location_config {
                                     let directory = database
@@ -413,6 +488,8 @@ impl Worker {
                                     crate::storage_backend::persist_location(config, directory)?;
                                 }
                                 engine = next;
+                                preferences = next_preferences;
+                                synchronization = next_sync;
                                 library_lock = next_lock;
                                 last_tick = Instant::now();
                                 Ok(report)
@@ -421,9 +498,6 @@ impl Worker {
                         library_replaced = result.is_ok();
                         if library_replaced {
                             generation += 1;
-                            synchronization = crate::sync_runtime::SyncRuntime::load(
-                                std::path::Path::new(&engine.snapshot().data_path),
-                            );
                             last_sync_attempt = Instant::now();
                             sync_changed = true;
                         }
@@ -495,9 +569,12 @@ impl Worker {
                             notice,
                             editor_result,
                             library_replaced,
+                            library_result,
                             note_result,
                             sync_status: sync_changed.then(|| synchronization.status.clone()),
                             storage_event,
+                            preferences: Some(preferences.snapshot()),
+                            preferences_result,
                         })
                         .is_err()
                 {
@@ -526,6 +603,58 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unified_preferences_results_and_legacy_patches_preserve_all_categories() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let worker = Worker::start(root.join("studyapp.sqlite3"), None);
+        let initial = worker
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let original = initial.preferences.unwrap();
+        let library = initial.snapshot.unwrap().data_path.clone();
+        let mut settings = original.settings.clone();
+        settings.layout.folders_visible = false;
+        settings.answer_minutes = 9;
+        worker
+            .sender
+            .send(Work::Scoped {
+                library: library.clone(),
+                work: Box::new(Work::SavePreferences(SavePreferences {
+                    expected_revision: original.revision.clone(),
+                    settings,
+                    shortcuts: original.shortcuts.clone(),
+                    sync: original.sync.clone(),
+                    password: None,
+                })),
+            })
+            .unwrap();
+        let saved = receive_notice(&worker);
+        assert!(saved.preferences_result.unwrap().is_ok());
+        let committed = saved.preferences.unwrap();
+        assert_eq!(committed.settings.answer_minutes, 9);
+        assert!(!committed.settings.layout.folders_visible);
+        let patched = apply(&worker, Command::SetShowFilePaths(true));
+        let patched = patched.preferences.unwrap();
+        assert!(patched.settings.show_file_paths);
+        assert_eq!(patched.settings.answer_minutes, 9);
+        assert!(!patched.settings.layout.folders_visible);
+        assert_eq!(patched.shortcuts, committed.shortcuts);
+        worker
+            .sender
+            .send(Work::SavePreferences(SavePreferences {
+                expected_revision: original.revision,
+                settings: original.settings,
+                shortcuts: original.shortcuts,
+                sync: original.sync,
+                password: None,
+            }))
+            .unwrap();
+        let rejected = receive_notice(&worker);
+        assert!(rejected.preferences_result.unwrap().is_err());
+        assert_eq!(rejected.preferences.unwrap().revision, patched.revision);
+    }
 
     fn storage_result(update: &Update) -> &Result<crate::storage_backend::StorageReport, String> {
         let Some(StorageEvent::Finished(result)) = &update.storage_event else {
@@ -849,6 +978,8 @@ mod tests {
 
     fn while_network_sync_is_busy(worker: &Worker, action: impl FnOnce() -> Update) -> Update {
         use std::io::{Read, Write};
+        worker.sender.send(Work::RefreshStorage).unwrap();
+        let current = receive_notice(worker).preferences.unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         // Hold the initial TLS handshake so the worker has a deterministic,
         // in-flight network task. Release with invalid TLS after the assertion.
@@ -870,8 +1001,11 @@ mod tests {
         });
         worker
             .sender
-            .send(Work::ConfigureSync {
-                settings: crate::sync_runtime::SyncSettings {
+            .send(Work::SavePreferences(SavePreferences {
+                expected_revision: current.revision,
+                settings: current.settings,
+                shortcuts: current.shortcuts,
+                sync: crate::sync_runtime::SyncSettings {
                     target: crate::sync_runtime::SyncTarget::WebDav {
                         url,
                         username: "fixture".into(),
@@ -879,7 +1013,7 @@ mod tests {
                     auto_minutes: None,
                 },
                 password: Some(zeroize::Zeroizing::new("fixture".into())),
-            })
+            }))
             .unwrap();
         receive_notice(worker).notice.unwrap().unwrap();
         worker
@@ -935,6 +1069,36 @@ mod tests {
             .unwrap();
         let barrier = apply(&worker, Command::SetPaused(true));
         assert!(barrier.snapshot.unwrap().notes.is_empty());
+    }
+
+    #[test]
+    fn stale_library_actions_complete_with_their_own_failure_signal() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let worker = Worker::start(root.join("studyapp.sqlite3"), None);
+        let initial = worker
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert!(initial.library_result.is_none());
+        let original = initial.snapshot.unwrap().data_path.clone();
+        for work in [
+            Work::SwitchLibrary(root.join("must-not-open")),
+            Work::Apply(Command::Restore(root.join("missing.sqlite3"))),
+        ] {
+            worker
+                .sender
+                .send(Work::Scoped {
+                    library: "expired-library".into(),
+                    work: Box::new(work),
+                })
+                .unwrap();
+            let rejected = receive_notice(&worker);
+            assert!(rejected.library_result.as_ref().unwrap().is_err());
+            assert!(!rejected.library_replaced);
+            assert!(rejected.preferences_result.is_none());
+            assert_eq!(rejected.snapshot.unwrap().data_path, original);
+        }
+        assert!(!root.join("must-not-open").exists());
     }
 
     #[test]
@@ -1123,18 +1287,22 @@ mod tests {
         assert!(!extra.library_replaced);
         let restored = apply(&worker, Command::Restore(backup));
         assert!(restored.notice.unwrap().is_ok());
+        assert_eq!(restored.library_result, Some(Ok(())));
+        assert!(restored.preferences_result.is_none());
         assert!(restored.library_replaced);
         let snapshot = restored.snapshot.unwrap();
-        assert_eq!(snapshot.settings.interval_minutes, 5);
+        assert_eq!(snapshot.settings.interval_minutes, 10);
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.sessions[0].id, original_id);
         assert_eq!(snapshot.sessions[0].summary, "备份中的学习");
         let failed = apply(&worker, Command::Restore(directory.join("missing.sqlite3")));
         assert!(failed.notice.unwrap().is_err());
+        assert!(failed.library_result.as_ref().unwrap().is_err());
+        assert!(failed.preferences_result.is_none());
         assert!(!failed.library_replaced);
         let unchanged = failed.snapshot.unwrap();
         assert_eq!(unchanged.data_path, snapshot.data_path);
-        assert_eq!(unchanged.settings.interval_minutes, 5);
+        assert_eq!(unchanged.settings.interval_minutes, 10);
         assert_eq!(unchanged.sessions.len(), 1);
         assert_eq!(unchanged.sessions[0].id, original_id);
     }
@@ -1148,6 +1316,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .unwrap();
         assert!(!initial.library_replaced);
+        assert!(initial.library_result.is_none());
         let original_path = initial.snapshot.unwrap().data_path.clone();
         let invalid_directory = directory.join("file.txt");
         std::fs::write(&invalid_directory, "preserve").unwrap();
@@ -1157,6 +1326,8 @@ mod tests {
             .unwrap();
         let failed = receive_notice(&worker);
         assert!(failed.notice.unwrap().is_err());
+        assert!(failed.library_result.as_ref().unwrap().is_err());
+        assert!(failed.preferences_result.is_none());
         assert!(!failed.library_replaced);
         assert_eq!(failed.snapshot.unwrap().data_path, original_path);
         worker
@@ -1165,6 +1336,8 @@ mod tests {
             .unwrap();
         let switched = receive_notice(&worker);
         assert!(switched.notice.unwrap().is_ok());
+        assert_eq!(switched.library_result, Some(Ok(())));
+        assert!(switched.preferences_result.is_none());
         assert!(switched.library_replaced);
         assert_ne!(switched.snapshot.unwrap().data_path, original_path);
     }

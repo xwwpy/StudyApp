@@ -87,6 +87,10 @@ impl StudyApp {
     ) {
         match event {
             MarkdownEvent::Save => self.save_note(window, cx),
+            MarkdownEvent::CancelResize => self.cancel_resize(cx),
+            MarkdownEvent::Shortcut(action) => {
+                self.dispatch_shortcut(&action, window, cx);
+            }
             MarkdownEvent::Error(error) => {
                 self.note_intent = None;
                 self.note_saving = false;
@@ -162,6 +166,10 @@ impl StudyApp {
                 self.pick_migration(window, cx);
             }
             NoteIntent::Close => {
+                if self.guard_settings(crate::settings_ui::SettingsContinuation::Close, cx) {
+                    self.close_requested = false;
+                    return;
+                }
                 self.close_allowed = true;
                 window.remove_window();
             }
@@ -183,6 +191,9 @@ impl StudyApp {
         if self.close_allowed {
             return true;
         }
+        if self.guard_settings(crate::settings_ui::SettingsContinuation::Close, cx) {
+            return false;
+        }
         if !self.note_content.read(cx).creating()
             && !self.storage_busy
             && self.note_editor.is_none()
@@ -202,12 +213,18 @@ impl StudyApp {
             || self.draft_discard.is_some()
             || self.note_content.read(cx).creating()
             || self.storage_busy
+            || self.preferences_ui.busy
+            || self.preferences_ui.leave.is_some()
         {
             return;
         }
         if self.note_editor.is_some() {
             self.request_note_action(NoteIntent::Close, window, cx);
         } else {
+            if self.guard_settings(crate::settings_ui::SettingsContinuation::Close, cx) {
+                self.close_requested = false;
+                return;
+            }
             self.close_allowed = true;
             window.remove_window();
         }
@@ -310,9 +327,9 @@ impl StudyApp {
         let mut show = self.page == Page::Notes
             && self.confirmation.is_none()
             && self.storage_confirm.is_none()
-            && !self.folders.read(cx).modal_open()
-            && !self.is_layout_resizing()
-            && !cx.has_active_drag()
+            && !self.folders.read(cx).overlay_open()
+            && self.preferences_ui.leave.is_none()
+            && !self.preferences_ui.reset_confirmation
             && self.draft_discard.is_none()
             && self.active_note_menu.is_none();
         if self.note_editor.is_none() {

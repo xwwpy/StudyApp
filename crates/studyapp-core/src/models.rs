@@ -9,15 +9,17 @@ pub struct LayoutSettings {
     pub folders_width: u32,
     pub notes_width: u32,
     pub navigation_visible: bool,
+    pub folders_visible: bool,
 }
 
 impl Default for LayoutSettings {
     fn default() -> Self {
         Self {
-            navigation_width: 184,
-            folders_width: 176,
-            notes_width: 240,
+            navigation_width: 160,
+            folders_width: 144,
+            notes_width: 200,
             navigation_visible: true,
+            folders_visible: true,
         }
     }
 }
@@ -31,6 +33,10 @@ pub struct Settings {
     pub show_file_paths: bool,
     #[serde(default)]
     pub layout: LayoutSettings,
+}
+/// Validated configuration, ready to install without another storage operation.
+pub struct PreparedSettings {
+    pub(crate) settings: Settings,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SessionStatus {

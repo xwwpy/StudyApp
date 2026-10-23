@@ -5,7 +5,7 @@ use crate::{
     smoke_library::{click_scrolled, create_note, scroll_settings, settled, until},
     worker::Work,
 };
-use gpui_kit::{test::TestWindowExt, *};
+use gpui_kit::{component::WindowExt, test::TestWindowExt, *};
 use std::{path::Path, time::Duration};
 use studyapp_desktop::presentation::display_path;
 
@@ -82,6 +82,159 @@ pub async fn exercise(
                 .clone()
         })
         .unwrap();
+    window
+        .update(cx, |_, window, cx| {
+            window.click("folders-all", cx);
+            crate::smoke_library::reveal_scrolled(
+                window,
+                format!("folder-row-{destination}").into(),
+                "folder-tree-scroll",
+                cx,
+            );
+            window.right_click(SharedString::from(format!("folder-row-{destination}")), cx);
+        })
+        .unwrap();
+    until(
+        window,
+        view,
+        "folder row context menu opened",
+        |app, cx| app.folders.read(cx).overlay_open() && !app.folders.read(cx).modal_open(),
+        cx,
+    )
+    .await;
+    let rename_input = window
+        .update(cx, |_, window, cx| {
+            assert_eq!(
+                view.read(cx).folders.read(cx).filter(),
+                &FolderFilter::All,
+                "right-click must keep the current note filter"
+            );
+            assert_eq!(
+                editor.read(cx).native_state().unwrap()["controllerVisible"],
+                false,
+                "folder context menu must cover the native editor"
+            );
+            for old_button in ["folder-rename", "folder-move", "folder-delete"] {
+                assert!(
+                    window.try_find(SharedString::from(old_button)).is_none(),
+                    "folder row actions must live in its context menu"
+                );
+            }
+            window.press("down", cx);
+            window.press("down", cx);
+            window.press("enter", cx); // Rename the clicked row, while All remains selected.
+            window.render_frame(cx);
+            assert!(
+                view.read(cx).folders.read(cx).modal_open(),
+                "menu dismissal must not close the newly opened action dialog"
+            );
+            window.click("folder-name-input", cx);
+            window.press("ctrl-a", cx);
+            window
+                .focused_input(cx)
+                .expect("rename input must retain focus")
+                .as_input()
+                .expect("folder name uses a single-line input")
+                .clone()
+        })
+        .unwrap();
+    // Configured native shortcuts defer dispatch to avoid reentering StudyApp.
+    // Real key messages leave the event loop between Ctrl+A and text input.
+    cx.background_executor()
+        .timer(Duration::from_millis(40))
+        .await;
+    until(
+        window,
+        view,
+        "deferred Ctrl+A selected the rename input",
+        |_, cx| {
+            let input = rename_input.read(cx);
+            input.selected_range() == (0..input.text().len())
+        },
+        cx,
+    )
+    .await;
+    window
+        .update(cx, |_, window, cx| {
+            assert_eq!(
+                rename_input.read(cx).value().as_ref(),
+                "拖动目标目录",
+                "rename must start from the clicked folder's original name"
+            );
+            window.input("右键重命名拖动目录", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+    until(
+        window,
+        view,
+        "context rename targets clicked folder",
+        |app, cx| {
+            !app.folders.read(cx).overlay_open()
+                && app
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .folders
+                    .iter()
+                    .any(|folder| folder.id == destination && folder.name == "右键重命名拖动目录")
+        },
+        cx,
+    )
+    .await;
+    window
+        .update(cx, |_, window, cx| {
+            window.click(SharedString::from(format!("folder-row-{destination}")), cx);
+            window.render_frame(cx);
+            for old_button in ["folder-rename", "folder-move", "folder-delete"] {
+                assert!(
+                    window.try_find(SharedString::from(old_button)).is_none(),
+                    "selected folder retained its obsolete bottom action buttons"
+                );
+            }
+            window.click("folders-all", cx);
+            // The compact row menu gives keyboard users the same four actions.
+            crate::smoke_library::reveal_scrolled(
+                window,
+                format!("folder-menu-{destination}").into(),
+                "folder-tree-scroll",
+                cx,
+            );
+            window.click(SharedString::from(format!("folder-menu-{destination}")), cx);
+        })
+        .unwrap();
+    until(
+        window,
+        view,
+        "folder row keyboard menu opened",
+        |app, cx| app.folders.read(cx).overlay_open() && !app.folders.read(cx).modal_open(),
+        cx,
+    )
+    .await;
+    window
+        .update(cx, |_, window, cx| {
+            window.press("down", cx);
+            window.press("enter", cx); // New child is the first menu item.
+            window.render_frame(cx);
+            assert!(view.read(cx).folders.read(cx).modal_open());
+            window.input("键盘菜单子目录", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+    until(
+        window,
+        view,
+        "keyboard row menu creates child",
+        |app, cx| {
+            !app.folders.read(cx).overlay_open()
+                && app.snapshot.as_ref().unwrap().folders.iter().any(|folder| {
+                    folder.name == "键盘菜单子目录"
+                        && folder.parent_id.as_ref() == Some(&destination)
+                })
+        },
+        cx,
+    )
+    .await;
     let note = create_note(window, view, "拖动与右键测试", None, cx).await;
     let bytes = std::fs::read(&note.path).unwrap();
     let note_element: SharedString = format!("note-{}", note.id).into();
@@ -245,13 +398,125 @@ pub async fn exercise(
             );
             window.click(("nav", 4_usize), cx);
             click_scrolled(window, "show-file-paths".into(), "page-scroll", cx);
+            assert!(
+                view.read(cx)
+                    .preferences_ui
+                    .draft
+                    .as_ref()
+                    .unwrap()
+                    .show_file_paths
+            );
+            assert!(
+                !view
+                    .read(cx)
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .show_file_paths,
+                "checkbox saved before explicit save"
+            );
+            assert!(view.read(cx).settings_dirty(cx));
+            window.click(("nav", 1_usize), cx);
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx).page,
+                Page::Settings,
+                "dirty settings left without confirmation"
+            );
+            assert!(view.read(cx).preferences_ui.leave.is_some());
+            window.click("settings-continue-editing", cx);
+            assert_eq!(view.read(cx).page, Page::Settings);
+            assert!(view.read(cx).preferences_ui.leave.is_none());
+            assert!(
+                view.read(cx).settings_dirty(cx),
+                "continue editing discarded the draft"
+            );
+            let library = view.read(cx).last_library.clone();
+            view.update(cx, |app, cx| {
+                app.storage_busy = true;
+                app.accept_picker_result(
+                    library.clone(),
+                    Work::SwitchLibrary(database.with_file_name("unused-picker-result")),
+                    cx,
+                );
+                assert!(app.preferences_ui.leave.is_none());
+                assert!(!app.preferences_ui.replacing);
+                let (queued_library, work) = app
+                    .picker_results
+                    .try_recv()
+                    .expect("picker result must wait while migration owns storage locks");
+                assert_eq!(queued_library, library);
+                app.storage_busy = false;
+                app.accept_picker_result(queued_library, work, cx);
+            });
+            assert!(
+                matches!(
+                    view.read(cx).preferences_ui.leave,
+                    Some(crate::settings_ui::SettingsContinuation::PickedWork(..))
+                ),
+                "async picker result bypassed dirty settings guard"
+            );
+            assert_eq!(view.read(cx).last_library, library);
+            assert!(
+                !view.read(cx).storage_busy,
+                "guarded picker result started switching libraries"
+            );
+            window.render_frame(cx);
+            window.click("settings-continue-editing", cx);
+            view.update(cx, |app, cx| {
+                app.close_requested = true;
+                app.finish_draft_persist(crate::editor_lifecycle::NoteIntent::Close, window, cx);
+            });
+            assert!(
+                matches!(
+                    view.read(cx).preferences_ui.leave,
+                    Some(crate::settings_ui::SettingsContinuation::Close)
+                ),
+                "async note close bypassed dirty settings guard"
+            );
+            assert!(!view.read(cx).close_allowed && !view.read(cx).close_requested);
+            assert_eq!(view.read(cx).page, Page::Settings);
+            window.render_frame(cx);
+            window.click("settings-continue-editing", cx);
+            assert!(view.read(cx).preferences_ui.leave.is_none());
+            assert!(view.read(cx).settings_dirty(cx));
+            window.click(("nav", 1_usize), cx);
+            window.render_frame(cx);
+            window.click("settings-discard", cx);
+            assert_eq!(view.read(cx).page, Page::Notes);
+            assert!(
+                !view
+                    .read(cx)
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .show_file_paths
+            );
+            assert!(
+                !view.read(cx).settings_dirty(cx),
+                "discard retained dirty settings"
+            );
+            window.click(("nav", 4_usize), cx);
+            click_scrolled(window, "show-file-paths".into(), "page-scroll", cx);
+            window.click(("nav", 1_usize), cx);
+            window.render_frame(cx);
+            assert!(view.read(cx).preferences_ui.leave.is_some());
+            window.click("settings-save-and-continue", cx);
         })
         .unwrap();
     until(
         window,
         view,
-        "path setting enabled",
-        |app, _| app.snapshot.as_ref().unwrap().settings.show_file_paths,
+        "path setting saved before navigation continues",
+        |app, cx| {
+            app.page == Page::Notes
+                && !app.preferences_ui.busy
+                && app.preferences_ui.leave.is_none()
+                && !app.settings_dirty(cx)
+                && app.snapshot.as_ref().unwrap().settings.show_file_paths
+        },
         cx,
     )
     .await;
@@ -385,13 +650,35 @@ pub async fn exercise(
                 "Settings must scroll outside the file list"
             );
             click_scrolled(window, "show-file-paths".into(), "page-scroll", cx);
+            assert!(
+                !view
+                    .read(cx)
+                    .preferences_ui
+                    .draft
+                    .as_ref()
+                    .unwrap()
+                    .show_file_paths
+            );
+            assert!(
+                view.read(cx)
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .show_file_paths
+            );
+            click_scrolled(window, "save-settings".into(), "page-scroll", cx);
         })
         .unwrap();
     until(
         window,
         view,
         "path setting disabled again",
-        |app, _| !app.snapshot.as_ref().unwrap().settings.show_file_paths,
+        |app, cx| {
+            !app.preferences_ui.busy
+                && !app.settings_dirty(cx)
+                && !app.snapshot.as_ref().unwrap().settings.show_file_paths
+        },
         cx,
     )
     .await;
@@ -426,5 +713,5 @@ pub async fn exercise(
     .await;
     assert_eq!(std::fs::read(&note.path).unwrap(), bytes);
     std::fs::write(database.with_file_name("interactions-smoke-result.txt"),
-        "PASS: Enter directory creation, actual pointer drag, right-click Move to Unclassified, context-menu visibility and keyboard selection, explicit path copy, persistent display toggle UI, nested wheel at both boundaries, actual scrollbar drag and outer scrolling outside the list; source bytes unchanged.\n").unwrap();
+        "PASS: Enter directory creation; unselected folder right-click rename and row-menu child creation; folder actions use menus and modal survives menu dismissal; actual pointer drag; right-click Move to Unclassified; explicit path copy; show-path checkbox stages until save; dirty-settings continue/discard/save-and-continue; nested wheel at both boundaries, actual scrollbar drag and outer scrolling outside the list; source bytes unchanged.\n").unwrap();
 }

@@ -88,6 +88,9 @@ pub struct StudyApp {
     pub layout: studyapp_core::LayoutSettings,
     pub resizing: Option<crate::workspace_layout::ResizeState>,
     pub layout_dirty: bool,
+    pub preferences_ui: crate::settings_ui::PreferencesUi,
+    pub(crate) picker_sender: std::sync::mpsc::Sender<(String, Work)>,
+    pub(crate) picker_results: std::sync::mpsc::Receiver<(String, Work)>,
     pub modal_focus: crate::feedback::ModalFocus,
     notice_seen: Option<Result<String, String>>,
     notice_started: Option<std::time::Instant>,
@@ -97,6 +100,7 @@ pub struct StudyApp {
 
 impl StudyApp {
     pub fn new(worker: Worker, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let (picker_sender, picker_results) = std::sync::mpsc::channel();
         let input =
             |placeholder: &str, value: &str, window: &mut Window, cx: &mut Context<Self>| {
                 cx.new(|cx| {
@@ -154,6 +158,24 @@ impl StudyApp {
         )
         .detach();
         let weak = cx.weak_entity();
+        let shortcut_owner = weak.clone();
+        let shortcut_window = window.window_handle();
+        cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle() != shortcut_window
+                || event.input_preference == InputPreference::CharacterInput
+            {
+                return;
+            }
+            let _ = shortcut_owner.update(cx, |this, cx| {
+                if this.is_layout_resizing() && event.keystroke.key.eq_ignore_ascii_case("escape") {
+                    this.cancel_resize(cx);
+                    cx.stop_propagation();
+                } else if this.handle_shortcut(&event.keystroke, window, cx) {
+                    cx.stop_propagation();
+                }
+            });
+        })
+        .detach();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |this, cx| this.handle_close(window, cx))
                 .unwrap_or(true)
@@ -163,14 +185,29 @@ impl StudyApp {
         cx.subscribe(
             &sync_panel,
             |this, _, event: &crate::sync_ui::SyncEvent, cx| {
-                let crate::sync_ui::SyncEvent::Feedback(message) = event;
-                this.notice = Some(message.clone());
-                this.notice_seen = None;
+                match event {
+                    crate::sync_ui::SyncEvent::Feedback(message) => {
+                        this.notice = Some(message.clone());
+                        this.notice_seen = None;
+                    }
+                    crate::sync_ui::SyncEvent::SaveRequested => this.save_preferences(cx),
+                }
                 cx.notify();
             },
         )
         .detach();
+        cx.observe(&sync_panel, |_, _, cx| cx.notify()).detach();
         let folders = cx.new(|cx| crate::folders_ui::FolderPanel::new(window, cx));
+        let interval = input("5–240 分钟", "60", window, cx);
+        let deadline = input("1–30 分钟", "5", window, cx);
+        let review_days = input("用逗号分隔天数", "1, 3, 7, 14, 30", window, cx);
+        for setting in [&interval, &deadline, &review_days] {
+            cx.subscribe(
+                setting,
+                |_, _, _: &gpui_kit::component::input::InputEvent, cx| cx.notify(),
+            )
+            .detach();
+        }
         cx.observe(&folders, |_, _, cx| cx.notify()).detach();
         cx.subscribe(
             &folders,
@@ -212,6 +249,9 @@ impl StudyApp {
             layout: Default::default(),
             resizing: None,
             layout_dirty: false,
+            preferences_ui: Default::default(),
+            picker_sender,
+            picker_results,
             modal_focus: crate::feedback::ModalFocus::new(cx),
             notice_seen: None,
             notice_started: None,
@@ -249,9 +289,9 @@ impl StudyApp {
                 window,
                 cx,
             ),
-            interval: input("5–240 分钟", "60", window, cx),
-            deadline: input("1–30 分钟", "5", window, cx),
-            review_days: input("用逗号分隔天数", "1, 3, 7, 14, 30", window, cx),
+            interval,
+            deadline,
+            review_days,
             editor: None,
             chosen_notes: HashSet::new(),
             chosen_versions: HashSet::new(),
@@ -271,6 +311,16 @@ impl StudyApp {
     }
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while !self.storage_busy
+            && !self.preferences_ui.busy
+            && !self.preferences_ui.replacing
+            && !self.has_modal(cx)
+        {
+            let Ok((library, work)) = self.picker_results.try_recv() else {
+                break;
+            };
+            self.accept_picker_result(library, work, cx);
+        }
         self.sync_panel
             .update(cx, |panel, cx| panel.poll(window, cx));
         let mut changed = self.poll_drafts(window, cx);
@@ -290,6 +340,7 @@ impl StudyApp {
             self.capture_note_draft(cx);
         }
         while let Ok(update) = self.worker.receiver.try_recv() {
+            let storage_finished = update.storage_event.is_some();
             if let Some(crate::storage_backend::StorageEvent::Finished(result)) =
                 update.storage_event
             {
@@ -318,7 +369,9 @@ impl StudyApp {
                     self.recoverable_draft = None;
                     self.drafts.save(&self.last_library, None);
                     self.reader_key.clear();
-                    self.page = Page::Notes;
+                    if self.page != Page::Settings {
+                        self.page = Page::Notes;
+                    }
                     self.finish_library_transition(window, cx);
                 }
             }
@@ -350,6 +403,25 @@ impl StudyApp {
                     self.accept_snapshot(snapshot, update.library_replaced, window, cx);
                 }
             }
+            if let Some(preferences) = update.preferences {
+                self.accept_preferences(preferences, update.library_replaced, window, cx);
+            }
+            if let Some(result) = update.preferences_result {
+                self.preferences_finished(result, window, cx);
+            }
+            if update
+                .library_result
+                .as_ref()
+                .is_some_and(|result| result.is_err() || self.pending_library.is_none())
+                || (storage_finished
+                    && self.preferences_ui.replacing
+                    && self.pending_library.is_none())
+            {
+                self.preferences_ui.replacing = false;
+                self.sync_panel.update(cx, |panel, cx| {
+                    panel.set_editing_locked(false, cx);
+                });
+            }
             changed = true;
         }
         self.continue_close(window, cx);
@@ -366,6 +438,12 @@ impl StudyApp {
         cx: &mut Context<Self>,
     ) {
         if library_replaced || self.last_library != snapshot.data_path {
+            // A successful switch may wait for the old editor's durable flush.
+            // Unlock only when this snapshot actually becomes the current library.
+            self.preferences_ui.replacing = false;
+            self.sync_panel.update(cx, |panel, cx| {
+                panel.set_editing_locked(false, cx);
+            });
             self.layout = snapshot.settings.layout.clone();
             self.layout_dirty = false;
             self.resizing = None;
@@ -412,7 +490,9 @@ impl StudyApp {
                 )
             });
         }
-        if !self.is_layout_resizing() && !self.layout_dirty {
+        if self.page == Page::Settings && self.settings_dirty(cx) {
+            // Layout changes made on the settings page are part of its draft.
+        } else if !self.is_layout_resizing() && !self.layout_dirty {
             self.layout = snapshot.settings.layout.clone();
         } else if self.layout == snapshot.settings.layout {
             self.layout_dirty = false;
@@ -438,7 +518,7 @@ impl StudyApp {
                     self.chosen_notes = session.note_ids.iter().cloned().collect();
                     self.chosen_versions = session.version_ids.iter().cloned().collect();
                     self.seed_versions(&snapshot, session.ended_at);
-                    self.page = Page::Today;
+                    self.navigate(Page::Today, window, cx);
                 }
             }
         }
@@ -543,7 +623,7 @@ impl StudyApp {
         if self.note_saving || self.draft_discard.is_some() || self.storage_busy {
             return;
         }
-        let sender = self.worker.sender.clone();
+        let sender = self.picker_sender.clone();
         let library = self.last_library.clone();
         std::thread::spawn(move || {
             let work = match action {
@@ -559,15 +639,18 @@ impl StudyApp {
                 _ => None,
             };
             if let Some(work) = work {
-                let _ = sender.send(Work::Scoped {
-                    library,
-                    work: Box::new(work),
-                });
+                let _ = sender.send((library, work));
             }
         });
     }
 
     pub fn open_editor(&mut self, mode: EditorMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.guard_settings(
+            crate::settings_ui::SettingsContinuation::Record(mode.clone()),
+            cx,
+        ) {
+            return;
+        }
         let mut text = String::new();
         self.chosen_notes.clear();
         self.chosen_versions.clear();
@@ -725,9 +808,16 @@ impl StudyApp {
         self.confirmation.is_some()
             || self.storage_confirm.is_some()
             || self.folders.read(cx).modal_open()
+            || self.preferences_ui.leave.is_some()
+            || self.preferences_ui.reset_confirmation
     }
 
     fn cancel_modal(&mut self, cx: &mut Context<Self>) {
+        if self.preferences_ui.busy {
+            return;
+        }
+        self.preferences_ui.leave = None;
+        self.preferences_ui.reset_confirmation = false;
         self.confirmation = None;
         self.storage_confirm = None;
         self.folders.update(cx, |panel, cx| panel.cancel_action(cx));
@@ -735,7 +825,11 @@ impl StudyApp {
     }
 
     fn accept_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.confirmation.is_some() {
+        if self.preferences_ui.leave.is_some() {
+            self.save_preferences(cx);
+        } else if self.preferences_ui.reset_confirmation {
+            // Reset is deliberately activated by its explicit dialog button.
+        } else if self.confirmation.is_some() {
             self.confirm_note_action(window, cx);
         } else if self.storage_confirm.is_some() {
             self.confirm_storage_copy(cx);
@@ -743,6 +837,23 @@ impl StudyApp {
             self.folders
                 .update(cx, |panel, cx| panel.submit_action(window, cx));
         }
+    }
+
+    fn navigation_toggle(&self, cx: &mut Context<Self>) -> Button {
+        Button::new("toggle-navigation")
+            .disabled(
+                self.storage_busy || self.preferences_ui.busy || self.preferences_ui.replacing,
+            )
+            .small()
+            .ghost()
+            .icon(IconName::PanelLeft)
+            .accessibility_label("展开或收起主导航")
+            .tooltip(if self.layout.navigation_visible {
+                "收起主导航"
+            } else {
+                "展开主导航"
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_navigation(cx)))
     }
 
     fn navigation(&self, width: Pixels, cx: &mut Context<Self>) -> impl IntoElement {
@@ -768,12 +879,16 @@ impl StudyApp {
                     .gap_1()
                     .py_5()
                     .child(
-                        div()
-                            .text_lg()
-                            .truncate()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(GREEN))
-                            .child("WW-StudyApp"),
+                        row().gap_1().child(self.navigation_toggle(cx)).child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .truncate()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(GREEN))
+                                .child("WW-StudyApp"),
+                        ),
                     )
                     .child(muted("本地资料库")),
             )
@@ -789,9 +904,8 @@ impl StudyApp {
                             .selected(self.page == page)
                             .w_full()
                             .justify_start()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.page = page;
-                                cx.notify();
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.navigate(page, window, cx);
                             }))
                     }),
             )
@@ -848,7 +962,9 @@ impl Render for StudyApp {
             empty("正在打开本地资料库", "所有学习内容保存在你选择的目录").into_any_element()
         };
         let notice = self.floating_notice_view(cx);
-        let modal_content = if self.confirmation.is_some() {
+        let modal_content = if let Some(settings) = self.settings_modal(cx) {
+            Some(settings)
+        } else if self.confirmation.is_some() {
             Some(self.confirmation_view(cx).into_any_element())
         } else if self.storage_confirm.is_some() {
             self.storage_confirmation_view(cx)
@@ -890,15 +1006,9 @@ impl Render for StudyApp {
                 }
                 cx.notify();
             }))
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.modifiers.control
-                    && event.keystroke.key.eq_ignore_ascii_case("s")
-                    && this.page == Page::Notes
-                    && this.note_editor.is_some()
-                {
-                    if !this.has_modal(cx) {
-                        this.save_note(window, cx);
-                    }
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.is_layout_resizing() && event.keystroke.key == "escape" {
+                    this.cancel_resize(cx);
                     cx.stop_propagation();
                 }
             }))
@@ -933,20 +1043,9 @@ impl Render for StudyApp {
                             .px_4()
                             .border_b_1()
                             .border_color(rgb(BORDER))
-                            .child(
-                                Button::new("toggle-navigation")
-                                    .disabled(self.storage_busy)
-                                    .small()
-                                    .ghost()
-                                    .label(if self.layout.navigation_visible {
-                                        "收起导航"
-                                    } else {
-                                        "显示导航"
-                                    })
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.toggle_navigation(cx)),
-                                    ),
-                            )
+                            .when(!self.layout.navigation_visible, |view| {
+                                view.child(self.navigation_toggle(cx))
+                            })
                             .child(
                                 column()
                                     .gap_1()
@@ -957,9 +1056,6 @@ impl Render for StudyApp {
                                             .text_2xl()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .truncate()
-                                            .when(self.notice.is_some(), |heading| {
-                                                heading.opacity(0.)
-                                            })
                                             .child(title),
                                     )
                                     .child(muted(
@@ -974,9 +1070,9 @@ impl Render for StudyApp {
                                     .icon(IconName::Plus)
                                     .primary()
                                     .label("导入笔记")
-                                    .on_click(
-                                        cx.listener(|this, _, _, _| this.picker("import", None)),
-                                    ),
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.settings_picker("import", None, cx)
+                                    })),
                             ),
                     )
                     .child(
@@ -1013,9 +1109,13 @@ impl Render for StudyApp {
                         .occlude()
                         .absolute()
                         .top(px(8.))
-                        .left(layout.navigation + px(118.))
-                        .w(px(440.)
-                            .min(window.viewport_size().width - layout.navigation - px(360.)))
+                        .left(
+                            (window.viewport_size().width
+                                - px(440.)
+                                    .min((window.viewport_size().width - px(32.)).max(px(0.))))
+                                / 2.,
+                        )
+                        .w(px(440.).min((window.viewport_size().width - px(32.)).max(px(0.))))
                         .child(notice),
                 )
             })

@@ -50,7 +50,7 @@ fn reparse(metadata: &std::fs::Metadata) -> bool {
 
 /// Windows handles deny directory renames while traversing, and explicitly open
 /// the reparse point itself. No inspected/copied file is opened through a link.
-fn plain_handle(path: &Path, directory: bool, exclusive_read: bool) -> Result<File> {
+pub(crate) fn plain_handle(path: &Path, directory: bool, exclusive_read: bool) -> Result<File> {
     let before = std::fs::symlink_metadata(path)?;
     ensure!(
         !reparse(&before),
@@ -102,7 +102,7 @@ fn plain_handle(path: &Path, directory: bool, exclusive_read: bool) -> Result<Fi
     Ok(file)
 }
 
-fn guard_directories(path: &Path, create: bool) -> Result<Vec<File>> {
+pub(crate) fn guard_directories(path: &Path, create: bool) -> Result<Vec<File>> {
     ensure!(path.is_absolute(), "需要绝对目录路径");
     ensure!(
         !path.components().any(|c| matches!(c, Component::ParentDir)),
@@ -447,6 +447,48 @@ mod tests {
             )
             .unwrap();
         engine.snapshot().notes.last().unwrap().clone()
+    }
+
+    #[test]
+    fn migration_copies_categorized_preferences_and_counts_them_as_auxiliary_data() {
+        let (root, mut engine) = library();
+        let database = root.join("studyapp.sqlite3");
+        let (mut store, mut runtime) =
+            crate::preferences::PreferencesStore::open(&database, &mut engine).unwrap();
+        let before = store.snapshot();
+        let mut settings = before.settings.clone();
+        settings.show_file_paths = true;
+        store
+            .save(
+                crate::preferences::SavePreferences {
+                    expected_revision: before.revision,
+                    settings,
+                    shortcuts: before.shortcuts,
+                    sync: before.sync,
+                    password: None,
+                },
+                &mut engine,
+                &mut runtime,
+            )
+            .unwrap();
+        let manifest = std::fs::read(root.join("settings/manifest.json")).unwrap();
+        let report = inspect(&engine.snapshot()).unwrap();
+        assert!(report.auxiliary_bytes > manifest.len() as u64);
+        let destination = tempfile::tempdir().unwrap().keep().join("migrated");
+        let migrated_database = prepare_migration(&mut engine, &destination, 1001).unwrap();
+        let mut migrated = Engine::open(&migrated_database, 1002).unwrap();
+        let (copied, _) =
+            crate::preferences::PreferencesStore::open(&migrated_database, &mut migrated).unwrap();
+        assert_eq!(copied.snapshot().revision, store.snapshot().revision);
+        assert!(migrated.snapshot().settings.show_file_paths);
+        assert_eq!(
+            std::fs::read(destination.join("settings/manifest.json")).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            std::fs::read(root.join("settings/manifest.json")).unwrap(),
+            manifest
+        );
     }
 
     #[test]

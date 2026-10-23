@@ -19,6 +19,8 @@ pub struct NotificationCenter {
     epoch: Instant,
     timer: Option<Task<()>>,
     occlusions: Vec<Bounds<Pixels>>,
+    #[cfg(feature = "ui-test")]
+    test_time: Option<Duration>,
 }
 
 impl EventEmitter<NotificationOcclusions> for NotificationCenter {}
@@ -30,17 +32,68 @@ impl NotificationCenter {
             epoch: Instant::now(),
             timer: None,
             occlusions: Vec::new(),
+            #[cfg(feature = "ui-test")]
+            test_time: None,
         }
     }
 
+    fn now(&self) -> Duration {
+        #[cfg(feature = "ui-test")]
+        if let Some(now) = self.test_time {
+            return now;
+        }
+        self.epoch.elapsed()
+    }
+
+    #[cfg(feature = "ui-test")]
+    pub fn freeze_time(&mut self) {
+        assert!(
+            self.test_time.is_none(),
+            "notification test clock already frozen"
+        );
+        self.test_time = Some(self.now());
+    }
+
+    #[cfg(feature = "ui-test")]
+    fn advance_clock(&mut self, delta: Duration) -> Duration {
+        let now = self
+            .test_time
+            .as_mut()
+            .expect("notification test clock is not frozen");
+        *now = now
+            .checked_add(delta)
+            .expect("notification test clock overflow");
+        *now
+    }
+
+    #[cfg(feature = "ui-test")]
+    pub fn advance_time(&mut self, delta: Duration, cx: &mut Context<Self>) {
+        let now = self.advance_clock(delta);
+        self.queue.tick(now);
+        cx.notify();
+    }
+
+    #[cfg(feature = "ui-test")]
+    pub fn resume_time(&mut self) {
+        let now = self
+            .test_time
+            .take()
+            .expect("notification test clock is not frozen");
+        // Preserve the queue's logical timeline rather than counting wall time
+        // spent capturing screenshots or delivering native input while frozen.
+        self.epoch = Instant::now()
+            .checked_sub(now)
+            .expect("notification test clock is out of range");
+    }
+
     pub fn push(&mut self, message: Result<String, String>, cx: &mut Context<Self>) {
-        self.queue.push(message, self.epoch.elapsed());
+        self.queue.push(message, self.now());
         if self.timer.is_none() {
             self.timer = Some(cx.spawn(async move |owner, cx| {
                 loop {
                     let delay = owner
                         .update(cx, |this, _| {
-                            if this.queue.animating(this.epoch.elapsed()) {
+                            if this.queue.animating(this.now()) {
                                 16
                             } else {
                                 100
@@ -52,7 +105,7 @@ impl NotificationCenter {
                         .await;
                     let keep = owner
                         .update(cx, |this, cx| {
-                            if this.queue.tick(this.epoch.elapsed()) {
+                            if this.queue.tick(this.now()) {
                                 cx.notify();
                             }
                             if this.queue.is_empty() {
@@ -87,14 +140,45 @@ impl NotificationCenter {
     pub fn test_state(&self) -> Vec<(u64, f32)> {
         self.queue
             .visible()
-            .map(|entry| (entry.id, entry.opacity(self.epoch.elapsed())))
+            .map(|entry| (entry.id, entry.opacity(self.now())))
             .collect()
+    }
+
+    #[cfg(feature = "ui-test")]
+    pub fn test_is_closing(&self, id: u64) -> bool {
+        self.queue
+            .visible()
+            .any(|entry| entry.id == id && entry.is_closing())
+    }
+}
+
+#[cfg(all(test, feature = "ui-test"))]
+mod tests {
+    use super::*;
+
+    #[::core::prelude::v1::test]
+    fn controlled_time_ignores_wall_delay_and_resumes_on_the_same_logical_timeline() {
+        let mut center = NotificationCenter::new();
+        center.freeze_time();
+        let frozen = center.now();
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(center.now(), frozen);
+        let advanced = center.advance_clock(Duration::from_millis(70));
+        assert_eq!(advanced, frozen + Duration::from_millis(70));
+        assert_eq!(center.now(), advanced);
+        let before_resume = Instant::now();
+        center.resume_time();
+        let after_resume = Instant::now();
+        assert!(center.test_time.is_none());
+        assert!(before_resume.saturating_duration_since(center.epoch) <= advanced);
+        assert!(after_resume.duration_since(center.epoch) >= advanced);
+        assert!(center.now() >= advanced);
     }
 }
 
 impl Render for NotificationCenter {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let now = self.epoch.elapsed();
+        let now = self.now();
         let palette = crate::theme::palette();
         let available = (window.viewport_size().width - px(32.)).max(px(0.));
         let font_size = px((palette.font_size as f32 - 1.).max(12.));
@@ -208,12 +292,12 @@ impl Render for NotificationCenter {
                         .accessibility_label("关闭通知")
                         .tooltip("关闭通知")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.queue.dismiss(id, this.epoch.elapsed());
+                            this.queue.dismiss(id, this.now());
                             cx.notify();
                         })),
                     )
                     .on_hover(cx.listener(move |this, hovered, _, cx| {
-                        this.queue.hover(id, *hovered, this.epoch.elapsed());
+                        this.queue.hover(id, *hovered, this.now());
                         cx.notify();
                     }))
                     .child(

@@ -350,7 +350,20 @@ pub async fn exercise(
             crate::smoke_library::editor_action(window, view, false, cx)
         })
         .unwrap();
-    settled(window, view, cx).await;
+    crate::smoke_library::until(
+        window,
+        view,
+        "kept draft persisted and reader restored",
+        |app, _| {
+            app.recoverable_draft.is_some()
+                && app.note_editor.is_none()
+                && !app.note_saving
+                && app.draft_persist.is_none()
+                && app.note_intent.is_none()
+        },
+        cx,
+    )
+    .await;
     window
         .update(cx, |_, window, cx| {
             assert!(view.read(cx).recoverable_draft.is_some());
@@ -388,7 +401,20 @@ pub async fn exercise(
                     crate::smoke_library::editor_action(window, view, false, cx)
                 })
                 .unwrap();
-            settled(window, view, cx).await;
+            crate::smoke_library::until(
+                window,
+                view,
+                "recovery-test draft persisted before discard",
+                |app, _| {
+                    app.recoverable_draft.is_some()
+                        && app.note_editor.is_none()
+                        && !app.note_saving
+                        && app.draft_persist.is_none()
+                        && app.note_intent.is_none()
+                },
+                cx,
+            )
+            .await;
         }
         window
             .update(cx, |_, window, cx| {

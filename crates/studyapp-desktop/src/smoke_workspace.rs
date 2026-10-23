@@ -453,8 +453,16 @@ async fn exercise_notifications(
         .update(cx, |_, window, cx| {
             view.update(cx, |app, cx| {
                 app.clear_notices(cx);
+                app.notifications
+                    .update(cx, |center, _| center.freeze_time());
                 app.push_notice(Ok("已保存".into()), cx);
             });
+            view.read(cx)
+                .notifications
+                .clone()
+                .update(cx, |center, cx| {
+                    center.advance_time(Duration::from_millis(240), cx)
+                });
             window.render_frame(cx);
             let id = view.read(cx).notifications.read(cx).test_state()[0].0;
             window
@@ -478,9 +486,19 @@ async fn exercise_notifications(
             assert_eq!(view.read(cx).notifications.read(cx).visible_count(), 2);
         })
         .unwrap();
-    cx.background_executor()
-        .timer(Duration::from_millis(240))
-        .await;
+    window
+        .update(cx, |_, _, cx| {
+            view.read(cx)
+                .notifications
+                .clone()
+                .update(cx, |center, cx| {
+                    center.advance_time(Duration::from_millis(240), cx)
+                });
+        })
+        .unwrap();
+    // Allow native child region/compositor delivery while logical animation
+    // time remains frozen at the fully entered state.
+    native_tick(cx).await;
     let (ids, body, dismiss, covered) = window
         .update(cx, |_, window, cx| {
             window.render_frame(cx);
@@ -602,14 +620,28 @@ async fn exercise_notifications(
     .await;
     native_pointer(&native, dismiss, Some(true));
     native_pointer(&native, dismiss, Some(false));
-    cx.background_executor()
-        .timer(Duration::from_millis(70))
-        .await;
+    until(
+        window,
+        view,
+        "real native dismiss starts notification fade",
+        |app, cx| app.notifications.read(cx).test_is_closing(ids[0]),
+        cx,
+    )
+    .await;
     window
         .update(cx, |_, window, cx| {
+            view.read(cx)
+                .notifications
+                .clone()
+                .update(cx, |center, cx| {
+                    center.advance_time(Duration::from_millis(70), cx)
+                });
             window.render_frame(cx);
             let state = view.read(cx).notifications.read(cx).test_state();
-            let closing = state.iter().find(|(id, _)| *id == ids[0]).unwrap();
+            let closing = state
+                .iter()
+                .find(|(id, _)| *id == ids[0])
+                .expect("dismissed notification must remain during the controlled fade phase");
             assert!(closing.1 > 0. && closing.1 < 1., "dismiss did not fade");
             let current = editor.read(cx).native_state().unwrap();
             assert_eq!(current["bounds"], native["bounds"]);
@@ -618,17 +650,24 @@ async fn exercise_notifications(
             assert_eq!(current["visibilityUpdates"], native["visibilityUpdates"]);
         })
         .unwrap();
-    cx.background_executor()
-        .timer(Duration::from_millis(220))
-        .await;
     window
         .update(cx, |_, window, cx| {
+            view.read(cx)
+                .notifications
+                .clone()
+                .update(cx, |center, cx| {
+                    center.advance_time(Duration::from_millis(220), cx)
+                });
             window.render_frame(cx);
             let state = view.read(cx).notifications.read(cx).test_state();
             assert_eq!(state.len(), 2);
             assert!(!state.iter().any(|(id, _)| *id == ids[0]));
             assert!(state.iter().any(|(id, _)| *id != ids[1]));
-            view.update(cx, |app, cx| app.clear_notices(cx));
+            view.update(cx, |app, cx| {
+                app.clear_notices(cx);
+                app.notifications
+                    .update(cx, |center, _| center.resume_time());
+            });
         })
         .unwrap();
     native_tick(cx).await;

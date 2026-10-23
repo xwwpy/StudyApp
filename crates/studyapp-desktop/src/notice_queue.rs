@@ -18,6 +18,11 @@ pub struct Notice {
 }
 
 impl Notice {
+    #[cfg(feature = "ui-test")]
+    pub fn is_closing(&self) -> bool {
+        self.closing_at.is_some()
+    }
+
     pub fn opacity(&self, now: Duration) -> f32 {
         if let Some(start) = self.closing_at {
             self.closing_opacity

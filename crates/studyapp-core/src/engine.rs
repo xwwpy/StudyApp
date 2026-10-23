@@ -864,6 +864,60 @@ mod managed_storage_tests {
         settings
     }
 
+    fn interrupt_managed_create_after_publication(engine: &mut Engine) -> PathBuf {
+        let before: String = engine
+            .conn
+            .query_row("SELECT data FROM app_state", [], |row| row.get(0))
+            .unwrap();
+        // Blocking the notes directory is not a portable post-intent failure:
+        // Unix try_exists returns ENOTDIR before prepare can journal the write.
+        // Fail the final state commit instead, after the intent and publication.
+        engine.conn.execute_batch(
+            "CREATE TRIGGER fail_final_state_commit BEFORE UPDATE ON app_state BEGIN SELECT RAISE(ABORT, 'final state commit failure fixture'); END;",
+        ).unwrap();
+        let error = engine
+            .apply(
+                Command::CreateNote {
+                    title: "interrupted draft".into(),
+                    content: "durable draft".into(),
+                },
+                1001,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("final state commit failure fixture"));
+        let pending: i64 = engine
+            .conn
+            .query_row("SELECT count(*) FROM write_intents", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pending, 1);
+        let after: String = engine
+            .conn
+            .query_row("SELECT data FROM app_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "failed commit must preserve the SQLite mirror"
+        );
+        assert!(engine.snapshot().notes.is_empty());
+        assert!(engine.snapshot().versions.is_empty());
+        let raw: String = engine
+            .conn
+            .query_row("SELECT data FROM write_intents", [], |row| row.get(0))
+            .unwrap();
+        let intent: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let note_id = intent["state"]["notes"][0]["id"].as_str().unwrap();
+        let published = crate::managed::path(&engine.path, note_id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&published).unwrap(),
+            "durable draft"
+        );
+        engine
+            .conn
+            .execute_batch("DROP TRIGGER fail_final_state_commit;")
+            .unwrap();
+        published
+    }
+
     #[test]
     fn installed_preferences_allow_immediate_managed_create_without_checkpoint() {
         let dir = tempfile::tempdir().unwrap().keep();
@@ -1029,27 +1083,7 @@ mod managed_storage_tests {
             let database = dir.join("preferences.sqlite");
             let mut engine = Engine::open(&database, 1000).unwrap();
             let settings = install_changed_preferences(&mut engine);
-            // A file where the notes directory should be interrupts publication
-            // after the durable intent, without deleting any fixture files.
-            let blocker = dir.join("notes");
-            std::fs::write(&blocker, "retained blocker").unwrap();
-            assert!(
-                engine
-                    .apply(
-                        Command::CreateNote {
-                            title: "recover".into(),
-                            content: "durable draft".into(),
-                        },
-                        1001
-                    )
-                    .is_err()
-            );
-            let pending: i64 = engine
-                .conn
-                .query_row("SELECT count(*) FROM write_intents", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(pending, 1);
-            std::fs::rename(&blocker, dir.join("retained-blocker")).unwrap();
+            let published = interrupt_managed_create_after_publication(&mut engine);
             if reopen {
                 drop(engine);
                 engine = Engine::open(&database, 1002).unwrap();
@@ -1064,6 +1098,13 @@ mod managed_storage_tests {
                 )
                 .unwrap();
             assert_eq!(engine.snapshot().notes.len(), 2);
+            assert_eq!(engine.snapshot().versions.len(), 2);
+            assert_eq!(std::fs::read_to_string(published).unwrap(), "durable draft");
+            let pending: i64 = engine
+                .conn
+                .query_row("SELECT count(*) FROM write_intents", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(pending, 0);
             assert_eq!(engine.snapshot().settings, settings);
             assert_eq!(
                 storage::load(&engine.conn).unwrap().unwrap().settings,
@@ -1109,28 +1150,7 @@ mod managed_storage_tests {
         let dir = tempfile::tempdir().unwrap().keep();
         let mut engine = Engine::open(&dir.join("preferences.sqlite"), 1000).unwrap();
         let settings = install_changed_preferences(&mut engine);
-        let blocker = dir.join("notes");
-        std::fs::write(&blocker, "retained blocker").unwrap();
-        assert!(
-            engine
-                .apply(
-                    Command::CreateNote {
-                        title: "recover conflict".into(),
-                        content: "durable draft".into(),
-                    },
-                    1001
-                )
-                .is_err()
-        );
-        let raw: String = engine
-            .conn
-            .query_row("SELECT data FROM write_intents", [], |row| row.get(0))
-            .unwrap();
-        let intent: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let note_id = intent["state"]["notes"][0]["id"].as_str().unwrap();
-        std::fs::rename(&blocker, dir.join("retained-blocker")).unwrap();
-        std::fs::create_dir(&blocker).unwrap();
-        let external_path = blocker.join(format!("{note_id}.md"));
+        let external_path = interrupt_managed_create_after_publication(&mut engine);
         std::fs::write(&external_path, "external writer").unwrap();
         let error = engine.apply(Command::SetPaused(true), 1002).unwrap_err();
         assert!(error.to_string().contains("发现外部修改"));
@@ -1140,6 +1160,14 @@ mod managed_storage_tests {
         );
         assert_eq!(engine.snapshot().settings, settings);
         assert_eq!(engine.snapshot().versions.len(), 2);
+        assert_eq!(engine.snapshot().versions[0].content, "durable draft");
+        assert_eq!(engine.snapshot().versions[1].content, "external writer");
+        assert!(engine.snapshot().versions[1].offline);
+        let pending: i64 = engine
+            .conn
+            .query_row("SELECT count(*) FROM write_intents", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pending, 0);
         engine
             .apply(
                 Command::CreateNote {

@@ -9,7 +9,7 @@ license.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 quick-xml = "0.41"
 serde = { version = "1", features = ["derive"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hmac = "0.12"
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }

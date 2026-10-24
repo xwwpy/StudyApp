@@ -46,7 +46,7 @@ pub async fn exercise(
     .await;
     window
         .update(cx, |_, window, cx| {
-            crate::smoke_library::library_add(window, true, cx);
+            crate::smoke_library::library_add(window, true, view, cx);
             window.click("folder-name-input", cx);
             window.input("拖动目标目录", cx);
             window.press("enter", cx);

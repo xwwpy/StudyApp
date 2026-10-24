@@ -33,6 +33,13 @@ try {
     if ($dragTrace.Count -ne 3) { throw 'Expected one actual native modal loop per page' }
     $dragControls = Get-Content -LiteralPath (Join-Path $dragData 'window-controls-result.txt') -Raw
     if ($dragControls -notmatch '^PASS:') { throw 'Custom titlebar control smoke report did not pass' }
+    foreach ($dragPage in @('today', 'notes', 'settings')) {
+        $dragEnvironment = Get-Content -LiteralPath (Join-Path $dragData ('window-drag-' + $dragPage + '-samples.environment.json')) -Raw | ConvertFrom-Json
+        if ($dragEnvironment.effectiveDragFullWindows -ne $true -or $dragEnvironment.restored -ne $true -or $dragEnvironment.restoredDragFullWindows -ne $dragEnvironment.originalDragFullWindows) {
+            throw ('Full-window drag fixture did not enable and restore the desktop option: ' + $dragPage)
+        }
+        Write-Output ($dragPage + ' original DragFullWindows=' + $dragEnvironment.originalDragFullWindows + '; restored=' + $dragEnvironment.restored)
+    }
     Write-Output $dragReport.Trim()
     $dragTrace | Select-Object moves, renderedFrames, elapsedMicros, drawMicros, drawP95Micros, drawMaxMicros
     Write-Output ('Evidence: ' + $dragData)

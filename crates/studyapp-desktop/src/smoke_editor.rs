@@ -105,7 +105,7 @@ pub async fn exercise(
             // previous scenario's feedback before exercising this menu.
             view.update(cx, |app, cx| app.clear_notices(cx));
             window.render_frame(cx);
-            crate::smoke_library::library_add(window, false, cx);
+            crate::smoke_library::library_add(window, false, view, cx);
             assert!(
                 view.read(cx)
                     .note_editor
@@ -402,7 +402,7 @@ pub async fn exercise(
             .update(cx, |_, window, cx| {
                 view.update(cx, |app, cx| app.clear_notices(cx));
                 window.render_frame(cx);
-                crate::smoke_library::library_add(window, false, cx);
+                crate::smoke_library::library_add(window, false, view, cx);
                 assert!(
                     view.read(cx).note_editor.as_ref().is_some_and(|draft| {
                         draft.note_id.is_none() && draft.content.is_empty()
@@ -580,7 +580,7 @@ pub async fn exercise_multiple_drafts(
         window
             .update(cx, |_, window, cx| {
                 window.render_frame(cx);
-                library_add(window, false, cx);
+                library_add(window, false, view, cx);
             })
             .unwrap();
         until(
@@ -870,7 +870,7 @@ async fn exercise_save_view(
         .update(cx, |_, window, cx| {
             view.update(cx, |app, cx| app.clear_notices(cx));
             window.render_frame(cx);
-            library_add(window, false, cx);
+            library_add(window, false, view, cx);
             view.read(cx).note_content.clone()
         })
         .unwrap();

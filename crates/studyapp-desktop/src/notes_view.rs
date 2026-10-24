@@ -968,15 +968,17 @@ impl StudyApp {
                     if this.note_editor.is_none() { this.draft_failed = false; this.draft_loading = true; this.drafts.load(&this.last_library); }
                     cx.notify();
                 })))))
-            .when(self.recoverable_draft.is_some(), |c| c.child(card().id("draft-recovery").child(heading("草稿箱中有未完成的笔记"))
-                .child(muted("所有草稿分别保留在左侧草稿箱；可继续新建，也可恢复最近一份。"))
-                .child(row()
-                    .child(Button::new("recover-note-draft").disabled(self.storage_busy).primary().label("恢复草稿").on_click(cx.listener(|this, _, window, cx| this.recover_note(window, cx))))
-                    .child(Button::new("discard-recovered-draft").disabled(self.storage_busy).ghost().label("删除草稿").on_click(cx.listener(|this, _, _, cx| {
+            .when(self.recoverable_draft.is_some(), |c| c.child(row().id("draft-recovery")
+                .h(px(40.)).flex_shrink_0().min_w_0().px_2().mb_2().rounded_md()
+                .bg(crate::theme::color(0xFFFFFF))
+                .child(Icon::new(IconName::FileText).small().text_color(crate::theme::color(MUTED)))
+                .child(div().flex_1().min_w_0().truncate().child(muted("未保存的笔记已保留在草稿箱")))
+                    .child(Button::new("recover-note-draft").disabled(self.storage_busy || self.note_saving || self.media_busy()).small().ghost().label("恢复最近草稿").on_click(cx.listener(|this, _, window, cx| this.recover_note(window, cx))))
+                    .child(Button::new("discard-recovered-draft").disabled(self.storage_busy || self.note_saving || self.media_busy()).small().ghost().label("删除草稿").on_click(cx.listener(|this, _, _, cx| {
                         this.confirmation = this.recoverable_draft_id().map(crate::editor_lifecycle::NoteConfirmation::DiscardDraft);
                         cx.notify();
                     })))
-                )))
+                ))
             .child(row().items_stretch().gap_0().flex_1().min_h_0().min_w_0().w_full().overflow_hidden()
                 .when(self.layout.folders_visible, |view| view.child(list).child(self.resize_handle(Pane::Notes, cx)))
                 .child(div().id("document-pane").test_support().flex().flex_1().h_full().min_h_0().min_w_0().overflow_hidden().child(detail)))

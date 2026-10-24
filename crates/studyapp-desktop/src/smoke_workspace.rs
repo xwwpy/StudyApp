@@ -1456,7 +1456,7 @@ pub async fn exercise(
     .await;
     window
         .update(cx, |_, window, cx| {
-            crate::smoke_library::library_add(window, true, cx);
+            crate::smoke_library::library_add(window, true, view, cx);
             window.render_frame(cx);
             assert!(view.read(cx).folders.read(cx).modal_open());
             assert!(window.try_find("modal-content-scroll").is_some());
@@ -1484,7 +1484,7 @@ pub async fn exercise(
     const DESTINATION: &str = "工作区布局回归目标";
     window
         .update(cx, |_, window, cx| {
-            crate::smoke_library::library_add(window, true, cx);
+            crate::smoke_library::library_add(window, true, view, cx);
             window.input(DESTINATION, cx); // Initial modal focus must accept typing.
             window.press("enter", cx);
             window.press("enter", cx);

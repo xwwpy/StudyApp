@@ -4,23 +4,134 @@ use crate::app::{Page, StudyApp};
 use gpui_kit::{test::TestWindowExt, *};
 use serde_json::{Value, json};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 use windows::Win32::{
-    Foundation::{HWND, LPARAM, RECT},
+    Foundation::{HWND, LPARAM, POINT, RECT},
     UI::{
         Input::KeyboardAndMouse::{
             INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT,
             SendInput,
         },
         WindowsAndMessaging::{
-            GetForegroundWindow, GetWindowRect, HTCAPTION, HTMAXBUTTON, HTMINBUTTON,
-            HWND_NOTOPMOST, IsIconic, IsZoomed, SW_RESTORE, SWP_NOACTIVATE, SWP_NOSIZE,
-            SWP_NOZORDER, SendMessageW, SetCursorPos, SetWindowPos, ShowWindow, WM_NCHITTEST,
+            GetClipCursor, GetCursorPos, GetForegroundWindow, GetWindowRect, HTCAPTION,
+            HTMAXBUTTON, HTMINBUTTON, HWND_NOTOPMOST, IsIconic, IsZoomed, SPI_GETDRAGFULLWINDOWS,
+            SPI_SETDRAGFULLWINDOWS, SW_RESTORE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetCursorPos, SetWindowPos,
+            ShowWindow, SystemParametersInfoW, WM_NCHITTEST,
         },
     },
 };
+
+fn full_window_drag() -> windows::core::Result<bool> {
+    let mut enabled = windows::core::BOOL::default();
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETDRAGFULLWINDOWS,
+            0,
+            Some((&mut enabled as *mut windows::core::BOOL).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )?;
+    }
+    Ok(enabled.as_bool())
+}
+
+fn set_full_window_drag(enabled: bool) -> windows::core::Result<()> {
+    // Do not persist a user-profile setting or broadcast a settings update.
+    unsafe {
+        SystemParametersInfoW(
+            SPI_SETDRAGFULLWINDOWS,
+            u32::from(enabled),
+            None,
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+}
+
+/// GitHub Windows desktops may show only a drag outline, leaving GetWindowRect
+/// unchanged until release. Keep this fixture prerequisite scoped to CI and
+/// restore it on normal return or a background-thread assertion unwind.
+struct FullWindowDrag {
+    previous: bool,
+    effective: Option<bool>,
+    changed: bool,
+    evidence: PathBuf,
+}
+
+impl FullWindowDrag {
+    fn prepare(evidence: PathBuf) -> Self {
+        let previous = full_window_drag().expect("query full-window dragging");
+        let mut guard = Self {
+            previous,
+            effective: None,
+            changed: false,
+            evidence,
+        };
+        let ci = std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true");
+        std::fs::write(
+            &guard.evidence,
+            serde_json::to_vec_pretty(&json!({
+                "originalDragFullWindows": previous, "ci": ci,
+                "temporarilyEnabled": false, "restored": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        if !previous {
+            assert!(
+                ci,
+                "outline-only dragging cannot measure held-window movement; only the CI fixture may temporarily enable full-window dragging"
+            );
+            guard.changed = true;
+            set_full_window_drag(true)
+                .expect("enable full-window dragging for isolated CI fixture");
+        }
+        let effective = full_window_drag().expect("verify full-window dragging");
+        guard.effective = Some(effective);
+        std::fs::write(
+            &guard.evidence,
+            serde_json::to_vec_pretty(&json!({
+                "originalDragFullWindows": previous, "ci": ci,
+                "temporarilyEnabled": guard.changed, "effectiveDragFullWindows": effective,
+                "restored": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            effective,
+            "native drag benchmark requires actual full-window movement"
+        );
+        guard
+    }
+}
+
+impl Drop for FullWindowDrag {
+    fn drop(&mut self) {
+        let restore = if self.changed {
+            set_full_window_drag(self.previous)
+        } else {
+            Ok(())
+        };
+        let restored = full_window_drag();
+        let evidence = json!({
+            "originalDragFullWindows": self.previous,
+            "effectiveDragFullWindows": self.effective,
+            "temporarilyEnabled": self.changed,
+            "restoreSucceeded": restore.is_ok(),
+            "restoredDragFullWindows": restored.as_ref().ok().copied(),
+            "restored": restore.is_ok() && restored.as_ref().is_ok_and(|value| *value == self.previous),
+            "restoreError": restore.as_ref().err().map(ToString::to_string),
+        });
+        if let Ok(encoded) = serde_json::to_vec_pretty(&evidence) {
+            let _ = std::fs::write(&self.evidence, encoded);
+        }
+        if let Err(error) = restore {
+            eprintln!("failed to restore CI full-window dragging: {error}");
+        }
+    }
+}
 
 async fn settle(cx: &AsyncApp) {
     cx.background_executor()
@@ -117,11 +228,14 @@ pub async fn click_window_control(
     mouse_button(false);
 }
 
-fn native_drag(raw: usize, x: i32, y: i32) -> Value {
+fn native_drag(raw: usize, x: i32, y: i32, evidence: PathBuf) -> Value {
+    let _full_window_drag = FullWindowDrag::prepare(evidence.with_extension("environment.json"));
     let hwnd = HWND(raw as *mut _);
     let mut rect = RECT::default();
+    let mut clip_before = RECT::default();
     unsafe {
         GetWindowRect(hwnd, &mut rect).unwrap();
+        GetClipCursor(&mut clip_before).unwrap();
     }
     assert_eq!(unsafe { GetForegroundWindow() }, hwnd);
     unsafe {
@@ -139,8 +253,13 @@ fn native_drag(raw: usize, x: i32, y: i32) -> Value {
     }
     let release = Release;
     std::thread::sleep(Duration::from_millis(50));
+    let mut clip_held = RECT::default();
+    unsafe {
+        GetClipCursor(&mut clip_held).unwrap();
+    }
     let began = Instant::now();
     let mut positions = Vec::new();
+    let mut cursor_positions = Vec::new();
     for step in 0..80_i32 {
         assert_eq!(
             unsafe { GetForegroundWindow() },
@@ -153,20 +272,19 @@ fn native_drag(raw: usize, x: i32, y: i32) -> Value {
         }
         std::thread::sleep(Duration::from_millis(16));
         let mut current = RECT::default();
+        let mut cursor = POINT::default();
         unsafe {
             GetWindowRect(hwnd, &mut current).unwrap();
+            GetCursorPos(&mut cursor).unwrap();
         }
         positions.push((began.elapsed().as_micros(), current.left, current.top));
+        cursor_positions.push((x + offset, y + offset / 4, cursor.x, cursor.y));
     }
     drop(release);
     let changed = positions
         .windows(2)
         .filter(|pair| pair[0].1 != pair[1].1 || pair[0].2 != pair[1].2)
         .count();
-    assert!(
-        changed >= 30,
-        "actual OS window movement stalled: only {changed} positions"
-    );
     let mut change_gaps = Vec::new();
     let mut last_change = positions[0].0;
     for pair in positions.windows(2) {
@@ -176,11 +294,24 @@ fn native_drag(raw: usize, x: i32, y: i32) -> Value {
         }
     }
     change_gaps.sort_unstable();
-    json!({"inputSamples": positions.len(), "changedPositions": changed,
-        "motionP95GapMicros": change_gaps[(change_gaps.len() - 1) * 95 / 100],
+    let report = json!({"inputSamples": positions.len(), "changedPositions": changed,
+        "motionP95GapMicros": change_gaps.get(change_gaps.len().saturating_sub(1) * 95 / 100),
         "motionMaxGapMicros": change_gaps.last(),
         "elapsedMicros": began.elapsed().as_micros(), "positions": positions,
-        "original": [rect.left, rect.top]})
+        "original": [rect.left, rect.top, rect.right, rect.bottom],
+        "captionPoint": [x, y],
+        "cursorClipBefore": [clip_before.left, clip_before.top, clip_before.right, clip_before.bottom],
+        "cursorClipHeld": [clip_held.left, clip_held.top, clip_held.right, clip_held.bottom],
+        "cursorRequestedActual": cursor_positions});
+    // Persist diagnostics before the strict movement assertion, including for
+    // outline/clip/desktop-geometry failures. No file writes occur while held.
+    std::fs::write(&evidence, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    assert!(
+        changed >= 30,
+        "actual OS window movement stalled: only {changed} positions; samples: {}",
+        evidence.display()
+    );
+    report
 }
 
 pub async fn exercise(
@@ -257,9 +388,10 @@ pub async fn exercise(
             .update(cx, |_, _, cx| editor.read(cx).native_state().unwrap())
             .unwrap();
         let (_, x, y) = control_point(window, view, "window-title-drag", cx);
+        let evidence = database.with_file_name(format!("window-drag-{name}-samples.json"));
         let mut result = cx
             .background_executor()
-            .spawn(async move { native_drag(raw, x, y) })
+            .spawn(async move { native_drag(raw, x, y, evidence) })
             .await;
         settle(cx).await;
         let after = window

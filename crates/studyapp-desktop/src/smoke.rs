@@ -238,8 +238,11 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
             window.update(cx, |_, window, cx| {
                 let snapshot = view.read(cx).snapshot.as_ref().unwrap();
                 assert_eq!(snapshot.versions.iter().filter(|v| v.note_id == managed_id).count(), 2);
+                view.update(cx, |app, cx| app.clear_notices(cx));
                 window.click(("nav", 4_usize), cx);
                 window.click("settings-section-sync", cx);
+                assert!(view.read(cx).preferences_ui.section == crate::settings_ui::SettingsSection::Sync,
+                    "Sync category must be selected before using its controls");
                 // Scroll outside nested lists to expose the sync card.
                 #[cfg(windows)]
                 crate::smoke_library::reveal_scrolled(window, "save-sync-settings".into(), "page-scroll", cx);

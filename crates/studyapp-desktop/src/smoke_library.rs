@@ -33,7 +33,16 @@ pub(crate) fn resize(window: &mut Window, requested: Size<Pixels>) {
 /// Exercise the compact library dropdown and its keyboard navigation. PopupMenu
 /// items deliberately have no app-owned button IDs; the chosen item is asserted
 /// by each caller's resulting application state.
-pub(crate) fn library_add(window: &mut Window, folder: bool, cx: &mut App) {
+pub(crate) fn library_add(
+    window: &mut Window,
+    folder: bool,
+    view: &Entity<StudyApp>,
+    cx: &mut App,
+) {
+    // Previous scenario results can overlap + on a narrow window. Notification
+    // geometry, dismissal and queue behavior have their own native coverage.
+    view.update(cx, |app, cx| app.clear_notices(cx));
+    window.render_frame(cx);
     window.click("library-add-menu", cx);
     window.press("down", cx);
     if folder {
@@ -813,7 +822,7 @@ pub async fn exercise(
                 .id
                 .clone();
             window.click(SharedString::from(format!("folder-row-{id}")), cx);
-            crate::smoke_library::library_add(window, false, cx);
+            crate::smoke_library::library_add(window, false, view, cx);
             view.update(cx, |app, cx| {
                 assert_eq!(
                     app.note_editor.as_ref().unwrap().folder_id.as_ref(),

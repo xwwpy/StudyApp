@@ -254,7 +254,7 @@ pub async fn exercise(
                 cx.notify();
             });
             window.render_frame(cx);
-            crate::smoke_library::library_add(window, false, cx);
+            crate::smoke_library::library_add(window, false, view, cx);
             view.update(cx, |app, cx| {
                 app.note_title.update(cx, |title, cx| {
                     title.set_value("Windows 剪贴板图片测试", window, cx)

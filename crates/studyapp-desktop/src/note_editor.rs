@@ -16,6 +16,31 @@ use gpui_kit::{
 use studyapp_core::Command;
 
 impl StudyApp {
+    pub(crate) fn refresh_draft_library(&mut self) {
+        self.draft_library
+            .refresh(self.draft_catalog.values().map(|record| {
+                studyapp_desktop::draft_viewmodel::DraftRow {
+                    id: &record.id,
+                    revision: record.revision,
+                    updated_at: record.updated_at,
+                    active: record.active(),
+                    title: &record.draft.title,
+                    content: &record.draft.content,
+                    note_id: record.draft.note_id.as_deref(),
+                    folder_id: record.draft.folder_id.as_deref(),
+                }
+            }));
+    }
+
+    pub(crate) fn refresh_storage_draft_index(&mut self) {
+        self.refresh_draft_library();
+        let next = crate::drafts::protected_note_ids(self.draft_catalog.values());
+        if next != self.storage_active_draft_notes {
+            self.storage_active_draft_notes = next;
+            self.storage_draft_revision = self.storage_draft_revision.wrapping_add(1);
+        }
+    }
+
     pub(crate) fn recoverable_draft_id(&self) -> Option<String> {
         self.draft_catalog
             .values()
@@ -25,6 +50,7 @@ impl StudyApp {
     }
 
     pub fn refresh_recoverable(&mut self) {
+        self.refresh_storage_draft_index();
         self.recoverable_draft = self
             .draft_catalog
             .values()
@@ -47,6 +73,7 @@ impl StudyApp {
                 self.drafts.save_record(&self.last_library, record.clone());
             }
         }
+        self.refresh_draft_library();
     }
 
     pub fn poll_drafts(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -236,6 +263,7 @@ impl StudyApp {
             changed = true;
         }
         if changed {
+            self.refresh_storage_draft_index();
             cx.notify();
         }
         changed
@@ -490,6 +518,7 @@ impl StudyApp {
         );
         record.touch(chrono::Utc::now().timestamp_millis());
         let record = record.clone();
+        self.refresh_storage_draft_index();
         self.persist_record_intent(record, crate::editor_lifecycle::NoteIntent::Commit, cx);
     }
     pub(crate) fn finish_commit_note(&mut self, cx: &mut Context<Self>) {
@@ -549,6 +578,7 @@ impl StudyApp {
             chrono::Utc::now().timestamp_millis(),
         );
         let record = record.clone();
+        self.refresh_storage_draft_index();
         self.persist_record_intent(
             record,
             crate::editor_lifecycle::NoteIntent::Saved(note_id),

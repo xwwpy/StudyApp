@@ -131,6 +131,7 @@ pub struct FolderPanel {
     row_sort: studyapp_core::LibrarySort,
     search_query: Option<String>,
     search_folders: HashSet<String>,
+    visible_cache: Option<VisibleLibrary>,
     rows: Vec<FolderRow>,
     counts: HashMap<String, usize>,
     all_count: usize,
@@ -148,6 +149,15 @@ pub struct FolderPanel {
     tree_scroll: ScrollHandle,
     action_scroll: ScrollHandle,
     destination_scroll: ScrollHandle,
+}
+
+struct VisibleLibrary {
+    query: String,
+    sort: studyapp_core::LibrarySort,
+    detached: bool,
+    collapsed: HashSet<String>,
+    positions: Arc<Vec<usize>>,
+    count: usize,
 }
 
 impl EventEmitter<FolderEvent> for FolderPanel {}
@@ -177,6 +187,7 @@ impl FolderPanel {
             row_sort: Default::default(),
             search_query: None,
             search_folders: HashSet::new(),
+            visible_cache: None,
             rows: Vec::new(),
             counts: HashMap::new(),
             all_count: 0,
@@ -344,12 +355,30 @@ impl FolderPanel {
         }
     }
 
+    #[cfg(test)]
     pub fn accept(&mut self, snapshot: Arc<Snapshot>, window: &mut Window, cx: &mut Context<Self>) {
-        if self.index.needs_update(&snapshot) {
-            self.search_query = None;
-            self.index = Arc::new(studyapp_desktop::library_tree::LibraryIndex::build(
+        let index = if self.index.needs_update(&snapshot) {
+            Arc::new(studyapp_desktop::library_tree::LibraryIndex::build(
                 &snapshot,
-            ));
+            ))
+        } else {
+            self.index.clone()
+        };
+        self.accept_with_index(snapshot, index, window, cx);
+    }
+
+    pub fn accept_with_index(
+        &mut self,
+        snapshot: Arc<Snapshot>,
+        index: Arc<studyapp_desktop::library_tree::LibraryIndex>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index_changed = !Arc::ptr_eq(&self.index, &index);
+        if index_changed {
+            self.search_query = None;
+            self.visible_cache = None;
+            self.index = index;
             self.rows = folder_rows_sorted(&snapshot.folders, self.row_sort, &self.index);
         }
         let had_overlay = self.overlay_open();
@@ -357,27 +386,29 @@ impl FolderPanel {
             .snapshot
             .as_ref()
             .is_some_and(|old| old.data_path != snapshot.data_path);
-        let folders_changed = library_changed
-            || self.snapshot.as_ref().is_none_or(|old| {
-                old.folders.len() != snapshot.folders.len()
-                    || old.folders.iter().zip(&snapshot.folders).any(|(a, b)| {
-                        a.id != b.id || a.name != b.name || a.parent_id != b.parent_id
-                    })
-            });
+        let folders_changed = index_changed
+            && (library_changed
+                || self.snapshot.as_ref().is_none_or(|old| {
+                    old.folders.len() != snapshot.folders.len()
+                        || old.folders.iter().zip(&snapshot.folders).any(|(a, b)| {
+                            a.id != b.id || a.name != b.name || a.parent_id != b.parent_id
+                        })
+                }));
         if folders_changed {
-            self.rows = folder_rows_sorted(&snapshot.folders, self.row_sort, &self.index);
             self.collapsed
                 .retain(|id| snapshot.folders.iter().any(|folder| &folder.id == id));
         }
-        self.counts.clear();
-        self.all_count = 0;
-        self.root_count = 0;
-        for note in snapshot.notes.iter().filter(|note| !note.detached) {
-            self.all_count += 1;
-            if let Some(folder_id) = &note.folder_id {
-                *self.counts.entry(folder_id.clone()).or_default() += 1;
-            } else {
-                self.root_count += 1;
+        if index_changed {
+            self.counts.clear();
+            self.all_count = 0;
+            self.root_count = 0;
+            for note in snapshot.notes.iter().filter(|note| !note.detached) {
+                self.all_count += 1;
+                if let Some(folder_id) = &note.folder_id {
+                    *self.counts.entry(folder_id.clone()).or_default() += 1;
+                } else {
+                    self.root_count += 1;
+                }
             }
         }
         if library_changed {
@@ -415,7 +446,11 @@ impl FolderPanel {
                 .is_some_and(|id| !self.rows.iter().any(|row| row.id == id))
         {
             self.filter = FolderFilter::All;
-            cx.emit(FolderEvent::Filter(self.filter.clone()));
+            // A removed folder is background reconciliation, not a user
+            // navigation request: parking a draft here would close its editor.
+            if library_changed {
+                cx.emit(FolderEvent::Filter(self.filter.clone()));
+            }
         }
         cx.notify();
     }
@@ -1074,22 +1109,48 @@ impl FolderPanel {
         sort: studyapp_core::LibrarySort,
         selected_note: Option<&str>,
         detached: bool,
-    ) -> Vec<usize> {
+    ) -> Arc<Vec<usize>> {
         self.prepare_library(query, sort, selected_note);
         let Some(snapshot) = &self.snapshot else {
-            return Vec::new();
+            return Arc::new(Vec::new());
         };
-        self.index
-            .ordered_notes(sort)
-            .iter()
-            .copied()
-            .filter(|&position| {
-                let note = &snapshot.notes[position];
-                note.detached == detached
-                    && self.index.matches(&note.id, query)
-                    && self.index.note_visible(&note.id, &self.collapsed, query)
-            })
-            .collect()
+        if let Some(cache) = &self.visible_cache
+            && cache.query == query
+            && cache.sort == sort
+            && cache.detached == detached
+            && cache.collapsed == self.collapsed
+        {
+            return cache.positions.clone();
+        }
+        let mut count = 0;
+        let positions = Arc::new(
+            self.index
+                .ordered_notes(sort)
+                .iter()
+                .copied()
+                .filter(|&position| {
+                    let note = &snapshot.notes[position];
+                    if note.detached != detached || !self.index.matches(&note.id, query) {
+                        return false;
+                    }
+                    count += 1;
+                    self.index.note_visible(&note.id, &self.collapsed, query)
+                })
+                .collect(),
+        );
+        self.visible_cache = Some(VisibleLibrary {
+            query: query.to_owned(),
+            sort,
+            detached,
+            collapsed: self.collapsed.clone(),
+            positions: Arc::clone(&positions),
+            count,
+        });
+        positions
+    }
+
+    pub fn matching_note_count(&self) -> usize {
+        self.visible_cache.as_ref().map_or(0, |cache| cache.count)
     }
 
     pub fn library_tree(
@@ -2061,6 +2122,126 @@ mod ui_tests {
             0,
             "Folder reselection would override the clicked note"
         );
+    }
+
+    #[gpui_kit::test]
+    fn deleted_folder_reconciles_without_navigating_away_from_an_open_draft(
+        cx: &mut TestAppContext,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let (host, cx) = cx.add_window_view(|window, cx| TestHost::new("New", window, cx));
+        let panel = cx.read(|cx| host.read(cx).panel.clone());
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.cancel_action(cx);
+                panel.accept(selection_snapshot(), window, cx);
+                panel.set_filter(FolderFilter::Folder("existing".into()), cx);
+            })
+        });
+        cx.run_until_parked();
+        let navigations = Rc::new(RefCell::new(0));
+        let observed = navigations.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&panel, move |_, event: &FolderEvent, _| {
+                if matches!(event, FolderEvent::Filter(_)) {
+                    *observed.borrow_mut() += 1;
+                }
+            })
+            .detach();
+        });
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                let mut snapshot = (*selection_snapshot()).clone();
+                snapshot.folders.retain(|folder| folder.id != "existing");
+                for note in &mut snapshot.notes {
+                    if note.folder_id.as_deref() == Some("existing") {
+                        note.folder_id = None;
+                    }
+                }
+                panel.accept(Arc::new(snapshot), window, cx);
+                assert_eq!(panel.filter(), &FolderFilter::All);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            *navigations.borrow(),
+            0,
+            "Background reconciliation must not park the active draft"
+        );
+        cx.update(|_, cx| panel.update(cx, |panel, cx| panel.set_filter(FolderFilter::Root, cx)));
+        cx.run_until_parked();
+        assert_eq!(
+            *navigations.borrow(),
+            1,
+            "User folder clicks still navigate"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn library_selection_invalidates_for_search_sort_collapse_and_snapshot(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (host, cx) = cx.add_window_view(|window, cx| TestHost::new("New", window, cx));
+        let panel = cx.read(|cx| host.read(cx).panel.clone());
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.accept(selection_snapshot(), window, cx);
+                let initial = panel.visible_notes("", Default::default(), None, false);
+                let count = initial.len();
+                assert_eq!(panel.matching_note_count(), count);
+                let repeated = panel.visible_notes("", Default::default(), None, false);
+                assert!(Arc::ptr_eq(&initial, &repeated));
+                panel.collapsed.insert("other".into());
+                let collapsed = panel.visible_notes("", Default::default(), None, false);
+                assert_eq!(collapsed.len(), count - 1);
+                assert_eq!(
+                    panel.matching_note_count(),
+                    count,
+                    "Badge counts matches in collapsed branches too"
+                );
+                let search = panel.visible_notes("b", Default::default(), None, false);
+                assert!(!Arc::ptr_eq(&collapsed, &search));
+                assert!(
+                    search
+                        .iter()
+                        .any(
+                            |&position| panel.snapshot.as_ref().unwrap().notes[position].id == "b"
+                        ),
+                    "Search reveals collapsed matches"
+                );
+                let sorted =
+                    panel.visible_notes("b", studyapp_core::LibrarySort::Newest, None, false);
+                assert!(!Arc::ptr_eq(&search, &sorted));
+                let mut changed = (*selection_snapshot()).clone();
+                changed
+                    .notes
+                    .iter_mut()
+                    .find(|note| note.id == "b")
+                    .unwrap()
+                    .detached = true;
+                panel.accept(Arc::new(changed), window, cx);
+                let attached =
+                    panel.visible_notes("b", studyapp_core::LibrarySort::Newest, None, false);
+                assert!(
+                    !attached
+                        .iter()
+                        .any(
+                            |&position| panel.snapshot.as_ref().unwrap().notes[position].id == "b"
+                        )
+                );
+                let detached =
+                    panel.visible_notes("b", studyapp_core::LibrarySort::Newest, None, true);
+                assert!(
+                    detached
+                        .iter()
+                        .any(
+                            |&position| panel.snapshot.as_ref().unwrap().notes[position].id == "b"
+                        )
+                );
+            })
+        });
     }
 
     #[gpui_kit::test]

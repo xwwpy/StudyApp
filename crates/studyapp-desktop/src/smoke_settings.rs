@@ -26,6 +26,130 @@ fn settings_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     result
 }
 
+fn exercise_color_controls(
+    window: AnyWindowHandle,
+    view: &Entity<StudyApp>,
+    database: &Path,
+    cx: &mut AsyncApp,
+) {
+    let files_root = database.parent().unwrap().join("settings");
+    let files = settings_files(&files_root);
+    let (accent, original_accent, body, original_body, touched, control) = window
+        .update(cx, |_, window, cx| {
+            let app = view.read(cx);
+            let accent = app.preferences_ui.appearance_fields["accent"].clone();
+            let original_accent = accent.read(cx).value();
+            let body = app.preferences_ui.appearance_fields["md-body"].clone();
+            let original_body = body.read(cx).value();
+            let touched = app.preferences_ui.appearance_touched;
+            let control = app.preferences_ui.appearance_colors["accent"].clone();
+            assert!(
+                control.read(cx).picker_id().is_none(),
+                "closed color fields allocated their popup state"
+            );
+            click_scrolled(
+                window,
+                "color-open-accent".into(),
+                "settings-section-scroll",
+                cx,
+            );
+            (
+                accent,
+                original_accent,
+                body,
+                original_body,
+                touched,
+                control,
+            )
+        })
+        .unwrap();
+    let picker = window
+        .update(cx, |_, window, cx| {
+            assert!(control.read(cx).popup_open());
+            let picker = control
+                .read(cx)
+                .picker_id()
+                .expect("open picker was not allocated");
+            window.render_frame(cx);
+            window
+                .render_to_image()
+                .unwrap()
+                .save(database.with_file_name("settings-color-picker.png"))
+                .unwrap();
+            window.click("color-swatch-accent-3", cx);
+            picker
+        })
+        .unwrap();
+    // Selection emits a component event. End each update before checking its
+    // subscriber, exactly as real native event delivery does.
+    window
+        .update(cx, |_, window, cx| {
+            assert_eq!(accent.read(cx).value().as_str(), "#EF4444");
+            assert!(!control.read(cx).popup_open());
+            assert!(view.read(cx).preferences_ui.appearance_touched);
+            window.click("color-open-accent", cx);
+            assert_eq!(
+                control.read(cx).picker_id(),
+                Some(picker),
+                "reopening recreated the picker"
+            );
+            window.click("color-close-accent", cx);
+            window.click("settings-section-learning", cx);
+        })
+        .unwrap();
+    window
+        .update(cx, |_, window, cx| {
+            assert!(!control.read(cx).popup_open());
+            assert!(view.read(cx).preferences_ui.section == SettingsSection::Learning);
+            assert_eq!(
+                accent.read(cx).value().as_str(),
+                "#EF4444",
+                "category switch discarded color draft"
+            );
+            window.click("settings-section-appearance", cx);
+            assert!(view.read(cx).preferences_ui.section == SettingsSection::Appearance);
+            assert_eq!(control.read(cx).picker_id(), Some(picker));
+            click_scrolled(
+                window,
+                "color-open-md-body".into(),
+                "settings-section-scroll",
+                cx,
+            );
+        })
+        .unwrap();
+    window
+        .update(cx, |_, window, cx| {
+            window.click("color-swatch-md-body-0", cx)
+        })
+        .unwrap();
+    window
+        .update(cx, |_, window, cx| {
+            assert_eq!(body.read(cx).value().as_str(), "#233631");
+            window.click("color-auto-md-body", cx);
+        })
+        .unwrap();
+    window
+        .update(cx, |_, window, cx| {
+            assert!(
+                body.read(cx).value().is_empty(),
+                "automatic color did not restore inherited configuration"
+            );
+            assert_eq!(
+                settings_files(&files_root),
+                files,
+                "picker persisted settings before Save"
+            );
+            accent.update(cx, |input, cx| input.set_value(original_accent, window, cx));
+            body.update(cx, |input, cx| input.set_value(original_body, window, cx));
+            view.update(cx, |app, cx| {
+                app.preferences_ui.appearance_touched = touched;
+                cx.notify();
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+}
+
 fn timing_summary(mut samples: Vec<u64>) -> serde_json::Value {
     samples.sort_unstable();
     let count = samples.len();
@@ -309,6 +433,7 @@ pub async fn exercise(
 ) {
     settled(window, view, cx).await;
     measure_appearance_cache(window, view, database, cx).await;
+    exercise_color_controls(window, view, database, cx);
     window
         .update(cx, |_, window, cx| {
             crate::smoke_library::resize(window, size(px(1280.), px(900.)));
@@ -438,6 +563,7 @@ pub async fn exercise(
             }
             let rebuilds = view.read(cx).shortcut_analysis_rebuilds();
             measure_settings(window, view, database, cx);
+            crate::smoke_storage_performance::measure(window, view, database, cx);
             assert_eq!(
                 view.read(cx).shortcut_analysis_rebuilds(),
                 rebuilds,

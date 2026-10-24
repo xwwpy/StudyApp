@@ -30,6 +30,8 @@ mod overlay_regions;
 mod preferences;
 mod resize_overlay;
 mod settings_cache;
+mod settings_color;
+mod settings_color_value;
 mod settings_components;
 mod settings_ui;
 mod shortcuts;
@@ -44,6 +46,8 @@ mod smoke_interactions;
 mod smoke_library;
 #[cfg(all(windows, feature = "ui-test"))]
 mod smoke_settings;
+#[cfg(all(windows, feature = "ui-test"))]
+mod smoke_storage_performance;
 #[cfg(all(windows, feature = "ui-test"))]
 mod smoke_visibility;
 #[cfg(all(windows, feature = "ui-test"))]

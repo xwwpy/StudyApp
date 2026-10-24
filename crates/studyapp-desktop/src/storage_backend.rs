@@ -1,11 +1,17 @@
 //! Library storage inspection and explicit, single-file maintenance.
+#[path = "storage_viewmodel.rs"]
+pub mod viewmodel;
+
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::{Read, Seek, Write},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use studyapp_core::{Command, Engine, Note, Snapshot};
 
@@ -25,9 +31,15 @@ pub struct StorageReport {
     pub image_locations: Vec<String>,
     pub cleanup: Option<CopyCleanupOutcome>,
     pub copies: Vec<ManagedCopy>,
+    pub presentation: Arc<viewmodel::StoragePresentation>,
 }
 
 impl StorageReport {
+    /// Build display data on the worker that produced the immutable report.
+    pub fn prepare_presentation(&mut self) {
+        self.presentation = Arc::new(viewmodel::StoragePresentation::prepare(self));
+    }
+
     /// Logical file lengths, counted once per path. Hard links can share disk blocks.
     pub fn logical_bytes(&self) -> u64 {
         [
@@ -680,6 +692,7 @@ pub fn inspect(snapshot: &Snapshot) -> Result<StorageReport> {
     }
     report.incomplete = !issues.is_empty();
     report.issues = issues;
+    report.prepare_presentation();
     Ok(report)
 }
 
@@ -946,6 +959,14 @@ mod tests {
         assert_eq!(report.copies.len(), 1);
         assert_eq!(report.copies[0].note_id, note.id);
         assert!(report.copies[0].deletable);
+        assert_eq!(report.presentation.copies.len(), 1);
+        assert!(report.presentation.copy_by_id(&note.id).unwrap().deletable);
+        assert!(
+            report
+                .presentation
+                .logical_label
+                .starts_with("已统计逻辑大小 ")
+        );
     }
 
     #[test]
@@ -999,6 +1020,9 @@ mod tests {
         );
         assert!(!report.copies[0].deletable);
         assert_eq!(report.copies[0].state, CopyState::Cleaned);
+        let displayed_copy = report.presentation.copy_by_id(&note.id).unwrap();
+        assert_eq!(displayed_copy.state, CopyState::Cleaned);
+        assert!(!displayed_copy.deletable);
         assert_eq!(report.cleanup, Some(CopyCleanupOutcome::Removed));
         assert_eq!(
             report.copies[0].reason.as_deref(),

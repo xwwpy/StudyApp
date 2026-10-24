@@ -422,15 +422,10 @@ impl StudyApp {
             )
         });
         let notes = visible
-            .into_iter()
-            .filter_map(|position| snapshot.notes.get(position))
-            .collect::<Vec<_>>();
-        let note_count = index
-            .ordered_notes(self.layout.library_sort)
             .iter()
             .filter_map(|&position| snapshot.notes.get(position))
-            .filter(|note| note.detached == self.show_detached && index.matches(&note.id, &query))
-            .count();
+            .collect::<Vec<_>>();
+        let note_count = self.folders.read(cx).matching_note_count();
         let mut note_rows: std::collections::HashMap<Option<String>, Vec<AnyElement>> =
             std::collections::HashMap::new();
         for note in notes {
@@ -601,24 +596,12 @@ impl StudyApp {
                 .or_default()
                 .push(element.into_any_element());
         }
-        let mut drafts = self
-            .draft_catalog
-            .values()
-            .filter(|r| r.active())
-            .collect::<Vec<_>>();
-        drafts.sort_by(|a, b| {
-            b.updated_at
-                .cmp(&a.updated_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        let draft_count = drafts.len();
-        let draft_entries = drafts
-            .into_iter()
-            .filter(|r| {
-                query.is_empty()
-                    || r.draft.title.to_lowercase().contains(&query)
-                    || r.draft.content.to_lowercase().contains(&query)
-            })
+        let draft_count = self.draft_library.active_count();
+        let draft_entries = self
+            .draft_library
+            .ids()
+            .iter()
+            .filter_map(|id| self.draft_catalog.get(id))
             .map(|record| {
                 let id = record.id.clone();
                 let title = if record.draft.title.trim().is_empty() {
@@ -726,20 +709,22 @@ impl StudyApp {
             )
             .child(div().px_2().child(Input::new(&self.search).cleanable(true)))
             .child(tree);
-        let selected = snapshot
-            .notes
-            .iter()
-            .find(|n| Some(&n.id) == self.selected_note.as_ref());
+        let selected = self
+            .selected_note
+            .as_deref()
+            .and_then(|id| self.read_models.note_position(id))
+            .and_then(|position| snapshot.notes.get(position));
         let detail = if self.note_editor.is_some() {
             self.note_editor_view(cx)
         } else if let Some(note) = selected {
             let id = note.id.clone();
             let managed = note.managed && !note.detached;
             let export_version = self.selected_version.clone();
-            let versions: Vec<_> = snapshot
-                .versions
+            let versions: Vec<_> = self
+                .read_models
+                .version_positions(&id)
                 .iter()
-                .filter(|v| v.note_id == id)
+                .map(|&position| &snapshot.versions[position])
                 .collect();
             let version = versions
                 .iter()

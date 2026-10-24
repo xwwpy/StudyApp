@@ -121,6 +121,7 @@ jobs:
             ${{ env.SMOKE_DIR }}/settings-render-timing.json
             ${{ env.SMOKE_DIR }}/*.log
             ${{ env.SETTINGS_DIR }}/settings-*
+            ${{ env.SETTINGS_DIR }}/storage-render-timing.json
             ${{ env.SETTINGS_DIR }}/*.log
             ${{ env.SETTINGS_DIR }}/smoke-input-mode.txt
             ${{ env.DRAG_DIR }}/window-drag-*

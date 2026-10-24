@@ -1,6 +1,32 @@
 // Test-first acceptance cases staged while another agent owns Cargo.
 use super::*;
 
+#[test]
+fn storage_protection_tracks_active_sources_and_pending_save_targets() {
+    let mut first = DraftRecord::new(draft("source"), 1);
+    first.draft.note_id = Some("original".into());
+    first.save_target = Some("copy-in-flight".into());
+    let mut second = first.clone();
+    second.id = uuid::Uuid::new_v4().to_string();
+    let mut retired = DraftRecord::new(draft("retired"), 1);
+    retired.draft.note_id = Some("safe-to-clean".into());
+    retired.retire(DraftStatus::Deleted, 2);
+    assert_eq!(
+        protected_note_ids([&first, &second, &retired]),
+        ["original".to_owned(), "copy-in-flight".to_owned()].into()
+    );
+    first.retire(DraftStatus::Deleted, 3);
+    assert!(protected_note_ids([&first, &second]).contains("original"));
+    second.retire(
+        DraftStatus::Saved {
+            note_id: "original".into(),
+            hash: "saved".into(),
+        },
+        4,
+    );
+    assert!(protected_note_ids([&first, &second, &retired]).is_empty());
+}
+
 fn draft(content: &str) -> NoteDraft {
     NoteDraft {
         note_id: None,

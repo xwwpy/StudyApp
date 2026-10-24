@@ -669,7 +669,7 @@ pub async fn exercise(
             let initial = window.find("storage-copy-list").bounds();
             assert!(initial.origin.y > px(80.));
             assert!(initial.bottom() < window.viewport_size().height);
-            assert!(view.read(cx).storage_copy_scroll.max_offset().y > px(0.));
+            assert!(view.read(cx).storage_ui.scroll.max_offset_for_scrollbar().y > px(0.));
             for delta in [-80., -10000., -80., 10000., 80.] {
                 window.scroll(
                     "storage-copy-list",
@@ -682,7 +682,7 @@ pub async fn exercise(
                     "nested wheel moved Settings"
                 );
             }
-            assert_eq!(view.read(cx).storage_copy_scroll.offset().y, px(0.));
+            assert_eq!(view.read(cx).storage_ui.scroll.scroll_px_offset_for_scrollbar().y, px(0.));
             // Base Scrollbar is a custom Element; its vertical track is at the
             // viewport's right edge (the element itself spans the whole list).
             window.drag(
@@ -691,8 +691,8 @@ pub async fn exercise(
                 cx,
             );
             assert!(
-                view.read(cx).storage_copy_scroll.offset().y
-                    == -view.read(cx).storage_copy_scroll.max_offset().y,
+                view.read(cx).storage_ui.scroll.scroll_px_offset_for_scrollbar().y
+                    == -view.read(cx).storage_ui.scroll.max_offset_for_scrollbar().y,
                 "scrollbar thumb drag must reach the final file"
             );
             window
@@ -706,7 +706,7 @@ pub async fn exercise(
             // position. Neither wheel may leak into the nested file list.
             let page = window.find("settings-section-scroll").bounds();
             let outside = point(page.origin.x + px(5.), page.center().y);
-            let inner_offset = view.read(cx).storage_copy_scroll.offset();
+            let inner_offset = view.read(cx).storage_ui.scroll.scroll_px_offset_for_scrollbar();
             // The outer div does not expose an app-owned ScrollHandle. Measure
             // its actual range with one stable child's position at both ends,
             // then use the bottom as a baseline that permits an upward move.
@@ -717,8 +717,8 @@ pub async fn exercise(
             let outer_max = outer_top_anchor - outer_bottom_anchor;
             let original_outer_offset = old_top - outer_top_anchor;
             assert!(outer_max > px(0.), "outer-scroll fixture needs a nonzero actual range");
-            assert_eq!(view.read(cx).storage_copy_scroll.offset(), inner_offset);
-            eprintln!("outer wheel fixture: original_offset={original_outer_offset:?}; max={outer_max:?}; at_bottom={}; section={page:?}; list_before={old_top:?}; inner_offset={inner_offset:?}; inner_max={:?}", original_outer_offset == -outer_max, view.read(cx).storage_copy_scroll.max_offset());
+            assert_eq!(view.read(cx).storage_ui.scroll.scroll_px_offset_for_scrollbar(), inner_offset);
+            eprintln!("outer wheel fixture: original_offset={original_outer_offset:?}; max={outer_max:?}; at_bottom={}; section={page:?}; list_before={old_top:?}; inner_offset={inner_offset:?}; inner_max={:?}", original_outer_offset == -outer_max, view.read(cx).storage_ui.scroll.max_offset_for_scrollbar());
             window.dispatch_event(
                 ScrollWheelEvent {
                     position: outside,
@@ -735,7 +735,7 @@ pub async fn exercise(
                 raised_top > outer_bottom_anchor,
                 "Settings must scroll up outside the file list"
             );
-            assert_eq!(view.read(cx).storage_copy_scroll.offset(), inner_offset);
+            assert_eq!(view.read(cx).storage_ui.scroll.scroll_px_offset_for_scrollbar(), inner_offset);
             window.dispatch_event(
                 ScrollWheelEvent {
                     position: outside,
@@ -756,10 +756,10 @@ pub async fn exercise(
                 outer_bottom_anchor,
                 "outer wheel roundtrip did not restore the section position"
             );
-            assert_eq!(view.read(cx).storage_copy_scroll.offset(), inner_offset);
+            assert_eq!(view.read(cx).storage_ui.scroll.scroll_px_offset_for_scrollbar(), inner_offset);
             scroll_settings(window, f32::from(old_top - outer_bottom_anchor), cx);
             assert_eq!(window.find("storage-copy-list").bounds().origin.y, old_top, "outer boundary probe did not restore the original offset");
-            assert_eq!(view.read(cx).storage_copy_scroll.offset(), inner_offset);
+            assert_eq!(view.read(cx).storage_ui.scroll.scroll_px_offset_for_scrollbar(), inner_offset);
             window.click("settings-section-appearance", cx);
             click_scrolled(window, "show-file-paths".into(), "page-scroll", cx);
             assert!(

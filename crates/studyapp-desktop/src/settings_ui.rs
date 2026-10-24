@@ -155,6 +155,7 @@ pub struct PreferencesUi {
     shortcut_frame_rows: std::cell::Cell<u64>,
     pub shortcut_search: Option<Entity<InputState>>,
     pub appearance_fields: BTreeMap<&'static str, Entity<InputState>>,
+    pub appearance_colors: BTreeMap<&'static str, Entity<crate::settings_color::ColorSetting>>,
     markdown_preview: InputCache<AppearanceInputKey, MarkdownPreview>,
     appearance_rows: form::VirtualRows<AppearanceViewKey>,
     appearance_focus: Vec<FocusHandle>,
@@ -299,6 +300,9 @@ impl StudyApp {
     }
 
     pub fn select_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        for color in self.preferences_ui.appearance_colors.values() {
+            color.update(cx, |color, cx| color.dismiss(cx));
+        }
         if self.preferences_ui.section != section {
             self.preferences_ui.section = section;
             self.preferences_ui.section_revision =
@@ -391,6 +395,35 @@ impl StudyApp {
                 })
                 .detach();
                 self.preferences_ui.appearance_fields.insert(key, input);
+            }
+            let color_field = ["accent", "background", "surface", "text"].contains(&key)
+                || MARKDOWN_FIELDS
+                    .iter()
+                    .any(|(color_key, _, _, _)| *color_key == key);
+            if color_field {
+                if let Some(color) = self.preferences_ui.appearance_colors.get(key) {
+                    color.update(cx, |color, cx| color.dismiss(cx));
+                } else {
+                    let source = self.preferences_ui.appearance_fields[key].clone();
+                    let color = cx.new(|cx| {
+                        crate::settings_color::ColorSetting::new(
+                            key,
+                            source,
+                            key.starts_with("md-"),
+                            window,
+                            cx,
+                        )
+                    });
+                    cx.subscribe(
+                        &color,
+                        |this, _, _: &crate::settings_color::ColorSettingChanged, cx| {
+                            this.preferences_ui.appearance_touched = true;
+                            cx.notify();
+                        },
+                    )
+                    .detach();
+                    self.preferences_ui.appearance_colors.insert(key, color);
+                }
             }
         }
         self.preferences_ui.appearance_touched = false;
@@ -1444,7 +1477,6 @@ impl StudyApp {
         let preset = &preview.preset;
         let colors = &preview.colors;
         let p = &preset.markdown.layout;
-        let color = |index| gpui_kit::rgb(colors[index]);
         let mut panel = column().gap_3().child(
             row().flex_wrap().children(
                 ["文字与版式", "引用与代码", "表格与列表", "语法高亮"]
@@ -1477,31 +1509,21 @@ impl StudyApp {
             if let Some(input) = self.preferences_ui.appearance_fields.get(key) {
                 let value = input.read(cx).value().trim().to_owned();
                 let parsed = studyapp_core::parse_theme_color(&value);
-                let invalid = !value.is_empty() && parsed != Some(colors[index]);
+                let invalid = parsed.is_some_and(|parsed| parsed != colors[index]);
                 let mut field = column().gap_1().child(
                     row()
                         .child(div().w(px(100.)).text_sm().child(*label))
-                        .child(
-                            div()
-                                .size(px(22.))
-                                .rounded_md()
-                                .border_1()
-                                .border_color(crate::theme::color(BORDER))
-                                .bg(color(index)),
-                        )
-                        .child(div().flex_1().child(form::input(input, busy))),
+                        .child(div().flex_1().min_w_0().child(self.color_control(
+                            key,
+                            colors[index],
+                            busy,
+                            cx,
+                        ))),
                 );
                 if invalid {
                     field = field.child(
-                        muted(format!(
-                            "{label}：{}",
-                            if parsed.is_none() {
-                                "请输入 #RRGGBB，或留空自动适配"
-                            } else {
-                                "与实际背景对比度须达到 4.5:1"
-                            }
-                        ))
-                        .text_color(crate::theme::color(0xBE3434)),
+                        muted(format!("{label}：与实际背景对比度须达到 4.5:1"))
+                            .text_color(crate::theme::color(0xBE3434)),
                     );
                 }
                 panel = panel.child(field);
@@ -1644,6 +1666,20 @@ impl StudyApp {
                         })),
                 ),
         )
+    }
+
+    fn color_control(
+        &self,
+        key: &str,
+        inherited: u32,
+        busy: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(color) = self.preferences_ui.appearance_colors.get(key) else {
+            return div().into_any_element();
+        };
+        color.update(cx, |color, cx| color.configure(inherited, busy, cx));
+        color.clone().into_any_element()
     }
 
     fn appearance_view_key(&self, cx: &App) -> AppearanceViewKey {
@@ -1967,21 +2003,13 @@ impl StudyApp {
                 ("text", "文字颜色"),
             ] {
                 if let Some(input) = self.preferences_ui.appearance_fields.get(key) {
-                    let mut field = row().child(div().w(px(100.)).text_sm().child(label));
-                    if key != "name" {
-                        let color = studyapp_core::parse_theme_color(input.read(cx).value().trim())
-                            .unwrap_or(crate::theme::palette().surface);
-                        field = field.child(
-                            div()
-                                .size(px(22.))
-                                .rounded_md()
-                                .border_1()
-                                .border_color(crate::theme::color(BORDER))
-                                .bg(gpui_kit::rgb(color)),
-                        );
-                    }
-                    custom =
-                        custom.child(field.child(div().flex_1().child(form::input(input, busy))));
+                    let field = row().child(div().w(px(100.)).text_sm().child(label));
+                    let control = if key == "name" {
+                        form::input(input, busy).into_any_element()
+                    } else {
+                        self.color_control(key, crate::theme::palette().surface, busy, cx)
+                    };
+                    custom = custom.child(field.child(div().flex_1().min_w_0().child(control)));
                 }
             }
             return custom;

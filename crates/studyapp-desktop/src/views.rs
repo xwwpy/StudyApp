@@ -14,7 +14,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::FluentBuilder, *};
 use studyapp_core::{Command, Review, SessionStatus, Snapshot};
-use studyapp_desktop::presentation::{calendar_stats, duration, stamp};
+use studyapp_desktop::presentation::{duration, stamp};
 
 fn today_date() -> String {
     Local::now().format("%Y-%m-%d").to_string()
@@ -41,13 +41,8 @@ fn review_tip(review: &Review) -> String {
 impl StudyApp {
     pub fn today(&self, snapshot: &Snapshot, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let now = Utc::now().timestamp();
-        let stats = calendar_stats(snapshot, &Local, Local::now().date_naive(), 1);
-        let learned = stats.first().map_or(0, |s| s.learned_seconds);
-        let due = snapshot
-            .reviews
-            .iter()
-            .filter(|r| r.next_review_at.is_some_and(|t| t <= now))
-            .count();
+        let learned = self.read_models.today_learned_seconds();
+        let due = self.read_models.due_count(now);
         let remaining = snapshot
             .timer
             .target_seconds
@@ -72,10 +67,7 @@ impl StudyApp {
                     ))
                     .child(metric(
                         "我的笔记",
-                        format!(
-                            "{} 份",
-                            snapshot.notes.iter().filter(|n| !n.detached).count()
-                        ),
+                        format!("{} 份", self.read_models.managed_note_count),
                         "导入后自动追踪文件更改",
                     )),
             )
@@ -148,14 +140,11 @@ impl StudyApp {
                 .child(self.editor_view(snapshot, cx))
                 .child(content);
         }
-        let pending: Vec<_> = snapshot
-            .sessions
-            .iter()
-            .filter(|s| s.status == SessionStatus::Pending)
-            .collect();
+        let pending = &self.read_models.pending_sessions;
         if !pending.is_empty() {
             content = content.child(card().child(heading("等待你的回答")).children(
-                pending.iter().map(|s| {
+                pending.iter().map(|&position| {
+                    let s = &snapshot.sessions[position];
                     let id = s.id.clone();
                     row()
                         .child(
@@ -180,7 +169,7 @@ impl StudyApp {
                 }),
             ));
         }
-        if snapshot.notes.iter().all(|n| n.detached) {
+        if self.read_models.managed_note_count == 0 {
             content = content.child(card().child(heading("从一份笔记开始")).child(muted("导入正在学习的 Markdown 文件。文件改动会形成版本历史，并在回顾时提供学习摘要。"))
                 .child(Button::new("first-import").primary().label("选择 Markdown 笔记").on_click(cx.listener(|this, _, _, _| this.picker("import", None)))));
         }
@@ -288,19 +277,18 @@ impl StudyApp {
                         .max_h(px(220.))
                         .overflow_y_scroll()
                         .children(
-                            snapshot
-                                .versions
-                                .iter()
-                                .rev()
-                                .filter(|v| self.chosen_notes.contains(&v.note_id))
-                                .map(|version| {
+                            self.read_models
+                                .selected_version_positions(&self.chosen_notes)
+                                .into_iter()
+                                .map(|position| {
+                                    let version = &snapshot.versions[position];
                                     let id = version.id.clone();
                                     let preview_id = id.clone();
                                     let note_id = version.note_id.clone();
-                                    let title = snapshot
-                                        .notes
-                                        .iter()
-                                        .find(|n| n.id == version.note_id)
+                                    let title = self
+                                        .read_models
+                                        .note_position(&version.note_id)
+                                        .and_then(|position| snapshot.notes.get(position))
                                         .map_or("笔记", |n| n.title.as_str());
                                     row()
                                         .child(
@@ -452,34 +440,20 @@ impl StudyApp {
                     }),
             ),
         );
-        let mut reviews: Vec<_> = snapshot
-            .reviews
-            .iter()
-            .filter(|r| match self.review_filter {
-                0 => r.next_review_at.is_some_and(|t| t <= now),
-                1 => snapshot
-                    .review_events
-                    .iter()
-                    .any(|e| e.review_id == r.id && day_of(e.completed_at) == today),
-                _ => true,
-            })
-            .collect();
-        reviews.sort_by_key(|r| r.next_review_at.unwrap_or(i64::MAX));
+        let reviews = self.read_models.review_positions(self.review_filter, now);
         if reviews.is_empty() {
             content = content.child(empty(
                 "当前没有复习任务",
                 "学习确认后会自动安排复习。到期后勾选完成，下一次时间随之更新。",
             ));
         }
-        for review in reviews {
+        for &position in reviews {
+            let review = &snapshot.reviews[position];
             let id = review.id.clone();
             let stage = review.stage;
             let tip = review_tip(review);
             let due = review.next_review_at.is_some_and(|t| t <= now);
-            let done_today = snapshot
-                .review_events
-                .iter()
-                .any(|e| e.review_id == id && day_of(e.completed_at) == today);
+            let done_today = self.read_models.review_completed_today(&id);
             let complete = review.next_review_at.is_none();
             let mut item = card()
                 .id(SharedString::from(format!("review-card-{id}")))
@@ -578,18 +552,9 @@ impl StudyApp {
     }
 
     pub fn statistics(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
-        let days = calendar_stats(snapshot, &Local, Local::now().date_naive(), self.stats_days);
-        let total: u64 = snapshot
-            .sessions
-            .iter()
-            .filter(|s| s.status == SessionStatus::Learned)
-            .map(|s| s.active_seconds)
-            .sum();
-        let learned = snapshot
-            .sessions
-            .iter()
-            .filter(|s| s.status == SessionStatus::Learned)
-            .count();
+        let days = self.read_models.recent_days(self.stats_days);
+        let total = self.read_models.learned_seconds;
+        let learned = self.read_models.learned_count;
         let max = days
             .iter()
             .map(|d| d.learned_seconds)
@@ -684,7 +649,7 @@ impl StudyApp {
                             })),
                     ),
             );
-        let heat = calendar_stats(snapshot, &Local, Local::now().date_naive(), 91);
+        let heat = self.read_models.calendar();
         let maximum = heat
             .iter()
             .map(|d| d.review_count)
@@ -766,18 +731,9 @@ impl StudyApp {
         );
         let record_date = self.record_date.read(cx).value();
         let record_date = record_date.trim();
-        let sessions: Vec<_> = snapshot
-            .sessions
-            .iter()
-            .rev()
-            .filter(|s| record_date.is_empty() || day_of(s.ended_at) == record_date)
-            .filter(|s| match self.record_filter {
-                1 => s.status == SessionStatus::Learned,
-                2 => s.status == SessionStatus::Missed,
-                3 => s.status == SessionStatus::Pending,
-                _ => true,
-            })
-            .collect();
+        let sessions = self
+            .read_models
+            .record_positions(record_date, self.record_filter);
         content.child(
             card()
                 .child(
@@ -815,7 +771,7 @@ impl StudyApp {
                     sessions
                         .iter()
                         .take(self.record_limit)
-                        .map(|s| self.session_row(s, cx)),
+                        .map(|&position| self.session_row(&snapshot.sessions[position], cx)),
                 )
                 .when(sessions.len() > self.record_limit, |c| {
                     c.child(Button::new("more-records").label("再显示 50 条").on_click(

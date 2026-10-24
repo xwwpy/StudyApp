@@ -193,6 +193,7 @@ impl StudyApp {
         cx: &mut Context<Self>,
     ) {
         static NEXT_PERSIST: AtomicU64 = AtomicU64::new(1);
+        self.refresh_draft_library();
         let token = NEXT_PERSIST.fetch_add(1, Ordering::Relaxed);
         self.draft_persist = Some(PersistPending {
             token,
@@ -386,9 +387,9 @@ impl StudyApp {
             && self.draft_discard.is_none()
             && self.pending_update.is_none()
             && self.draft_persist.is_none()
-            && let Some((snapshot, replaced)) = self.pending_library.take()
+            && let Some((snapshot, read_models, replaced)) = self.pending_library.take()
         {
-            self.accept_snapshot(snapshot, replaced, window, cx);
+            self.accept_prepared_snapshot(snapshot, read_models, replaced, window, cx);
         }
     }
 
@@ -475,6 +476,7 @@ impl StudyApp {
             original,
         });
         self.draft_catalog.insert(id, deleted.clone());
+        self.refresh_storage_draft_index();
         if self.active_draft_id.as_ref() == Some(&deleted.id) {
             self.draft_dirty_since = None;
             self.note_content
@@ -570,10 +572,17 @@ impl StudyApp {
         show &= !self.external_drop.active();
         if self.note_editor.is_none() {
             let version = self.selected_note.as_ref().and_then(|note_id| {
-                self.snapshot.as_ref()?.versions.iter().rev().find(|v| {
-                    &v.note_id == note_id
-                        && self.selected_version.as_ref().is_none_or(|id| id == &v.id)
-                })
+                let snapshot = self.snapshot.as_ref()?;
+                self.read_models
+                    .version_positions(note_id)
+                    .iter()
+                    .rev()
+                    .map(|&position| &snapshot.versions[position])
+                    .find(|version| {
+                        self.selected_version
+                            .as_ref()
+                            .is_none_or(|id| id == &version.id)
+                    })
             });
             if self.history {
                 self.history_preview
@@ -600,12 +609,13 @@ impl StudyApp {
             && !self.draft_loading
             && !self.draft_failed
             && self.snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot.notes.iter().any(|note| {
-                    Some(&note.id) == self.selected_note.as_ref()
-                        && note.managed
-                        && !note.detached
-                        && !note.missing
-                })
+                self.selected_note
+                    .as_ref()
+                    .and_then(|id| self.read_models.note_position(id))
+                    .is_some_and(|position| {
+                        let note = &snapshot.notes[position];
+                        note.managed && !note.detached && !note.missing
+                    })
             });
         self.note_content.update(cx, |editor, cx| {
             editor.set_can_request_edit(can_edit, cx);

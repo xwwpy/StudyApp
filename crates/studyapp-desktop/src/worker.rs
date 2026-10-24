@@ -46,6 +46,7 @@ pub enum Work {
 
 pub struct Update {
     pub snapshot: Option<Arc<Snapshot>>,
+    pub read_models: Option<Arc<studyapp_desktop::read_models::SnapshotReadModels>>,
     pub notice: Option<Result<String, String>>,
     pub editor_result: bool,
     pub library_replaced: bool,
@@ -160,6 +161,7 @@ impl Worker {
                     Err(error) => {
                         let _ = updates.send(Update {
                             snapshot: None,
+                            read_models: None,
                             notice: Some(Err(format!("无法打开资料库：{error:#}"))),
                             editor_result: false,
                             library_replaced: false,
@@ -176,10 +178,15 @@ impl Worker {
                     }
                 };
             let mut generation = 0_u64;
+            let mut read_model_cache = studyapp_desktop::read_models::ReadModelCache::default();
             let mut image_cloud_busy = false;
             let mut last_sync_attempt = Instant::now();
+            let snapshot = Arc::new(engine.snapshot());
+            let read_models =
+                read_model_cache.refresh(&snapshot, &chrono::Local, chrono::Utc::now().timestamp());
             let _ = updates.send(Update {
-                snapshot: Some(Arc::new(engine.snapshot())),
+                snapshot: Some(snapshot),
+                read_models: Some(read_models),
                 notice: None,
                 editor_result: false,
                 library_replaced: false,
@@ -245,8 +252,15 @@ impl Worker {
                             } else {
                                 None
                             };
+                            let snapshot = Arc::new(engine.snapshot());
+                            let read_models = read_model_cache.refresh(
+                                &snapshot,
+                                &chrono::Local,
+                                chrono::Utc::now().timestamp(),
+                            );
                             let _ = updates.send(Update {
-                                snapshot: Some(Arc::new(engine.snapshot())),
+                                snapshot: Some(snapshot),
+                                read_models: Some(read_models),
                                 notice: Some(Err(error)),
                                 editor_result,
                                 library_replaced: false,
@@ -295,6 +309,7 @@ impl Worker {
                             .map_err(|error| format!("{error:#}"));
                             let _ = updates.send(Update {
                                 snapshot: None,
+                                read_models: None,
                                 notice: None,
                                 editor_result: false,
                                 library_replaced: false,
@@ -673,10 +688,17 @@ impl Worker {
                     }
                     last_checkpoint = Instant::now();
                 }
-                if changed
-                    && updates
+                if changed {
+                    let snapshot = Arc::new(engine.snapshot());
+                    let read_models = read_model_cache.refresh(
+                        &snapshot,
+                        &chrono::Local,
+                        chrono::Utc::now().timestamp(),
+                    );
+                    if updates
                         .send(Update {
-                            snapshot: Some(Arc::new(engine.snapshot())),
+                            snapshot: Some(snapshot),
+                            read_models: Some(read_models),
                             notice,
                             editor_result,
                             library_replaced,
@@ -690,8 +712,9 @@ impl Worker {
                             image_cloud_busy: Some(image_cloud_busy),
                         })
                         .is_err()
-                {
-                    break;
+                    {
+                        break;
+                    }
                 }
             }
             drop(library_lock);

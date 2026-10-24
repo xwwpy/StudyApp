@@ -106,7 +106,7 @@ fn signature(snapshot: &Snapshot) -> u64 {
             &s.version_ids,
             &s.note_ids,
             s.ended_at,
-            format!("{:?}", s.status),
+            std::mem::discriminant(&s.status),
         )
             .hash(&mut h);
     }

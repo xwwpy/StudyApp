@@ -38,6 +38,7 @@ pub struct StudyApp {
     pub drafts: DraftStore,
     pub worker: Worker,
     pub snapshot: Option<Arc<Snapshot>>,
+    pub read_models: Arc<studyapp_desktop::read_models::SnapshotReadModels>,
     pub page: Page,
     pub notice: Option<Result<String, String>>,
     pub search: Entity<InputState>,
@@ -65,6 +66,7 @@ pub struct StudyApp {
     pub note_editor: Option<NoteDraft>,
     pub recoverable_draft: Option<NoteDraft>,
     pub draft_catalog: std::collections::BTreeMap<String, DraftRecord>,
+    pub draft_library: studyapp_desktop::draft_viewmodel::DraftLibraryIndex,
     pub active_draft_id: Option<String>,
     pub draft_durable: std::collections::BTreeMap<String, u64>,
     pub draft_errors: std::collections::BTreeMap<String, String>,
@@ -78,7 +80,11 @@ pub struct StudyApp {
     pub record_date: Entity<InputState>,
     pub note_saving: bool,
     pub note_intent: Option<(u64, crate::editor_lifecycle::NoteIntent)>,
-    pub pending_library: Option<(Arc<Snapshot>, bool)>,
+    pub pending_library: Option<(
+        Arc<Snapshot>,
+        Arc<studyapp_desktop::read_models::SnapshotReadModels>,
+        bool,
+    )>,
     pub draft_persist: Option<crate::editor_lifecycle::PersistPending>,
     pub draft_discard: Option<crate::editor_lifecycle::DiscardPending>,
     pub confirmation: Option<crate::editor_lifecycle::NoteConfirmation>,
@@ -92,7 +98,9 @@ pub struct StudyApp {
     pub storage_report: Option<crate::storage_backend::StorageReport>,
     pub storage_busy: bool,
     pub storage_confirm: Option<String>,
-    pub storage_copy_scroll: ScrollHandle,
+    pub storage_ui: crate::storage_ui::StorageUi,
+    pub storage_active_draft_notes: HashSet<String>,
+    pub storage_draft_revision: u64,
     pub page_scroll: ScrollHandle,
     pub settings_scroll: ScrollHandle,
     pub learning_versions_scroll: ScrollHandle,
@@ -150,10 +158,17 @@ impl StudyApp {
         })
         .detach();
         let search = input("搜索标题、路径与正文", "", window, cx);
-        cx.subscribe(
-            &search,
-            |_, _, _: &gpui_kit::component::input::InputEvent, cx| cx.notify(),
-        )
+        cx.observe(&search, |this, search, cx| {
+            // Observe actual text so programmatic restore/clear also updates
+            // the model; focus and caret notifications do no catalog work.
+            if this
+                .draft_library
+                .set_query(search.read(cx).value().as_ref())
+            {
+                this.refresh_draft_library();
+                cx.notify();
+            }
+        })
         .detach();
         let record_date = input("学习日期 YYYY-MM-DD", "", window, cx);
         cx.subscribe(
@@ -307,7 +322,9 @@ impl StudyApp {
             storage_report: None,
             storage_busy: false,
             storage_confirm: None,
-            storage_copy_scroll: ScrollHandle::new(),
+            storage_ui: Default::default(),
+            storage_active_draft_notes: Default::default(),
+            storage_draft_revision: 0,
             page_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
             learning_versions_scroll: ScrollHandle::new(),
@@ -339,6 +356,7 @@ impl StudyApp {
             note_editor: None,
             recoverable_draft: None,
             draft_catalog: Default::default(),
+            draft_library: Default::default(),
             active_draft_id: None,
             draft_durable: Default::default(),
             draft_errors: Default::default(),
@@ -360,6 +378,7 @@ impl StudyApp {
             close_allowed: false,
             worker,
             snapshot: None,
+            read_models: Arc::new(Default::default()),
             page: Page::Today,
             notice: None,
             search,
@@ -458,13 +477,13 @@ impl StudyApp {
                     self.push_notice(notice, cx);
                 }
             }
-            if let Some(snapshot) = update.snapshot {
+            if let Some((snapshot, read_models)) = update.snapshot.zip(update.read_models) {
                 if (update.library_replaced || self.last_library != snapshot.data_path)
                     && (self.note_editor.is_some()
                         || self.draft_discard.is_some()
                         || self.draft_persist.is_some())
                 {
-                    self.pending_library = Some((snapshot, update.library_replaced));
+                    self.pending_library = Some((snapshot, read_models, update.library_replaced));
                     if !self.draft_failed {
                         self.request_note_action(
                             crate::editor_lifecycle::NoteIntent::SwitchLibrary,
@@ -473,7 +492,13 @@ impl StudyApp {
                         );
                     }
                 } else {
-                    self.accept_snapshot(snapshot, update.library_replaced, window, cx);
+                    self.accept_prepared_snapshot(
+                        snapshot,
+                        read_models,
+                        update.library_replaced,
+                        window,
+                        cx,
+                    );
                 }
             }
             if let Some(preferences) = update.preferences {
@@ -524,9 +549,26 @@ impl StudyApp {
         }
     }
 
+    #[cfg(any(test, feature = "ui-test"))]
     pub fn accept_snapshot(
         &mut self,
         snapshot: Arc<Snapshot>,
+        library_replaced: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let read_models = studyapp_desktop::read_models::ReadModelCache::default().refresh(
+            &snapshot,
+            &Local,
+            Utc::now().timestamp(),
+        );
+        self.accept_prepared_snapshot(snapshot, read_models, library_replaced, window, cx);
+    }
+
+    pub fn accept_prepared_snapshot(
+        &mut self,
+        snapshot: Arc<Snapshot>,
+        read_models: Arc<studyapp_desktop::read_models::SnapshotReadModels>,
         library_replaced: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -544,7 +586,9 @@ impl StudyApp {
             self.show_detached = false;
             self.storage_report = None;
             self.storage_confirm = None;
-            self.storage_copy_scroll = ScrollHandle::new();
+            self.storage_ui = Default::default();
+            self.storage_active_draft_notes.clear();
+            self.storage_draft_revision = self.storage_draft_revision.wrapping_add(1);
             self.page_scroll = ScrollHandle::new();
             self.settings_scroll = ScrollHandle::new();
             self.learning_versions_scroll = ScrollHandle::new();
@@ -555,6 +599,7 @@ impl StudyApp {
             self.recoverable_draft = None;
             self.active_draft_id = None;
             self.draft_catalog.clear();
+            self.refresh_draft_library();
             self.draft_durable.clear();
             self.draft_errors.clear();
             self.draft_close_drain = None;
@@ -680,14 +725,26 @@ impl StudyApp {
                     .is_some_and(|(old, new)| old.folder_id != new.folder_id)
             })
             .cloned();
-        self.folders
-            .update(cx, |panel, cx| panel.accept(snapshot.clone(), window, cx));
+        self.folders.update(cx, |panel, cx| {
+            panel.accept_with_index(snapshot.clone(), read_models.library.clone(), window, cx)
+        });
+        if self.selected_note.is_none() && self.note_editor.is_none() {
+            self.selected_note = snapshot
+                .notes
+                .iter()
+                .find(|note| {
+                    note.detached == self.show_detached
+                        && self.folders.read(cx).filter().matches(note)
+                })
+                .map(|note| note.id.clone());
+        }
         if let Some(id) = moved_selection {
             self.folders.update(cx, |panel, cx| {
                 panel.align_note_context(&id, cx);
             });
         }
         self.reconcile_draft_folders(&snapshot);
+        self.read_models = read_models;
         self.snapshot = Some(snapshot);
     }
 

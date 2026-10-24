@@ -90,6 +90,20 @@ impl DraftRecord {
 }
 
 const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A derived protection set for storage views. Rebuild at draft lifecycle
+/// boundaries, never once per rendered file. Destructive actions still consult
+/// the authoritative records before acting.
+pub fn protected_note_ids<'a>(
+    records: impl IntoIterator<Item = &'a DraftRecord>,
+) -> std::collections::HashSet<String> {
+    records
+        .into_iter()
+        .filter(|record| record.active())
+        .flat_map(|record| record.draft.note_id.iter().chain(record.save_target.iter()))
+        .cloned()
+        .collect()
+}
 fn ordinary(path: &Path, directory: bool) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
     ensure!(

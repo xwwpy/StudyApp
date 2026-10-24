@@ -100,7 +100,19 @@ pub async fn exercise(
     let editor = window
         .update(cx, |_, window, cx| {
             assert_eq!(view.read(cx).snapshot.as_ref().unwrap().notes.len(), 2);
+            // The import result is a real occluding toast. At the runner's
+            // 1024 px width it covers the library's + button, so dismiss the
+            // previous scenario's feedback before exercising this menu.
+            view.update(cx, |app, cx| app.clear_notices(cx));
+            window.render_frame(cx);
             crate::smoke_library::library_add(window, false, cx);
+            assert!(
+                view.read(cx)
+                    .note_editor
+                    .as_ref()
+                    .is_some_and(|draft| { draft.note_id.is_none() && draft.content.is_empty() }),
+                "New Markdown menu must open a distinct empty draft"
+            );
             view.update(cx, |app, cx| {
                 app.note_title
                     .update(cx, |s, cx| s.set_value("连续编辑测试", window, cx))

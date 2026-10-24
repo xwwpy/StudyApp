@@ -68,6 +68,7 @@ jobs:
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-update-helper.ps1 -FixtureDirectory $env:RUNNER_TEMP -RequireReparseFixture
           if ($LASTEXITCODE -ne 0) { throw 'Updater regression tests failed' }
       - run: cargo build --locked -p studyapp-desktop --features ui-test
+        id: native-build
       - name: Exercise native window and capture five pages
         timeout-minutes: 10
         run: |
@@ -75,12 +76,14 @@ jobs:
           "SMOKE_DIR=$smokeDir" >> $env:GITHUB_ENV
           ./scripts/smoke.ps1 -DataDirectory $smokeDir
       - name: Verify native window movement
+        if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
         timeout-minutes: 2
         run: |
           $dragDir = Join-Path $env:RUNNER_TEMP ('studyapp-window-drag-' + [guid]::NewGuid().ToString('N'))
           "DRAG_DIR=$dragDir" >> $env:GITHUB_ENV
           ./scripts/smoke-window-drag.ps1 -DataDirectory $dragDir -BinaryPath ./target/debug/studyapp.exe
       - name: Verify real Windows image clipboard
+        if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
         timeout-minutes: 4
         run: |
           $clipboardDir = Join-Path $env:RUNNER_TEMP ('studyapp-clipboard-' + [guid]::NewGuid().ToString('N'))

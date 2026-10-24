@@ -278,21 +278,33 @@ pub fn binding_conflicts(bindings: &BTreeMap<String, String>) -> BTreeMap<String
 
 /// Missing actions use defaults, while an explicit empty value unbinds an action.
 pub fn validate_bindings(bindings: &BTreeMap<String, String>) -> Result<()> {
+    let label = |id: &str| {
+        SHORTCUT_ACTIONS
+            .iter()
+            .find(|action| action.id == id)
+            .map(|action| action.label)
+            .unwrap_or("未识别操作")
+    };
     let mut resolved = resolved_bindings(bindings);
     for (action, binding) in bindings {
         if !SHORTCUT_ACTIONS.iter().any(|known| known.id == action) {
-            bail!("未知快捷键操作：{action}");
+            bail!("包含不支持的快捷操作，请恢复默认后重新设置");
         }
         resolved.insert(
             action.clone(),
-            normalize_binding(binding).with_context(|| format!("操作 {action} 的快捷键无效"))?,
+            normalize_binding(binding)
+                .with_context(|| format!("「{}」的快捷键无效", label(action)))?,
         );
     }
     let mut used = BTreeMap::new();
     for (action, binding) in &resolved {
         for alternative in binding.split(';').filter(|value| !value.is_empty()) {
             if let Some(previous) = used.insert(alternative, action) {
-                bail!("{alternative} 同时用于 {previous} 和 {action}");
+                bail!(
+                    "{alternative} 同时用于「{}」和「{}」",
+                    label(previous),
+                    label(action)
+                );
             }
         }
     }

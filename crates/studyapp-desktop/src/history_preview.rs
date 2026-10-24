@@ -1,4 +1,5 @@
 use crate::components::*;
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::*;
 use std::sync::Arc;
 use studyapp_core::NoteVersion;
@@ -41,6 +42,7 @@ impl HistoryPreview {
             .overflow_hidden()
             .bg(crate::theme::color(BG))
             .rounded_lg()
+            .vertical_scrollbar(&self.scroll)
             .child(
                 uniform_list("history-diff-scroll", rows.len(), move |range, _, _| {
                     range

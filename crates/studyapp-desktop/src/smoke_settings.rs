@@ -50,12 +50,23 @@ pub async fn exercise(
             let interval = view.read(cx).interval.clone();
             interval.update(cx, |input, cx| input.set_value("35", window, cx));
             window.click("settings-section-appearance", cx);
+            window.render_frame(cx);
+            let preview_rebuilds = view.read(cx).appearance_preview_rebuilds();
             click_scrolled(
                 window,
                 "show-file-paths".into(),
                 "settings-section-scroll",
                 cx,
             );
+            assert_eq!(view.read(cx).appearance_preview_rebuilds(), preview_rebuilds, "unrelated appearance checkbox rebuilt Markdown preview colors");
+            let body_size = view.read(cx).preferences_ui.appearance_fields["md-body-size"].clone();
+            let original_body_size = body_size.read(cx).value();
+            body_size.update(cx, |input, cx| input.set_value("18", window, cx));
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).appearance_preview_rebuilds(), preview_rebuilds + 1, "programmatic field change did not refresh preview");
+            body_size.update(cx, |input, cx| input.set_value(original_body_size, window, cx));
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).appearance_preview_rebuilds(), preview_rebuilds + 2);
             for (section, id, _) in SettingsSection::ALL {
                 window.click(SharedString::from(format!("settings-section-{id}")), cx);
                 window.render_frame(cx);
@@ -82,7 +93,81 @@ pub async fn exercise(
                 );
             }
 
+            window.click("settings-section-storage", cx);
+            click_scrolled(
+                window,
+                "images-storage-cloud".into(),
+                "settings-section-scroll",
+                cx,
+            );
+            assert_eq!(
+                view.read(cx)
+                    .preferences_ui
+                    .image_cloud
+                    .as_ref()
+                    .unwrap()
+                    .kind,
+                0
+            );
+            for key in [
+                "endpoint",
+                "bucket",
+                "region",
+                "access_key_id",
+                "secret",
+                "prefix",
+            ] {
+                let id = SharedString::from(format!("image-cloud-field-{key}"));
+                reveal_scrolled(window, id.clone(), "settings-section-scroll", cx);
+                assert!(window.find(id).bounds().size.height > px(0.));
+            }
+            assert_eq!(
+                settings_files(&files_root),
+                files,
+                "cloud form wrote settings before save"
+            );
+            click_scrolled(
+                window,
+                "images-storage-local".into(),
+                "settings-section-scroll",
+                cx,
+            );
             window.click("settings-section-shortcuts", cx);
+            window.render_frame(cx);
+            let nav = window.find("settings-category-navigation").bounds();
+            let content = window.find("settings-section-scroll").bounds();
+            if window.viewport_size().width < px(1120.) {
+                assert!(
+                    nav.bottom() <= content.top(),
+                    "compact categories must stay above the scroll viewport"
+                );
+            } else {
+                assert!(
+                    nav.right() <= content.left(),
+                    "wide settings categories must occupy a separate rail"
+                );
+            }
+            let rebuilds = view.read(cx).shortcut_analysis_rebuilds();
+            let mut frame_micros = Vec::with_capacity(20);
+            for _ in 0..20 {
+                view.update(cx, |_, cx| cx.notify());
+                let started = std::time::Instant::now();
+                window.render_frame(cx);
+                frame_micros.push(started.elapsed().as_micros() as u64);
+            }
+            frame_micros.sort_unstable();
+            std::fs::write(database.with_file_name("settings-render-timing.json"), serde_json::to_string_pretty(&serde_json::json!({
+                "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+                "measurement": "GPUI TestWindowExt render_frame (refresh + draw + clear), unchanged shortcuts page",
+                "frames": frame_micros.len(), "actions": crate::shortcuts::SHORTCUT_ACTIONS.len(),
+                "p50_us": frame_micros[9], "p95_us": frame_micros[18], "samples_us": frame_micros,
+                "analysis_rebuilds_before": rebuilds, "analysis_rebuilds_after": view.read(cx).shortcut_analysis_rebuilds(),
+            })).unwrap()).unwrap();
+            assert_eq!(
+                view.read(cx).shortcut_analysis_rebuilds(),
+                rebuilds,
+                "unchanged settings frames reparsed all bindings"
+            );
             click_scrolled(
                 window,
                 "record-shortcut-app.new".into(),
@@ -90,9 +175,23 @@ pub async fn exercise(
                 cx,
             );
             assert!(view.read(cx).preferences_ui.recording.is_some());
+            window.render_frame(cx);
+            let capture = window.find("shortcut-recording-target").bounds();
+            let cell = window.find("record-shortcut-app.new").bounds();
+            assert!(capture.left() >= cell.left() && capture.right() <= cell.right());
+            assert!(
+                capture.top() >= cell.top() && capture.bottom() <= cell.bottom(),
+                "key capture escaped its binding cell"
+            );
+            window.render_to_image().unwrap().save(database.with_file_name("settings-inline-recording.png")).unwrap();
             window.press("ctrl-s", cx);
             window.render_frame(cx);
             assert!(view.read(cx).preferences_ui.recording.is_none());
+            assert_eq!(
+                view.read(cx).shortcut_analysis_rebuilds(),
+                rebuilds + 1,
+                "one captured binding must rebuild analysis exactly once"
+            );
             assert_eq!(
                 view.read(cx).preferences_ui.shortcuts["app.new"]
                     .read(cx)
@@ -318,6 +417,75 @@ pub async fn exercise(
             assert_eq!(view.read(cx).page, Page::Notes);
         })
         .unwrap();
+    // Windows resize queues SetWindowPos asynchronously; yield before reading
+    // the viewport or asserting responsive layout, unlike an in-process draw.
+    let original_size = window
+        .update(cx, |_, window, cx| {
+            window.click(("nav", 4_usize), cx);
+            window.click("settings-section-shortcuts", cx);
+            let original = window.viewport_size();
+            crate::smoke_library::resize(window, size(px(1024.), px(720.)));
+            original
+        })
+        .unwrap();
+    for attempt in 0..100 {
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(40))
+            .await;
+        let compact = window
+            .update(cx, |_, window, _| window.viewport_size().width <= px(1024.))
+            .unwrap();
+        if compact {
+            break;
+        }
+        assert!(attempt < 99, "native resize did not reach compact viewport");
+    }
+    window
+        .update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            let nav = window.find("settings-category-navigation").bounds();
+            let content = window.find("settings-section-scroll").bounds();
+            assert!(
+                nav.bottom() <= content.top(),
+                "compact nav overlaps form: viewport={:?}, nav={nav:?}, content={content:?}",
+                window.viewport_size()
+            );
+            assert!(
+                content.size.height > px(220.),
+                "compact settings lost its usable content viewport"
+            );
+            for (_, id, _) in SettingsSection::ALL {
+                let category = window.find(SharedString::from(format!("settings-section-{id}")));
+                assert!(
+                    category.visible(),
+                    "category {id} became unreachable in compact settings"
+                );
+                assert!(category.bounds().right() <= nav.right());
+            }
+            assert!(window.find("save-settings").visible());
+            window
+                .render_to_image()
+                .unwrap()
+                .save(database.with_file_name("settings-compact.png"))
+                .unwrap();
+            crate::smoke_library::resize(window, original_size);
+        })
+        .unwrap();
+    for attempt in 0..100 {
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(40))
+            .await;
+        let restored = window
+            .update(cx, |_, window, _| window.viewport_size() == original_size)
+            .unwrap();
+        if restored {
+            break;
+        }
+        assert!(attempt < 99, "native viewport did not restore");
+    }
+    window
+        .update(cx, |_, window, cx| window.click(("nav", 1_usize), cx))
+        .unwrap();
     let original_appearance = window
         .update(cx, |_, _, cx| {
             view.read(cx)
@@ -398,5 +566,5 @@ pub async fn exercise(
         .await;
     }
     std::fs::write(database.with_file_name("settings-capture-smoke-result.txt"),
-        "PASS: all six categories preserve one draft and byte-identical settings files; fixed save bar remains visible; platform Ctrl+S and Ctrl+N record without dispatch; both conflicting rows displayed in screenshot; strict save rejects; F8 appends, Escape cancels, clear unbinds, focus loss disarms and normal input resumes; reset remains draft until save, discard restores baseline; light/dark theme persistence, native/editor token coherence and full native screenshots, original appearance restored. Key events use native-window GPUI test dispatch; separate strict Win32 input gates remain required.\n").unwrap();
+        "PASS: all six categories preserve one draft and byte-identical settings files; fixed save bar remains visible; wide category rail and settled 1024px compact navigation have bounded form content; inline recording stays inside its binding cell; 20 unchanged frames reuse one analysis and one captured edit rebuilds once; platform Ctrl+S and Ctrl+N record without dispatch; both conflicting rows displayed in screenshot; strict save rejects; F8 appends, Escape cancels, clear unbinds, focus loss disarms and normal input resumes; reset remains draft until save, discard restores baseline; light/dark theme persistence, native/editor token coherence and full native screenshots, original appearance restored. Key events use native-window GPUI test dispatch; separate strict Win32 input gates remain required.\n").unwrap();
 }

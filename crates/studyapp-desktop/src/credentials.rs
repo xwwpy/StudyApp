@@ -4,6 +4,27 @@ use anyhow::{Result, ensure};
 use zeroize::Zeroizing;
 
 const CONTEXT: &[u8] = b"StudyApp/WebDAV/password/v1\0";
+const IMAGE_CONTEXT: &[u8] = b"StudyApp/ImageCloud/secret/v1\0";
+
+pub fn protect_image(secret: &str) -> Result<Vec<u8>> {
+    ensure!(secret.len() <= 16_384, "图片密钥长度超过限制");
+    let mut plaintext = Zeroizing::new(IMAGE_CONTEXT.to_vec());
+    plaintext.extend_from_slice(secret.as_bytes());
+    crypt(&plaintext, true)
+}
+
+pub fn unprotect_image(ciphertext: &[u8]) -> Result<Zeroizing<String>> {
+    ensure!(ciphertext.len() <= 65_536, "图片凭据文件超过限制");
+    let plaintext = Zeroizing::new(crypt(ciphertext, false)?);
+    ensure!(
+        plaintext.starts_with(IMAGE_CONTEXT),
+        "图片凭据格式无效，请重新填写 Secret"
+    );
+    Ok(Zeroizing::new(
+        String::from_utf8(plaintext[IMAGE_CONTEXT.len()..].to_vec())
+            .map_err(|_| anyhow::anyhow!("图片凭据内容无效，请重新填写 Secret"))?,
+    ))
+}
 
 pub fn protect(password: &str) -> Result<Vec<u8>> {
     ensure!(password.len() <= 16_384, "密码长度超过限制");

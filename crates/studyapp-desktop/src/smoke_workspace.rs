@@ -477,7 +477,7 @@ async fn exercise_notifications(
             view.update(cx, |app, cx| {
                 app.clear_notices(cx);
                 let message =
-                    "通知队列回归：相同结果分别显示；悬停暂停，关闭时平滑淡出。".repeat(4);
+                    "通知队列回归：相同结果分别显示；悬停暂停，关闭时平滑淡出。".repeat(12);
                 app.push_notice(Ok(message.clone()), cx);
                 app.push_notice(Ok(message), cx);
                 app.push_notice(Err("等待前面的通知退出后显示".into()), cx);
@@ -523,18 +523,11 @@ async fn exercise_notifications(
                 "long notification did not wrap"
             );
             assert!((f32::from(notice.center().x - window.viewport_size().width / 2.)).abs() < 2.);
-            for action in [
-                "library-add-menu",
-                "library-sort-menu",
-                "library-more-menu",
-                "toggle-navigation",
-            ] {
-                assert!(
-                    !notice.intersects(&window.find(SharedString::from(action)).bounds()),
-                    "notification {notice:?} covered {action} {:?}",
-                    window.find(SharedString::from(action)).bounds()
-                );
-            }
+            assert!(
+                (f32::from(notice.top()) - crate::window_chrome::TITLE_BAR_HEIGHT - 12.).abs()
+                    <= 1.,
+                "result notices must stay below the custom title bar"
+            );
             let current = editor.read(cx).native_state().unwrap();
             assert_eq!(current["boundsUpdates"], native["boundsUpdates"]);
             assert_eq!(current["visibilityUpdates"], native["visibilityUpdates"]);
@@ -1585,6 +1578,10 @@ pub async fn exercise(
             assert!(
                 preview.size.width <= px(222.) && preview.size.height <= px(64.),
                 "drag ghost grew to source bounds"
+            );
+            assert!(
+                (f32::from(preview.size.height - source.size.height)).abs() <= 1.,
+                "note drag preview height must match its source row"
             );
             window
                 .render_to_image()

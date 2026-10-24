@@ -80,3 +80,37 @@ main { display: flex; flex-direction: column; }
 .md-image { display:inline-block; max-width:100%; max-height:600px; object-fit:contain; border-radius:6px; vertical-align:middle; }
 
 .md-image-placeholder { display:inline-flex; align-items:center; min-height:40px; max-width:100%; max-height:160px; overflow:hidden; overflow-wrap:anywhere; white-space:normal; padding:8px 12px; border:1px dashed var(--editor-border); border-radius:6px; background:var(--editor-surface); color:var(--editor-muted); font:13px/1.6 system-ui; }
+
+/* Semantic reading styles; native and browser validate the same bounded tokens. */
+#editor .cm-scroller { font-family:var(--editor-body-font); }
+#editor .cm-content { padding-left:max(26px,calc((100% - var(--editor-reading-width,920px))/2)); padding-right:max(26px,calc((100% - var(--editor-reading-width,920px))/2)); }
+#editor .md-heading { color:var(--editor-heading); }
+.md-heading-1 { font-size:1.95em; } .md-heading-2 { font-size:1.55em; } .md-heading-3 { font-size:1.28em; } .md-heading-4,.md-heading-5,.md-heading-6 { font-size:1.08em; }
+#editor .md-list-line { padding-left:calc(var(--list-depth,1)*24px); text-indent:-20px; }
+#editor .md-list-continuation { text-indent:0; }
+.md-list-marker,.md-bullet { color:var(--editor-list); }
+.md-bullet { width:16px; text-indent:0; }
+#editor .md-quote { color:var(--editor-quote); background:var(--editor-quote-background); }
+.md-inline-code { color:var(--editor-code-text); font-family:var(--editor-mono-font); }
+.md-code-language { color:var(--editor-syntax-comment); }
+#editor .md-code-line { font-family:var(--editor-mono-font); font-size:var(--editor-code-size); line-height:var(--editor-line-height); border-left:var(--editor-code-border-width) solid var(--editor-code-border); border-right:var(--editor-code-border-width) solid var(--editor-code-border); }
+#editor .md-code-start { border-top:var(--editor-code-border-width) solid var(--editor-code-border); border-radius:var(--editor-code-radius) var(--editor-code-radius) 0 0; padding-top:8px; }
+#editor .md-code-end { border-bottom:var(--editor-code-border-width) solid var(--editor-code-border); border-radius:0 0 var(--editor-code-radius) var(--editor-code-radius); padding-bottom:8px; }
+#editor .md-code-start.md-code-end { border-radius:var(--editor-code-radius); }
+.md-link { color:var(--editor-link); }
+.md-task { background:var(--editor-check-background); color:var(--editor-check-text); text-indent:0; }
+#editor .md-table-row { display:flex; align-items:stretch; white-space:pre-wrap; padding:0; color:var(--editor-table); background:var(--editor-table-background); border-left:var(--editor-grid-width) solid var(--editor-grid); border-bottom:var(--editor-grid-width) solid var(--editor-grid); }
+#editor .md-table-stripe { background:var(--editor-table-stripe); }
+#editor .md-table-header { background:var(--editor-surface); color:var(--editor-table-header); border-top:var(--editor-grid-width) solid var(--editor-grid); }
+.md-table-cell { display:inline-block; flex-shrink:0; min-width:0; min-height:1.85em; padding:6px 10px; border-right:var(--editor-grid-width) solid var(--editor-grid); overflow-wrap:anywhere; white-space:pre-wrap; }
+#editor .md-table-separator { height:0; min-height:0; line-height:0; padding:0; }
+@media(max-width:600px) { #editor .cm-content { padding-left:18px; padding-right:18px; } }
+:root[data-source="true"] .tok-keyword { color:var(--editor-source-syntax-keyword); }
+:root[data-source="true"] .tok-string { color:var(--editor-source-syntax-string); }
+:root[data-source="true"] .tok-number { color:var(--editor-source-syntax-number); }
+:root[data-source="true"] .tok-comment { color:var(--editor-source-syntax-comment); }
+:root[data-source="true"] .tok-type { color:var(--editor-source-syntax-type); }
+:root[data-source="true"] .tok-property { color:var(--editor-source-syntax-property); }
+:root[data-source="true"] .tok-tag { color:var(--editor-source-syntax-tag); }
+:root[data-source="true"] .tok-function { color:var(--editor-source-syntax-function); }
+:root[data-source="true"] .tok-punctuation { color:var(--editor-source-syntax-punctuation); }

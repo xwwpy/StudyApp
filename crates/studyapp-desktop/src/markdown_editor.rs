@@ -18,7 +18,11 @@ pub enum MarkdownEvent {
     Save,
     RequestEdit(usize),
     RequestInsertImage,
+    RequestNativeImagePaste {
+        generation: u64,
+    },
     PasteImage {
+        generation: u64,
         name: String,
         mime: String,
         base64: String,
@@ -64,6 +68,9 @@ enum Message {
         position: usize,
     },
     RequestInsertImage {
+        generation: u64,
+    },
+    RequestNativeImagePaste {
         generation: u64,
     },
     PasteImage {
@@ -117,7 +124,7 @@ pub struct MarkdownEditor {
     request: u64,
     shortcuts: std::collections::BTreeMap<String, String>,
     images: BTreeMap<String, String>,
-    occlusions: Vec<Bounds<Pixels>>,
+    occlusions: crate::overlay_regions::OverlayRegions<Bounds<Pixels>>,
     #[cfg(feature = "ui-test")]
     pub(crate) test_results: std::collections::HashMap<String, serde_json::Value>,
     _poll: Task<()>,
@@ -157,7 +164,7 @@ impl MarkdownEditor {
             request: 0,
             shortcuts: crate::shortcuts::default_bindings(),
             images: BTreeMap::new(),
-            occlusions: Vec::new(),
+            occlusions: Default::default(),
             #[cfg(feature = "ui-test")]
             test_results: Default::default(),
             _poll: poll,
@@ -221,13 +228,21 @@ impl MarkdownEditor {
     }
 
     pub fn set_occlusions(&mut self, bounds: Vec<Bounds<Pixels>>, cx: &mut Context<Self>) {
-        if self.occlusions == bounds {
+        self.set_overlay_regions("notices", bounds, cx);
+    }
+
+    pub fn set_overlay_regions(
+        &mut self,
+        source: &'static str,
+        bounds: Vec<Bounds<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.occlusions.set(source, bounds) {
             return;
         }
-        self.occlusions = bounds;
         #[cfg(windows)]
         if let Some(host) = &self.host
-            && let Err(error) = host.set_occlusions(self.occlusions.clone())
+            && let Err(error) = host.set_occlusions(self.occlusions.all())
         {
             self.fail(format!("无法更新窗口遮挡区域：{error:#}"), cx);
         }
@@ -241,12 +256,27 @@ impl MarkdownEditor {
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
+    pub(crate) fn readonly(&self) -> bool {
+        self.readonly
+    }
 
-    pub fn set_value(&mut self, value: String, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_value(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_value_with_readonly(value, false, window, cx);
+    }
+
+    /// Load the document and its input state in the same browser message. Saving
+    /// can replace image references without briefly reopening the flushed editor.
+    pub(crate) fn set_value_with_readonly(
+        &mut self,
+        value: String,
+        readonly: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.document.reset(value);
         self.images.clear();
-        self.readonly = false;
-        self.resume_readonly = false;
+        self.readonly = readonly;
+        self.resume_readonly = readonly;
         self.can_request_edit = false;
         self.pending = None;
         self.recovering = false;
@@ -257,6 +287,41 @@ impl MarkdownEditor {
             self.load(cx);
         }
         cx.notify();
+    }
+
+    pub(crate) fn rebase_saved_value(
+        &mut self,
+        value: String,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.readonly() && self.pending.is_none(),
+            "请等待当前输入确认后再保存"
+        );
+        if value == self.document.text() {
+            return Ok(());
+        }
+        let previous_generation = self.document.generation();
+        let previous_revision = self.document.revision();
+        let changes = studyapp_desktop::editor_protocol::rebase_edits(self.document.text(), &value);
+        self.document.reset(value);
+        if self.ready {
+            let payload = serde_json::json!({
+                "previousGeneration": previous_generation, "previousRevision": previous_revision,
+                "generation": self.document.generation(), "text": self.document.text(),
+                "readonly": true, "changes": changes
+            });
+            if let Err(error) = self.evaluate(&format!("window.studyappEditor.rebase({payload});"))
+            {
+                self.fail(
+                    format!("无法更新保存中的正文，当前草稿仍保留：{error:#}"),
+                    cx,
+                );
+                return Err(error);
+            }
+        }
+        cx.notify();
+        Ok(())
     }
 
     fn evaluate(&self, script: &str) -> anyhow::Result<()> {
@@ -510,6 +575,14 @@ impl MarkdownEditor {
                             cx.emit(MarkdownEvent::RequestInsertImage);
                         }
                     }
+                    Message::RequestNativeImagePaste { generation } => {
+                        if generation == self.document.generation()
+                            && self.visible
+                            && self.editable()
+                        {
+                            cx.emit(MarkdownEvent::RequestNativeImagePaste { generation });
+                        }
+                    }
                     Message::PasteImage {
                         generation,
                         name,
@@ -520,7 +593,12 @@ impl MarkdownEditor {
                             && self.visible
                             && self.editable()
                         {
-                            cx.emit(MarkdownEvent::PasteImage { name, mime, base64 });
+                            cx.emit(MarkdownEvent::PasteImage {
+                                generation,
+                                name,
+                                mime,
+                                base64,
+                            });
                         }
                     }
                     // HostedEditor filters page-authored externalDrag messages;
@@ -623,7 +701,7 @@ impl MarkdownEditor {
                 this.creating = false;
                 match result {
                     Ok(host) => {
-                        if let Err(error) = host.set_occlusions(this.occlusions.clone()) {
+                        if let Err(error) = host.set_occlusions(this.occlusions.all()) {
                             this.fail(format!("无法更新窗口遮挡区域：{error:#}"), cx);
                         }
                         this.host = Some(host);

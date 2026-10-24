@@ -9,6 +9,7 @@ use gpui_kit::component::{
     Disableable, IconName, Selectable, Sizable,
     button::ButtonVariants,
     input::{Input, Textarea},
+    scroll::ScrollableElement,
     tooltip::Tooltip,
 };
 use gpui_kit::{prelude::FluentBuilder, *};
@@ -193,9 +194,8 @@ impl StudyApp {
                             Button::new("all-records")
                                 .ghost()
                                 .label("查看全部")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.page = Page::Stats;
-                                    cx.notify();
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.navigate(Page::Stats, window, cx);
                                 })),
                         ),
                 )
@@ -284,8 +284,7 @@ impl StudyApp {
                     "确认学习快照（每份笔记至少选择一个版本；时间为实际捕获时间，可多选或预览）",
                 ))
                 .child(
-                    column()
-                        .id("learning-versions")
+                    scroll_body("learning-versions", &self.learning_versions_scroll)
                         .max_h(px(220.))
                         .overflow_y_scroll()
                         .children(
@@ -336,10 +335,11 @@ impl StudyApp {
                                             .ghost()
                                             .small()
                                             .label("预览")
-                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                            .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.show_version(
                                                     note_id.clone(),
                                                     preview_id.clone(),
+                                                    window,
                                                     cx,
                                                 )
                                             })),
@@ -638,7 +638,11 @@ impl StudyApp {
                     .child(
                         row()
                             .id("study-bars")
+                            .relative()
+                            .track_scroll(&self.statistics_scroll)
+                            .horizontal_scrollbar(&self.statistics_scroll)
                             .overflow_x_scroll()
+                            .pb_3()
                             .items_end()
                             .gap_2()
                             .h(px(200.))
@@ -824,14 +828,20 @@ impl StudyApp {
         )
     }
 
-    pub fn settings(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
+    pub fn settings(
+        &self,
+        snapshot: &Snapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         use crate::settings_ui::SettingsSection;
+        let compact = window.viewport_size().width < px(1120.);
         let section = self.preferences_ui.section;
-        let content = column().gap_3().child(self.preference_controls(cx))
+        let content = column().min_w_0().w_full().max_w(px(960.)).flex_shrink_0().gap_3().child(self.preference_controls(cx))
             .children((section == SettingsSection::Storage).then(|| card().child(heading("数据保存"))
                 .child(row().child(pill("✓ 本地资料库", LIGHT)).child(muted("可在下方配置笔记文件同步")))
                 .child(muted(studyapp_desktop::presentation::display_path(&snapshot.data_path)))
-                .child(row().flex_wrap().child(Button::new("migrate-library").primary()
+                .child(row().flex_wrap().child(Button::new("migrate-library")
                     .disabled(self.storage_busy || self.note_saving || self.sync_panel.read(cx).status.busy)
                     .label("更改保存位置并迁移")
                     .on_click(cx.listener(|this, _, window, cx| this.choose_storage(window, cx))))
@@ -841,25 +851,72 @@ impl StudyApp {
                 .child(muted("迁移会复制笔记、历史、草稿和同步设置到新的空目录，保留原资料，正常启动时记住新位置。恢复备份只恢复学习资料，保留当前配置。使用 --data-dir 的独立运行不修改默认位置。"))))
             .children((section == SettingsSection::Storage).then(|| self.storage_view(cx)))
             .children((section == SettingsSection::Sync).then(|| self.sync_panel.clone()))
+            .children((section == SettingsSection::AboutAccount).then(|| self.update_panel.clone()))
             .children((section == SettingsSection::AboutAccount).then(|| card().child(heading("账户与微信登录"))
                 .child(row().child(pill("本地访客", LIGHT)).child(Button::new("wechat-disabled").label("微信登录 · 尚未连接服务").disabled(true)))
                 .child(muted("无需登录即可使用本地功能及自己的文件同步服务。微信登录仍保留后续接入。"))))
             .children((section == SettingsSection::AboutAccount).then(|| card().child(heading("文件历史与隐私"))
                 .child(muted("新建笔记保存在资料库 notes 目录，保存时自动生成版本；外部导入文件保持只读。运行时约每 3 秒检查文件改动，快速连续保存会合并为稳定版本。"))
                 .child(muted("离线期间只能比较上次快照与当前内容，无法还原中间的每一次保存。文件变化用于建议摘要，必须由你确认才会记为学习。"))
-                .child(muted("笔记预览不加载图片或执行 HTML；学习时长来自你的确认，不代表对实际专注的自动测量。"))));
+                .child(muted("笔记预览支持图片，原始 HTML 不会执行；学习时长来自你的确认，不代表对实际专注的自动测量。"))));
+        let transitioning = !cx.reduce_motion()
+            && self
+                .preferences_ui
+                .section_changed_at
+                .is_some_and(|changed| changed.elapsed() < std::time::Duration::from_millis(140));
+        let content = if transitioning {
+            content
+                .with_animation(
+                    (
+                        "settings-section-transition",
+                        self.preferences_ui.section_revision as usize,
+                    ),
+                    Animation::new(std::time::Duration::from_millis(120)),
+                    |content, progress| content.opacity(0.94 + 0.06 * progress),
+                )
+                .into_any_element()
+        } else {
+            content.into_any_element()
+        };
+        let workspace = if compact {
+            column()
+        } else {
+            row().items_stretch()
+        };
         column()
             .h_full()
             .min_h_0()
-            .child(div().flex_shrink_0().child(self.settings_header(cx)))
+            .min_w_0()
+            .gap_2()
             .child(
                 div()
-                    .id("settings-section-scroll")
+                    .id("settings-save-header")
                     .test_support()
+                    .flex_shrink_0()
+                    .child(self.settings_header(cx)),
+            )
+            .child(
+                workspace
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .child(content),
+                    .min_w_0()
+                    .gap_3()
+                    .child(
+                        self.settings_navigation(compact, cx)
+                            .id("settings-category-navigation")
+                            .test_support()
+                            .flex_shrink_0(),
+                    )
+                    .child(
+                        scroll_body("settings-section-scroll", &self.settings_scroll)
+                            .test_support()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .pr_4()
+                            .pb_4()
+                            .child(content),
+                    ),
             )
     }
 }

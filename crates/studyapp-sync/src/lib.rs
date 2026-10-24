@@ -5,9 +5,11 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 
 mod local;
+mod object_store;
 mod planner;
 mod webdav;
 pub use local::LocalFolderProvider;
+pub use object_store::{ObjectAddressing, ObjectStoreConfig, ObjectStoreProvider};
 pub use planner::plan_sync;
 pub use webdav::WebDavProvider;
 
@@ -38,6 +40,24 @@ impl std::fmt::Display for SyncError {
             Self::MissingRevision => write!(f, "WebDAV 未提供强 ETag，已拒绝覆盖现有笔记"),
             Self::Conflict => write!(f, "远端内容已更改，请重新同步；未覆盖未知版本"),
             Self::LockBusy => write!(f, "同步目录正在被其他 StudyApp 使用，请稍后重试"),
+            Self::Http(401 | 403) => write!(f, "云端拒绝访问，请检查账户密钥、存储桶及读写权限"),
+            Self::Http(301..=399) => write!(
+                f,
+                "云端地址发生重定向，请填写服务商提供的最终 Endpoint 与正确 Region"
+            ),
+            Self::Http(404) => write!(f, "云端路径或存储桶不存在，请检查目标配置"),
+            Self::Http(code) => write!(f, "云端请求失败（HTTP {code}），请检查服务状态后重试"),
+            Self::Transport => write!(f, "云端连接失败，请检查网络、证书、代理及 Endpoint 后重试"),
+            Self::InvalidUrl => {
+                write!(f, "云端地址无效，请填写不含账户、查询参数的 HTTPS 服务地址")
+            }
+            Self::InvalidPath => write!(f, "云端目录、存储桶或对象路径无效，请检查目标配置"),
+            Self::Io(std::io::ErrorKind::NotFound) => {
+                write!(f, "同步目录或文件不存在，请重新选择位置")
+            }
+            Self::Io(std::io::ErrorKind::PermissionDenied) => {
+                write!(f, "无法访问同步目录，请检查权限或文件占用")
+            }
             _ => write!(f, "同步失败：{self:?}"),
         }
     }
@@ -67,6 +87,52 @@ pub trait Provider: Send + Sync {
     /// Immutable assets have no overwrite or deletion operation and never enter note listings.
     fn read_asset(&self, key: &str) -> Result<Option<Vec<u8>>>;
     fn write_asset(&self, key: &str, bytes: &[u8]) -> Result<()>;
+}
+
+/// Image-only storage; implementations never need note revisions or deletion.
+pub trait AssetProvider: Send + Sync {
+    fn get_asset(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    fn put_asset(&self, key: &str, bytes: &[u8]) -> Result<()>;
+    fn check_connection(&self) -> Result<()>;
+    fn identity(&self) -> Option<String> {
+        None
+    }
+}
+
+impl<T: Provider> AssetProvider for T {
+    fn get_asset(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Provider::read_asset(self, key)
+    }
+    fn put_asset(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        Provider::write_asset(self, key, bytes)
+    }
+    fn check_connection(&self) -> Result<()> {
+        Provider::test_connection(self)
+    }
+}
+
+pub struct NoteAssets {
+    provider: Box<dyn Provider>,
+    identity: String,
+}
+impl NoteAssets {
+    pub fn new(provider: Box<dyn Provider>, identity: String) -> Self {
+        Self { provider, identity }
+    }
+}
+impl AssetProvider for NoteAssets {
+    fn get_asset(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.provider.read_asset(key)
+    }
+    fn put_asset(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        self.provider.write_asset(key, bytes)
+    }
+    fn check_connection(&self) -> Result<()> {
+        self.provider.test_connection()
+    }
+    fn identity(&self) -> Option<String> {
+        Some(self.identity.clone())
+    }
 }
 
 pub fn validate_asset_key(key: &str) -> Result<()> {
@@ -146,7 +212,10 @@ pub enum SyncAction {
     },
 }
 pub fn content_hash(content: &str) -> String {
-    format!("{:x}", Sha256::digest(content.as_bytes()))
+    content_hash_bytes(content.as_bytes())
+}
+pub fn content_hash_bytes(content: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(content))
 }
 
 fn validate_id(id: &str) -> Result<()> {

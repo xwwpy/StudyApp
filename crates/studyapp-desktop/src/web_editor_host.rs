@@ -43,7 +43,9 @@ pub use windows_host::{HostedEditor, ParentWindow};
 mod windows_host {
     use super::{
         EditorAsset, editor_asset, editor_page_allowed, ipc_allowed,
-        surface_geometry::{DragGate, LogicalRect, PhysicalRect, clipped_occlusions},
+        surface_geometry::{
+            DragGate, LogicalRect, PhysicalRect, clipped_occlusions, rounded_occlusion_rects,
+        },
     };
     use anyhow::{Context as _, Result, ensure};
     use gpui_kit::{Bounds, Pixels, Window};
@@ -120,6 +122,7 @@ mod windows_host {
         visible: Cell<bool>,
         occlusions: RefCell<Vec<LogicalRect>>,
         applied_occlusions: RefCell<Vec<PhysicalRect>>,
+        applied_round_rects: RefCell<Vec<PhysicalRect>>,
         applied_region_size: Cell<Option<(i32, i32)>>,
         #[cfg(feature = "ui-test")]
         occlusion_updates: Cell<u64>,
@@ -222,6 +225,7 @@ mod windows_host {
                 visible: Cell::new(false),
                 occlusions: RefCell::new(Vec::new()),
                 applied_occlusions: RefCell::new(Vec::new()),
+                applied_round_rects: RefCell::new(Vec::new()),
                 applied_region_size: Cell::new(None),
                 #[cfg(feature = "ui-test")]
                 occlusion_updates: Cell::new(0),
@@ -274,8 +278,8 @@ mod windows_host {
             Ok(())
         }
 
-        /// Parent-client logical bounds of individual overlay cards, including
-        /// their shadows. This keeps Chromium live and focus/selection unchanged.
+        /// Parent-client bounds of opaque cards. Never cut a shadow-sized
+        /// rectangle from Chromium: its exposed corners would become solid.
         pub fn set_occlusions(&self, bounds: Vec<Bounds<Pixels>>) -> Result<()> {
             *self.occlusions.borrow_mut() = bounds
                 .into_iter()
@@ -293,18 +297,22 @@ mod windows_host {
 
         fn apply_occlusions(&self) -> Result<()> {
             use windows::Win32::Graphics::Gdi::{
-                CombineRgn, CreateRectRgn, DeleteObject, GDI_REGION_TYPE, RGN_DIFF, SetWindowRgn,
+                CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, GDI_REGION_TYPE,
+                RGN_DIFF, SetWindowRgn,
             };
             let Some((x, y, width, height, dpi)) = self.bounds.get() else {
                 return Ok(());
             };
             let clips = clipped_occlusions((x, y, width, height), dpi, &self.occlusions.borrow());
+            let round_rects =
+                rounded_occlusion_rects((x, y, width, height), dpi, &self.occlusions.borrow());
             let scale = f64::from(dpi) / 96.;
             let size = (
                 (width * scale).ceil() as i32,
                 (height * scale).ceil() as i32,
             );
             if *self.applied_occlusions.borrow() == clips
+                && *self.applied_round_rects.borrow() == round_rects
                 && (clips.is_empty() || self.applied_region_size.get() == Some(size))
             {
                 return Ok(());
@@ -321,8 +329,16 @@ mod windows_host {
                 } else {
                     let region = CreateRectRgn(0, 0, size.0, size.1);
                     ensure!(!region.0.is_null(), "无法创建编辑器可见区域");
-                    for &(left, top, right, bottom) in &clips {
-                        let hole = CreateRectRgn(left, top, right, bottom);
+                    for &(left, top, right, bottom) in &round_rects {
+                        let diameter = (16. * scale).round() as i32;
+                        let hole = CreateRoundRectRgn(
+                            left,
+                            top,
+                            right + 1,
+                            bottom + 1,
+                            diameter,
+                            diameter,
+                        );
                         if hole.0.is_null() {
                             let _ = DeleteObject(region.into());
                             anyhow::bail!("无法创建通知遮挡区域");
@@ -341,6 +357,7 @@ mod windows_host {
                 }
             }
             *self.applied_occlusions.borrow_mut() = clips;
+            *self.applied_round_rects.borrow_mut() = round_rects;
             self.applied_region_size.set(Some(size));
             #[cfg(feature = "ui-test")]
             self.occlusion_updates.set(self.occlusion_updates.get() + 1);

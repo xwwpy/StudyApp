@@ -82,8 +82,8 @@ pub fn external_drop_overlay(
 }
 
 impl StudyApp {
-    /// Menus participate in the same native-child visibility lifecycle as note
-    /// context menus. The token prevents a released old menu closing a new one.
+    /// Track only the menu's actual native occlusion. The document stays live;
+    /// the token prevents a released old menu from closing a newer popup.
     pub(crate) fn library_menu_state(
         owner: &WeakEntity<Self>,
         cx: &mut Context<PopupMenu>,
@@ -94,8 +94,6 @@ impl StudyApp {
                 this.note_menu_sequence = this.note_menu_sequence.wrapping_add(1);
                 let token = this.note_menu_sequence;
                 this.active_note_menu = Some(token);
-                this.note_content
-                    .update(cx, |editor, cx| editor.set_visible(false, cx));
                 cx.notify();
                 Some((
                     token,
@@ -106,11 +104,13 @@ impl StudyApp {
             })
             .ok()??;
         let (token, sort, detached, busy) = opened;
+        Self::track_menu_surface(owner.clone(), token, cx);
         let dismissed = owner.clone();
         cx.subscribe_self(move |_, _: &DismissEvent, cx| {
             let _ = dismissed.update(cx, |this, cx| {
                 if this.active_note_menu == Some(token) {
                     this.active_note_menu = None;
+                    this.clear_menu_surface(cx);
                     cx.notify();
                 }
             });
@@ -121,12 +121,34 @@ impl StudyApp {
             let _ = released.update(cx, |this, cx| {
                 if this.active_note_menu == Some(token) {
                     this.active_note_menu = None;
+                    this.clear_menu_surface(cx);
                     cx.notify();
                 }
             });
         })
         .detach();
         Some((sort, detached, busy))
+    }
+
+    fn clear_menu_surface(&mut self, cx: &mut Context<Self>) {
+        self.note_content.update(cx, |editor, cx| {
+            editor.set_overlay_regions("note-menu", vec![], cx);
+        });
+    }
+
+    fn track_menu_surface(owner: WeakEntity<Self>, token: u64, cx: &mut Context<PopupMenu>) {
+        cx.subscribe_self(
+            move |_, event: &gpui_kit::component::menu::PopupMenuLayout, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    if this.active_note_menu == Some(token) {
+                        this.note_content.update(cx, |editor, cx| {
+                            editor.set_overlay_regions("note-menu", event.0.clone(), cx);
+                        });
+                    }
+                });
+            },
+        )
+        .detach();
     }
 
     pub(crate) fn library_controls_busy(&self, cx: &App) -> bool {
@@ -420,15 +442,23 @@ impl StudyApp {
             let mut tip = metadata
                 .map(|m| format!("{}\n修改时间：{}", m.tip, m.updated_stamp))
                 .unwrap_or_default();
+            tip.push_str(if note.detached {
+                "\n已取消管理 · 学习记录保留"
+            } else if note.managed {
+                "\n应用副本 · 由资料库管理"
+            } else {
+                "\n外部文件 · 跟踪原文件的变化"
+            });
             if snapshot.settings.show_file_paths {
                 tip.push_str(&format!("\n{}", display_path(&note.path)));
             }
-            let chosen = self.selected_note.as_ref() == Some(&id);
-            let element = row()
+            let chosen = self.active_draft_id.is_none() && self.selected_note.as_ref() == Some(&id);
+            let element = library_entry()
                 .id(SharedString::from(format!("note-{id}")))
                 .test_support()
+                .aria_selected(chosen)
                 .px_2()
-                .h(px(32.))
+                .h(px(LIBRARY_ROW_HEIGHT))
                 .rounded_md()
                 .border_1()
                 .border_color(rgba(0))
@@ -437,18 +467,11 @@ impl StudyApp {
                 .gap_2()
                 .cursor_pointer()
                 .hover(|style| style.bg(crate::theme::color(BG)))
-                .when(chosen, |c| {
-                    c.bg(crate::theme::color(LIGHT))
-                        .border_color(crate::theme::color(BORDER))
-                })
+                .when(chosen, |c| c.bg(crate::theme::selection_color()))
                 .child(
                     Icon::new(IconName::FileText)
                         .small()
-                        .text_color(crate::theme::color(if note.managed && !note.detached {
-                            GREEN
-                        } else {
-                            MUTED
-                        })),
+                        .text_color(crate::theme::color(MUTED)),
                 )
                 .child(
                     div()
@@ -475,7 +498,7 @@ impl StudyApp {
                                     {
                                         GREEN
                                     } else {
-                                        0xA36400
+                                        0x9B5719
                                     },
                                 ))
                                 .child(
@@ -491,34 +514,25 @@ impl StudyApp {
                 )
                 .when(!note.managed || note.detached || note.missing, |r| {
                     r.child(
-                        div()
-                            .id(SharedString::from(format!("note-source-{}", note.id)))
-                            .test_support()
-                            .flex_shrink_0()
-                            .text_xs()
-                            .text_color(crate::theme::color(MUTED))
-                            .child(if note.missing {
-                                "失联"
+                        library_tag(
+                            if note.missing {
+                                "待定位"
                             } else if note.detached {
                                 "已移除"
                             } else {
-                                "跟踪"
-                            }),
+                                "外部"
+                            },
+                            note.missing,
+                        )
+                        .id(SharedString::from(format!("note-source-{}", note.id)))
+                        .test_support(),
                     )
                 })
                 // Anchor within the sidebar so native editor children cannot
                 // cover learning/review timestamps near the row's right edge.
                 .tooltip(move |window, cx| sidebar_tooltip(tip.clone(), window, cx))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if this.media_busy() {
-                        return;
-                    }
-                    this.folders.update(cx, |panel, cx| {
-                        panel.align_note_context(&id, cx);
-                    });
-                    this.selected_note = Some(id.clone());
-                    this.selected_version = None;
-                    cx.notify();
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.select_note_document(id.clone(), None, false, window, cx);
                 }))
                 .on_drag(drag, |drag, source_offset, _, cx| {
                     cx.new(|_| crate::note_actions::NoteDragPreview::new(drag, source_offset))
@@ -534,8 +548,6 @@ impl StudyApp {
                         this.note_menu_sequence = this.note_menu_sequence.wrapping_add(1);
                         let token = this.note_menu_sequence;
                         this.active_note_menu = Some(token);
-                        this.note_content
-                            .update(cx, |editor, cx| editor.set_visible(false, cx));
                         cx.notify();
                         Some((
                             snapshot,
@@ -547,11 +559,13 @@ impl StudyApp {
                     let Ok(Some((snapshot, note, token, busy))) = opened else {
                         return menu;
                     };
+                    Self::track_menu_surface(menu_owner.clone(), token, cx);
                     let dismissed = menu_owner.clone();
                     cx.subscribe_self(move |_, _: &DismissEvent, cx| {
                         let _ = dismissed.update(cx, |this, cx| {
                             if this.active_note_menu == Some(token) {
                                 this.active_note_menu = None;
+                                this.clear_menu_surface(cx);
                                 cx.notify();
                             }
                         });
@@ -562,6 +576,7 @@ impl StudyApp {
                         let _ = released.update(cx, |this, cx| {
                             if this.active_note_menu == Some(token) {
                                 this.active_note_menu = None;
+                                this.clear_menu_surface(cx);
                                 cx.notify();
                             }
                         });
@@ -586,7 +601,67 @@ impl StudyApp {
                 .or_default()
                 .push(element.into_any_element());
         }
+        let mut drafts = self
+            .draft_catalog
+            .values()
+            .filter(|r| r.active())
+            .collect::<Vec<_>>();
+        drafts.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let draft_count = drafts.len();
+        let draft_entries = drafts
+            .into_iter()
+            .filter(|r| {
+                query.is_empty()
+                    || r.draft.title.to_lowercase().contains(&query)
+                    || r.draft.content.to_lowercase().contains(&query)
+            })
+            .map(|record| {
+                let id = record.id.clone();
+                let title = if record.draft.title.trim().is_empty() {
+                    "未命名草稿".to_owned()
+                } else {
+                    record.draft.title.clone()
+                };
+                let active = self.active_draft_id.as_ref() == Some(&id);
+                let error = self.draft_errors.contains_key(&id);
+                library_entry()
+                    .id(SharedString::from(format!("draft-row-{id}")))
+                    .test_support()
+                    .aria_selected(active)
+                    .min_w_0()
+                    .gap_2()
+                    .px_2()
+                    .cursor_pointer()
+                    .hover(|r| r.bg(crate::theme::color(BG)))
+                    .when(active, |r| r.bg(crate::theme::selection_color()))
+                    .child(
+                        Icon::new(IconName::FileText)
+                            .small()
+                            .text_color(crate::theme::color(MUTED)),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(title))
+                    .child(
+                        muted(if error {
+                            "保存失败".into()
+                        } else if active {
+                            "编辑中".into()
+                        } else {
+                            stamp(record.updated_at / 1000)
+                        })
+                        .text_xs(),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_draft(id.clone(), window, cx)
+                    }))
+                    .into_any_element()
+            })
+            .collect();
         let tree = self.folders.update(cx, |panel, cx| {
+            panel.set_draft_entries(draft_count, draft_entries);
             panel.library_tree(
                 note_rows,
                 &query,
@@ -698,15 +773,11 @@ impl StudyApp {
                         .flex_shrink_0()
                         .flex_wrap()
                         .child(heading(note.title.clone()).flex_1().min_w_0().truncate())
-                        .child(
-                            Button::new("record-note")
-                                .small()
-                                .primary()
-                                .label("记录")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_editor(EditorMode::Manual, window, cx)
-                                })),
-                        )
+                        .child(Button::new("record-note").small().label("记录").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.open_editor(EditorMode::Manual, window, cx)
+                            }),
+                        ))
                         .child(
                             Button::new("edit-note")
                                 .small()
@@ -790,6 +861,7 @@ impl StudyApp {
                     .flex_shrink_0(),
                 );
             if self.history {
+                use gpui_kit::component::scroll::ScrollableElement;
                 // At narrow widths, a vertical version rail would leave the
                 // actual diff only a few characters wide. Use a horizontal
                 // strip above it until the document has room for both columns.
@@ -801,12 +873,18 @@ impl StudyApp {
                 let timeline = if compact_history {
                     row()
                         .id("history-versions-scroll")
+                        .relative()
+                        .track_scroll(&self.history_versions_scroll)
+                        .horizontal_scrollbar(&self.history_versions_scroll)
                         .h(px(42.))
                         .w_full()
                         .overflow_x_scroll()
                 } else {
                     column()
                         .id("history-versions-scroll")
+                        .relative()
+                        .track_scroll(&self.history_versions_scroll)
+                        .vertical_scrollbar(&self.history_versions_scroll)
                         .w(px(145.))
                         .h_full()
                         .overflow_y_scroll()
@@ -885,17 +963,17 @@ impl StudyApp {
             .when(self.draft_discard.is_some(), |c| c.child(muted("正在删除草稿…")))
             .when(self.draft_loading, |c| c.child(muted("正在检查本地草稿…")))
             .when(self.draft_failed, |c| c.child(card().child(heading("草稿文件暂时无法读取或保存"))
-                .child(muted("为保护已有草稿，暂时不能开始另一份笔记。修复目录权限后可重试；当前编辑内容仍可保存为笔记。"))
+                .child(muted("当前草稿尚未可靠保存；当前正文仍保留。其他草稿不会被覆盖，修复目录权限后可重试。"))
                 .child(Button::new("retry-note-draft").label("重试草稿读取").on_click(cx.listener(|this, _, _, cx| {
                     if this.note_editor.is_none() { this.draft_failed = false; this.draft_loading = true; this.drafts.load(&this.last_library); }
                     cx.notify();
                 })))))
-            .when(self.recoverable_draft.is_some(), |c| c.child(card().id("draft-recovery").child(heading("发现未保存的笔记草稿"))
-                .child(muted("草稿仍保留在当前资料库，恢复后可继续编辑或另存为新笔记。"))
+            .when(self.recoverable_draft.is_some(), |c| c.child(card().id("draft-recovery").child(heading("草稿箱中有未完成的笔记"))
+                .child(muted("所有草稿分别保留在左侧草稿箱；可继续新建，也可恢复最近一份。"))
                 .child(row()
                     .child(Button::new("recover-note-draft").disabled(self.storage_busy).primary().label("恢复草稿").on_click(cx.listener(|this, _, window, cx| this.recover_note(window, cx))))
                     .child(Button::new("discard-recovered-draft").disabled(self.storage_busy).ghost().label("删除草稿").on_click(cx.listener(|this, _, _, cx| {
-                        this.confirmation = Some(crate::editor_lifecycle::NoteConfirmation::DiscardDraft);
+                        this.confirmation = this.recoverable_draft_id().map(crate::editor_lifecycle::NoteConfirmation::DiscardDraft);
                         cx.notify();
                     })))
                 )))

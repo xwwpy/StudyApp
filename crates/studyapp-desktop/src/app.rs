@@ -1,7 +1,7 @@
 use crate::controls::Button;
 use crate::{
     components::*,
-    drafts::{DraftStore, NoteDraft},
+    drafts::{DraftRecord, DraftStore, NoteDraft},
     worker::{Work, Worker},
 };
 use chrono::{Local, Utc};
@@ -34,6 +34,8 @@ pub enum EditorMode {
 }
 
 pub struct StudyApp {
+    // Drain queued recovery snapshots before Worker releases the library lock.
+    pub drafts: DraftStore,
     pub worker: Worker,
     pub snapshot: Option<Arc<Snapshot>>,
     pub page: Page,
@@ -58,11 +60,19 @@ pub struct StudyApp {
     pub record_limit: usize,
     pub review_filter: usize,
     pub last_library: String,
-    pub drafts: DraftStore,
     pub note_title: Entity<InputState>,
     pub note_content: Entity<crate::markdown_editor::MarkdownEditor>,
     pub note_editor: Option<NoteDraft>,
     pub recoverable_draft: Option<NoteDraft>,
+    pub draft_catalog: std::collections::BTreeMap<String, DraftRecord>,
+    pub active_draft_id: Option<String>,
+    pub draft_durable: std::collections::BTreeMap<String, u64>,
+    pub draft_errors: std::collections::BTreeMap<String, String>,
+    pub draft_close_drain: Option<u64>,
+    pub draft_drain_intent: Option<crate::editor_lifecycle::NoteIntent>,
+    pub draft_deferred_work: Option<(String, Work)>,
+    pub draft_work_ready: bool,
+    pub pending_note_save: Option<(String, String, u64)>,
     pub draft_loading: bool,
     pub draft_failed: bool,
     pub record_date: Entity<InputState>,
@@ -83,6 +93,11 @@ pub struct StudyApp {
     pub storage_busy: bool,
     pub storage_confirm: Option<String>,
     pub storage_copy_scroll: ScrollHandle,
+    pub page_scroll: ScrollHandle,
+    pub settings_scroll: ScrollHandle,
+    pub learning_versions_scroll: ScrollHandle,
+    pub history_versions_scroll: ScrollHandle,
+    pub statistics_scroll: ScrollHandle,
     pub active_note_menu: Option<u64>,
     pub note_menu_sequence: u64,
     pub layout: studyapp_core::LayoutSettings,
@@ -93,7 +108,11 @@ pub struct StudyApp {
     pub(crate) picker_results: std::sync::mpsc::Receiver<(String, Work)>,
     pub modal_focus: crate::feedback::ModalFocus,
     pub notifications: Entity<crate::notifications::NotificationCenter>,
+    pub update_panel: Entity<crate::update_ui::UpdatePanel>,
+    pub pending_update: Option<crate::update_backend::PreparedUpdate>,
+    pub image_cloud_busy: bool,
     pub applied_appearance: Option<crate::theme::ResolvedTheme>,
+    pub appearance_source: Option<(studyapp_core::AppearanceSettings, bool)>,
     pub external_drop: crate::external_drop::ExternalDropState,
     pub external_drop_paths: Vec<std::path::PathBuf>,
     pub media_ui: crate::media_ui::MediaUi,
@@ -148,6 +167,18 @@ impl StudyApp {
         let note_title = input("笔记标题", "", window, cx);
         let note_content = cx.new(|cx| crate::markdown_editor::MarkdownEditor::new(window, cx));
         let notifications = cx.new(|_| crate::notifications::NotificationCenter::new());
+        let update_panel = cx.new(crate::update_ui::UpdatePanel::new);
+        cx.subscribe_in(
+            &update_panel,
+            window,
+            |this, _, event: &crate::update_ui::UpdateEvent, window, cx| match event {
+                crate::update_ui::UpdateEvent::InstallRequested => {
+                    this.request_install_update(window, cx)
+                }
+                crate::update_ui::UpdateEvent::AvailabilityChanged => cx.notify(),
+            },
+        )
+        .detach();
         let editor_occlusions = note_content.clone();
         cx.subscribe(
             &notifications,
@@ -238,27 +269,27 @@ impl StudyApp {
             .detach();
         }
         cx.observe(&folders, |_, _, cx| cx.notify()).detach();
-        cx.subscribe(
+        cx.subscribe_in(
             &folders,
-            |this, _, event: &crate::folders_ui::FolderEvent, cx| {
+            window,
+            |this, _, event: &crate::folders_ui::FolderEvent, window, cx| {
                 match event {
                     crate::folders_ui::FolderEvent::Filter(filter) => {
-                        this.selected_note = this.snapshot.as_ref().and_then(|s| {
-                            s.notes
-                                .iter()
-                                .find(|n| n.detached == this.show_detached && filter.matches(n))
-                                .map(|n| n.id.clone())
-                        });
-                        this.selected_version = None;
+                        this.select_folder_document(filter.clone(), window, cx);
                     }
                     crate::folders_ui::FolderEvent::Command(command) => {
-                        this.send(command.clone(), cx)
+                        this.send(command.as_ref().clone(), cx)
                     }
                     crate::folders_ui::FolderEvent::OverlayChanged(open) => {
-                        if *open {
+                        if *open && this.folders.read(cx).dialog_open() {
                             this.note_content
                                 .update(cx, |editor, cx| editor.set_visible(false, cx));
                         }
+                    }
+                    crate::folders_ui::FolderEvent::MenuRegions(bounds) => {
+                        this.note_content.update(cx, |editor, cx| {
+                            editor.set_overlay_regions("folder-menu", bounds.clone(), cx);
+                        });
                     }
                 }
                 cx.notify();
@@ -273,6 +304,11 @@ impl StudyApp {
             storage_busy: false,
             storage_confirm: None,
             storage_copy_scroll: ScrollHandle::new(),
+            page_scroll: ScrollHandle::new(),
+            settings_scroll: ScrollHandle::new(),
+            learning_versions_scroll: ScrollHandle::new(),
+            history_versions_scroll: ScrollHandle::new(),
+            statistics_scroll: ScrollHandle::new(),
             active_note_menu: None,
             note_menu_sequence: 0,
             layout: Default::default(),
@@ -280,6 +316,7 @@ impl StudyApp {
             layout_dirty: false,
             preferences_ui: Default::default(),
             applied_appearance: None,
+            appearance_source: None,
             external_drop: Default::default(),
             external_drop_paths: Vec::new(),
             media_ui: crate::media_ui::MediaUi::new(),
@@ -287,6 +324,9 @@ impl StudyApp {
             picker_results,
             modal_focus: crate::feedback::ModalFocus::new(cx),
             notifications,
+            update_panel,
+            pending_update: None,
+            image_cloud_busy: false,
             drafts: DraftStore::new(),
             note_title,
             note_content,
@@ -294,6 +334,15 @@ impl StudyApp {
             draft_failed: false,
             note_editor: None,
             recoverable_draft: None,
+            draft_catalog: Default::default(),
+            active_draft_id: None,
+            draft_durable: Default::default(),
+            draft_errors: Default::default(),
+            draft_close_drain: None,
+            draft_drain_intent: None,
+            draft_deferred_work: None,
+            draft_work_ready: false,
+            pending_note_save: None,
             draft_loading: true,
             note_saving: false,
             note_intent: None,
@@ -343,6 +392,7 @@ impl StudyApp {
     }
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.poll_image_settings(window, cx);
         while !self.storage_busy
             && !self.media_jobs_active()
             && !self.preferences_ui.busy
@@ -365,6 +415,9 @@ impl StudyApp {
             self.capture_note_draft(cx);
         }
         while let Ok(update) = self.worker.receiver.try_recv() {
+            if let Some(busy) = update.image_cloud_busy {
+                self.image_cloud_busy = busy;
+            }
             if let Some(response) = update.media_result {
                 self.accept_media_result(response, window, cx);
             }
@@ -387,22 +440,7 @@ impl StudyApp {
                 });
             }
             if let Some(result) = update.note_result {
-                self.note_saving = false;
-                self.note_content
-                    .update(cx, |editor, cx| editor.set_readonly(false, cx));
-                if let Ok(note_id) = result {
-                    self.show_detached = false;
-                    self.selected_note = Some(note_id);
-                    self.selected_version = None;
-                    self.note_editor = None;
-                    self.recoverable_draft = None;
-                    self.drafts.save(&self.last_library, None);
-                    self.reader_key.clear();
-                    if self.page != Page::Settings {
-                        self.page = Page::Notes;
-                    }
-                    self.finish_library_transition(window, cx);
-                }
+                self.accept_note_save_result(result, window, cx);
             }
             if update.editor_result {
                 self.saving = false;
@@ -455,6 +493,27 @@ impl StudyApp {
             }
             changed = true;
         }
+        if self.draft_deferred_work.is_some()
+            && !self.close_requested
+            && !self.note_saving
+            && !self.media_busy()
+            && self.draft_persist.is_none()
+            && self.draft_close_drain.is_none()
+            && !self.image_cloud_busy
+        {
+            if self.note_editor.is_some() {
+                self.request_note_action(
+                    crate::editor_lifecycle::NoteIntent::DeferredWork,
+                    window,
+                    cx,
+                );
+            } else {
+                self.begin_draft_drain(crate::editor_lifecycle::NoteIntent::DeferredWork, cx);
+            }
+        }
+        if let Some(snapshot) = self.snapshot.clone() {
+            self.reconcile_draft_folders(&snapshot);
+        }
         self.continue_close(window, cx);
         if changed {
             cx.notify();
@@ -482,15 +541,34 @@ impl StudyApp {
             self.storage_report = None;
             self.storage_confirm = None;
             self.storage_copy_scroll = ScrollHandle::new();
+            self.page_scroll = ScrollHandle::new();
+            self.settings_scroll = ScrollHandle::new();
+            self.learning_versions_scroll = ScrollHandle::new();
+            self.history_versions_scroll = ScrollHandle::new();
+            self.statistics_scroll = ScrollHandle::new();
             self.active_note_menu = None;
             self.note_editor = None;
             self.recoverable_draft = None;
+            self.active_draft_id = None;
+            self.draft_catalog.clear();
+            self.draft_durable.clear();
+            self.draft_errors.clear();
+            self.draft_close_drain = None;
+            self.draft_drain_intent = None;
+            self.pending_note_save = None;
             self.note_saving = false;
-            self.note_content
-                .update(cx, |editor, cx| editor.set_readonly(false, cx));
+            self.note_content.update(cx, |editor, cx| {
+                editor.set_readonly(false, cx);
+                editor.set_overlay_regions("note-menu", vec![], cx);
+                editor.set_overlay_regions("folder-menu", vec![], cx);
+            });
             self.draft_loading = true;
             self.draft_failed = false;
             self.last_library = snapshot.data_path.clone();
+            self.update_panel.update(cx, |panel, cx| {
+                panel.set_library(snapshot.data_path.clone(), cx)
+            });
+            self.pending_update = None;
             self.drafts.load(&self.last_library);
             self.selected_note = None;
             self.selected_version = None;
@@ -605,41 +683,49 @@ impl StudyApp {
                 panel.align_note_context(&id, cx);
             });
         }
-        let mut draft_folder_changed = false;
-        for draft in [&mut self.note_editor, &mut self.recoverable_draft]
-            .into_iter()
-            .flatten()
-        {
-            let folder = if let Some(note) = snapshot
+        self.reconcile_draft_folders(&snapshot);
+        self.snapshot = Some(snapshot);
+    }
+
+    pub(crate) fn reconcile_draft_folders(&mut self, snapshot: &Snapshot) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut changed = false;
+        for record in self.draft_catalog.values_mut().filter(|r| r.active()) {
+            // A flush/persist/media receipt names an exact revision. Reconcile
+            // metadata on the next poll after that transaction has settled.
+            if self.note_saving && self.active_draft_id.as_ref() == Some(&record.id) {
+                continue;
+            }
+            let folder = snapshot
                 .notes
                 .iter()
-                .find(|n| Some(&n.id) == draft.note_id.as_ref())
-            {
-                note.folder_id.clone()
-            } else {
-                draft
-                    .folder_id
-                    .clone()
-                    .filter(|id| snapshot.folders.iter().any(|f| &f.id == id))
-            };
-            if draft.folder_id != folder {
-                draft.folder_id = folder;
-                draft_folder_changed = true;
+                .find(|n| Some(&n.id) == record.draft.note_id.as_ref())
+                .map(|n| n.folder_id.clone())
+                .unwrap_or_else(|| {
+                    record
+                        .draft
+                        .folder_id
+                        .clone()
+                        .filter(|id| snapshot.folders.iter().any(|f| &f.id == id))
+                });
+            if record.draft.folder_id != folder {
+                changed = true;
+                record.draft.folder_id = folder;
+                record.touch(now);
+                self.drafts.save_record(&self.last_library, record.clone());
             }
         }
-        if draft_folder_changed {
-            if self.note_editor.is_some() {
-                self.capture_note_draft(cx);
-            } else {
-                self.drafts
-                    .save(&self.last_library, self.recoverable_draft.clone());
-            }
-            self.push_notice(
-                Ok("草稿目录已随笔记更新；已删除的目录会转为未分类。".into()),
-                cx,
-            );
+        if let Some(record) = self
+            .active_draft_id
+            .as_ref()
+            .and_then(|id| self.draft_catalog.get(id))
+            && let Some(draft) = self.note_editor.as_mut()
+        {
+            draft.folder_id.clone_from(&record.draft.folder_id);
         }
-        self.snapshot = Some(snapshot);
+        if changed {
+            self.refresh_recoverable();
+        }
     }
 
     pub fn send(&mut self, command: Command, cx: &mut Context<Self>) {
@@ -681,14 +767,14 @@ impl StudyApp {
         std::thread::spawn(move || {
             let work = match action {
                 "import" => rfd::FileDialog::new().set_title("导入 Markdown 笔记").add_filter("Markdown", &["md", "markdown"]).pick_files().map(Work::ImportPaths),
-                "import-folder" => rfd::FileDialog::new().set_title("导入目录中的 Markdown").pick_folder().map(|p| Work::ImportPaths(vec![p])),
+                "import-folder" => crate::folder_picker::pick_folder("导入目录中的 Markdown", Some(std::path::PathBuf::from(&library))).map(|p| Work::ImportPaths(vec![p])),
                 "relink" => rfd::FileDialog::new().add_filter("Markdown", &["md", "markdown"]).pick_file().zip(note).map(|(path, note_id)| Work::Apply(Command::Relink { note_id, path })),
                 "backup" => rfd::FileDialog::new().set_file_name(format!("WW-StudyApp-{}.sqlite3", Local::now().format("%Y%m%d-%H%M%S"))).save_file().map(|p| Work::Apply(Command::Backup(p))),
                 "restore" => rfd::FileDialog::new().set_title("选择 WW-StudyApp 备份（恢复前自动保留当前资料）").add_filter("SQLite 备份", &["sqlite3", "sqlite", "db"]).pick_file().and_then(|p| {
                     let confirmed = rfd::MessageDialog::new().set_title("恢复资料库").set_description("将用选中的备份恢复当前资料库。恢复前会自动保存当前资料的备份；源 Markdown 文件不会改变。").set_buttons(rfd::MessageButtons::OkCancel).show();
                     (confirmed == rfd::MessageDialogResult::Ok).then_some(Work::Apply(Command::Restore(p)))
                 }),
-                "library" => rfd::FileDialog::new().set_title("选择本地资料库文件夹").pick_folder().map(Work::SwitchLibrary),
+                "library" => crate::folder_picker::pick_folder("选择本地资料库文件夹", Some(std::path::PathBuf::from(&library))).map(Work::SwitchLibrary),
                 _ => None,
             };
             if let Some(work) = work {
@@ -849,12 +935,14 @@ impl StudyApp {
         }
     }
 
-    pub fn show_version(&mut self, note: String, version: String, cx: &mut Context<Self>) {
-        self.selected_note = Some(note);
-        self.selected_version = Some(version);
-        self.history = false;
-        self.page = Page::Notes;
-        cx.notify();
+    pub fn show_version(
+        &mut self,
+        note: String,
+        version: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_note_document(note, Some(version), false, window, cx);
     }
 
     pub fn has_modal(&self, cx: &App) -> bool {
@@ -929,7 +1017,7 @@ impl StudyApp {
             .p_3()
             .child(
                 column().gap_1().py_2().child(
-                    row().gap_1().child(self.navigation_toggle(cx)).child(
+                    row().gap_1().px_1().child(
                         div()
                             .flex_1()
                             .min_w_0()
@@ -959,10 +1047,34 @@ impl StudyApp {
                     }),
             )
             .child(div().flex_1())
-            .child(muted(format!(
-                "v{}  ·  数据保存在此设备",
-                env!("CARGO_PKG_VERSION")
-            )))
+            .children(
+                self.update_panel
+                    .read(cx)
+                    .available_version()
+                    .map(|version| {
+                        Button::new("sidebar-update")
+                            .small()
+                            .ghost()
+                            .w_full()
+                            .justify_start()
+                            .icon(IconName::ArrowUp)
+                            .label(format!("更新至 {version}"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.navigate(Page::Settings, window, cx);
+                                this.select_settings_section(
+                                    crate::settings_ui::SettingsSection::AboutAccount,
+                                    cx,
+                                );
+                            }))
+                    }),
+            )
+            .child(
+                column()
+                    .gap_1()
+                    .px_1()
+                    .child(muted(format!("v{}", env!("CARGO_PKG_VERSION"))).text_xs())
+                    .child(muted("本地资料库").text_xs()),
+            )
     }
 }
 
@@ -990,7 +1102,7 @@ impl Render for StudyApp {
                 Page::Notes => self.notes(&snapshot, window, cx).into_any_element(),
                 Page::Reviews => self.reviews(&snapshot, cx).into_any_element(),
                 Page::Stats => self.statistics(&snapshot, cx).into_any_element(),
-                Page::Settings => self.settings(&snapshot, cx).into_any_element(),
+                Page::Settings => self.settings(&snapshot, window, cx).into_any_element(),
             }
         } else {
             empty("正在打开本地资料库", "所有学习内容保存在你选择的目录").into_any_element()
@@ -1008,7 +1120,7 @@ impl Render for StudyApp {
         let modal = modal_content.map(|content| {
             let cancel_owner = cx.weak_entity();
             let accept_owner = cx.weak_entity();
-            crate::feedback::modal_shell(content, self.modal_focus.handle(), window, cx)
+            crate::feedback::modal_shell(content, &self.modal_focus, window, cx)
                 .on_cancel(move |_, _, cx| {
                     let _ = cancel_owner.update(cx, |this, cx| this.cancel_modal(cx));
                     true
@@ -1018,7 +1130,50 @@ impl Render for StudyApp {
                     true
                 })
         });
-        row()
+        let mut leading = vec![self.navigation_toggle(cx).rounded_full().into_any_element()];
+        if self.page == Page::Notes && !self.layout.folders_visible {
+            leading.push(
+                Button::new("toggle-folders")
+                    .small()
+                    .ghost()
+                    .rounded_full()
+                    .icon(IconName::PanelLeft)
+                    .accessibility_label("展开笔记库")
+                    .tooltip("展开笔记库")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_folders(cx)))
+                    .into_any_element(),
+            );
+        }
+        let actions = if self.page == Page::Notes {
+            vec![]
+        } else {
+            vec![self.library_add_button(cx)]
+        };
+        let window_title = if self.page == Page::Notes {
+            if self.note_editor.is_some() {
+                let value = self.note_title.read(cx).value();
+                if value.trim().is_empty() {
+                    "未命名笔记".to_owned()
+                } else {
+                    value.to_string()
+                }
+            } else {
+                self.snapshot
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .notes
+                            .iter()
+                            .find(|note| Some(&note.id) == self.selected_note.as_ref())
+                    })
+                    .map(|note| note.title.clone())
+                    .unwrap_or_else(|| title.to_owned())
+            }
+        } else {
+            title.to_owned()
+        };
+        let close_owner = cx.weak_entity();
+        column()
             .relative()
             .on_drag_move::<ExternalPaths>(cx.listener(
                 |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
@@ -1049,91 +1204,81 @@ impl Render for StudyApp {
             .text_color(crate::theme::color(INK))
             .font_family("Microsoft YaHei UI")
             .text_size(px(crate::theme::palette().font_size as f32))
-            .when(self.layout.navigation_visible, |view| {
-                view.child(self.navigation(layout.navigation, cx))
-            })
-            .when(
-                self.layout.navigation_visible
-                    || self.resizing.as_ref().is_some_and(|resize| {
-                        resize.pane == crate::workspace_layout::Pane::Navigation
-                    }),
-                |view| {
-                    view.child(self.resize_handle(crate::workspace_layout::Pane::Navigation, cx))
+            .child(crate::window_chrome::title_bar(
+                window_title,
+                leading,
+                actions,
+                window,
+                move |window, cx| {
+                    let _ = close_owner.update(cx, |this, cx| {
+                        if this.handle_close(window, cx) {
+                            window.remove_window();
+                        }
+                    });
                 },
-            )
+            ))
             .child(
-                column()
+                row()
                     .gap_0()
                     .flex_1()
+                    .min_h_0()
                     .min_w_0()
-                    .h_full()
-                    .child(
-                        row()
-                            .h(px(56.))
-                            .flex_shrink_0()
-                            .px_4()
-                            .border_b_1()
-                            .border_color(crate::theme::color(BORDER))
-                            .when(!self.layout.navigation_visible, |view| {
-                                view.child(self.navigation_toggle(cx))
-                            })
-                            .when(
-                                self.page == Page::Notes && !self.layout.folders_visible,
-                                |view| {
-                                    view.child(
-                                        Button::new("toggle-folders")
-                                            .small()
-                                            .ghost()
-                                            .icon(IconName::PanelLeft)
-                                            .accessibility_label("展开笔记库")
-                                            .tooltip("展开笔记库")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_folders(cx)
-                                            })),
-                                    )
-                                },
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_lg()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .truncate()
-                                    .child(title),
-                            )
-                            .when(self.page != Page::Notes, |view| {
-                                view.child(self.library_add_button(cx))
+                    .when(self.layout.navigation_visible, |view| {
+                        view.child(self.navigation(layout.navigation, cx))
+                    })
+                    .when(
+                        self.layout.navigation_visible
+                            || self.resizing.as_ref().is_some_and(|resize| {
+                                resize.pane == crate::workspace_layout::Pane::Navigation
                             }),
+                        |view| {
+                            view.child(
+                                self.resize_handle(crate::workspace_layout::Pane::Navigation, cx),
+                            )
+                        },
                     )
                     .child(
                         column()
-                            .id("page-scroll")
-                            .test_support()
+                            .gap_0()
                             .flex_1()
+                            .min_w_0()
                             .min_h_0()
-                            .when(!continuous && self.page != Page::Settings, |c| {
-                                c.overflow_y_scroll()
-                            })
-                            .when(continuous || self.page == Page::Settings, |c| {
-                                c.overflow_hidden()
-                            })
-                            .when(continuous, |c| c.p_4())
-                            .when(!continuous, |c| c.p_8())
-                            .child(body),
-                    )
-                    .child(
-                        row()
-                            .px_8()
-                            .py_2()
-                            .border_t_1()
-                            .border_color(crate::theme::color(BORDER))
-                            .child(muted("本地保存"))
-                            .child(div().flex_1())
-                            .child(muted(format!(
-                                "{}  ·  自动记录运行时间",
-                                Utc::now().with_timezone(&Local).format("%H:%M")
-                            ))),
+                            .h_full()
+                            .child(
+                                column()
+                                    .id("page-scroll")
+                                    .relative()
+                                    .track_scroll(&self.page_scroll)
+                                    .when(!continuous && self.page != Page::Settings, |c| {
+                                        use gpui_kit::component::scroll::ScrollableElement;
+                                        c.vertical_scrollbar(&self.page_scroll)
+                                    })
+                                    .test_support()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .when(!continuous && self.page != Page::Settings, |c| {
+                                        c.overflow_y_scroll()
+                                    })
+                                    .when(continuous || self.page == Page::Settings, |c| {
+                                        c.overflow_hidden()
+                                    })
+                                    .when(continuous || self.page == Page::Settings, |c| c.p_4())
+                                    .when(!continuous && self.page != Page::Settings, |c| c.p_8())
+                                    .child(body),
+                            )
+                            .child(
+                                row()
+                                    .px_8()
+                                    .py_2()
+                                    .border_t_1()
+                                    .border_color(crate::theme::color(BORDER))
+                                    .child(muted("本地保存"))
+                                    .child(div().flex_1())
+                                    .child(muted(format!(
+                                        "{}  ·  自动记录运行时间",
+                                        Utc::now().with_timezone(&Local).format("%H:%M")
+                                    ))),
+                            ),
                     ),
             )
             .when(self.external_drop.active(), |view| {

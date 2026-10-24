@@ -1,3 +1,4 @@
+import { applyEditorTheme } from "./theme";
 import { ChangeSet, Compartment, EditorSelection, EditorState, Extension, Text, Transaction } from "@codemirror/state";
 import { drawSelection, EditorView, keymap, placeholder, ViewUpdate } from "@codemirror/view";
 import {
@@ -11,14 +12,16 @@ import { syntaxHighlighting } from "@codemirror/language";
 import { codeHighlighting, fencedLanguage } from "./languages";
 import { imageMapChanged, updateImages, renderedMarkdown } from "./decorations";
 import { formatCommand, indentMarkdown } from "./formatting";
-import { documentBudget, documentLimits, MAX_DOCUMENT_BYTES, MAX_TRANSACTION_PATCHES, stringBytes } from "./limits";
+import { documentBudget, documentLimits, resetDocumentBudget, MAX_DOCUMENT_BYTES, MAX_TRANSACTION_PATCHES, stringBytes } from "./limits";
 import { incompleteScalars, scalarText, splitsScalar } from "./unicode";
 import { eventBinding, resolveBindings, typingKeymap } from "./shortcuts";
 
 interface Load { generation: number; text: string; readonly: boolean; canRequestEdit?: boolean; }
+interface Rebase extends Load { previousGeneration: number; previousRevision: number; changes: { from: number; to: number; insert: string }[]; }
 interface TestAction { type: string; request?: string | number; from?: number; to?: number; text?: string; anchor?: number; head?: number; name?: string; edits?: number; }
 interface Bridge {
   load(value: Load): void;
+  rebase(value: Rebase): void;
   setReadonly(value: boolean): void;
   setCanRequestEdit(value:boolean):void;
   restoreSelection(position: number): void;
@@ -42,6 +45,7 @@ declare global {
 const readOnlyMode = new Compartment();
 const renderingMode = new Compartment();
 const shortcutsMode = new Compartment();
+const themeMode = new Compartment();
 let bindings = resolveBindings({});
 let generation = 0;
 let revision = 0;
@@ -238,6 +242,7 @@ function setShortcuts(values: Record<string, string>): void {
 function extensions(readonly: boolean, rawText = ""): Extension[] {
   return [
     readOnlyMode.of(readonlyExtensions(readonly)), renderingMode.of(source ? [] : renderedMarkdown),
+    themeMode.of(EditorView.theme({})),
     documentLimits(rawText, warning, clearWarning),
     markdown({ base: markdownLanguage, codeLanguages: fencedLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
     syntaxHighlighting(codeHighlighting), history(), drawSelection(), EditorView.lineWrapping,
@@ -256,23 +261,58 @@ function extensions(readonly: boolean, rawText = ""): Extension[] {
         if (position !== null) post({type:"requestEdit",generation,position});
         return false;
       },
-      paste(event) {
-        const files = [...(event.clipboardData?.files ?? [])].filter(file => /^image\/(?:png|jpeg|gif|webp|bmp)$/.test(file.type));
-        if (!files.length) return false;
-        event.preventDefault();
-        if (view.state.readOnly || pendingFlush) return true;
-        const epoch = loadEpoch;
-        for (const file of files) {
-          if (file.size > 10*1024*1024) { warning("图片超过 10 MiB，请先缩小图片"); continue; }
+      paste: (() => {
+        // Each loaded document owns its readers. Keep File objects queued and
+        // encode one at a time, so completion order cannot reorder the images.
+        const epoch = loadEpoch, requestGeneration = generation;
+        const queue: File[] = [];
+        let reading = false, count = 0, bytes = 0;
+        const active = () => epoch === loadEpoch && loaded && !view.state.readOnly && !pendingFlush;
+        function next(): void {
+          if (!active()) { queue.length = 0; reading = false; count = bytes = 0; return; }
+          const file = queue.shift();
+          if (!file) { reading = false; count = bytes = 0; return; }
+          reading = true;
           const reader = new FileReader();
           reader.addEventListener("load", () => {
-            if (epoch !== loadEpoch || view.state.readOnly || pendingFlush || typeof reader.result !== "string") return;
-            post({type:"pasteImage",generation,name:file.name,mime:file.type,base64:reader.result.slice(reader.result.indexOf(",")+1)});
+            if (active() && typeof reader.result === "string") {
+              post({type:"pasteImage",generation:requestGeneration,name:file.name,mime:file.type,base64:reader.result.slice(reader.result.indexOf(",")+1)});
+            }
+            next();
           });
-          reader.readAsDataURL(file);
+          const failed = () => { if (active()) warning("无法读取剪贴板图片，请重新复制后粘贴"); next(); };
+          reader.addEventListener("error", failed);
+          reader.addEventListener("abort", failed);
+          try { reader.readAsDataURL(file); } catch { failed(); }
         }
-        return true;
-      },
+        return (event: ClipboardEvent): boolean => {
+          const files = [...(event.clipboardData?.files ?? [])].filter(file => /^image\/(?:png|jpeg|gif|webp|bmp)$/.test(file.type));
+          if (!files.length) {
+            // WebView2 exposes PNG-only Windows clipboard entries as a trusted
+            // empty paste. Ask the host for that image format only; never read
+            // ordinary text or request ambient browser clipboard permission.
+            if (event.isTrusted && event.clipboardData?.types.length === 0 && view.hasFocus) {
+              event.preventDefault();
+              if (active()) post({type:"requestNativeImagePaste",generation:requestGeneration});
+              return true;
+            }
+            return false;
+          }
+          event.preventDefault();
+          if (!active()) return true;
+          if (files.some(file => file.size > 10 * 1024 * 1024)) { warning("图片超过 10 MiB，请先缩小图片"); return true; }
+          const incomingBytes = files.reduce((total, file) => total + file.size, 0);
+          if (count + files.length > 20 || bytes + incomingBytes > 20 * 1024 * 1024) {
+            warning("每次最多粘贴 20 张图片、合计 20 MiB，请等待当前图片处理完成");
+            return true;
+          }
+          count += files.length;
+          bytes += incomingBytes;
+          queue.push(...files);
+          if (!reading) next();
+          return true;
+        };
+      })(),
       dragover(event) { if (event.dataTransfer?.types.includes("Files")) { event.preventDefault(); return true; } return false; },
       drop(event) { if (event.dataTransfer?.files.length) { event.preventDefault(); return true; } return false; }
     }),
@@ -292,6 +332,7 @@ function setReadonly(value: boolean): void {
 }
 function setSource(value: boolean): void {
   source = Boolean(value);
+  document.documentElement.dataset.source = String(source);
   view.dispatch({ effects: renderingMode.reconfigure(source ? [] : renderedMarkdown) });
   updateToolbar();
 }
@@ -316,6 +357,40 @@ function load(value: Load): void {
   loaded = true;
   updateToolbar();
 }
+function rebase(value: Rebase): void {
+  try {
+    if (!loaded || !view.state.readOnly || pendingFlush || unpublished
+      || value.previousGeneration !== generation || value.previousRevision !== revision
+      || !Number.isSafeInteger(value.generation) || value.generation <= generation
+      || typeof value.text !== "string" || stringBytes(value.text) > MAX_DOCUMENT_BYTES
+      || !Array.isArray(value.changes)) throw new Error("保存内容的编辑状态已变化");
+    let end = 0;
+    for (const change of value.changes) {
+      if (!Number.isSafeInteger(change.from) || !Number.isSafeInteger(change.to)
+        || change.from < end || change.to < change.from || change.to > view.state.doc.length
+        || typeof change.insert !== "string" || !scalarText(change.insert) || change.insert.includes("\r")
+        || splitsScalar(view.state.doc, change.from) || splitsScalar(view.state.doc, change.to)) throw new Error("保存内容的映射无效");
+      end = change.to;
+    }
+    const changes = ChangeSet.of(value.changes, view.state.doc.length);
+    if (changes.apply(view.state.doc).toString() !== value.text.replace(/\r\n?/g, "\n")) throw new Error("保存内容校验失败");
+    // This trusted host transaction maps the existing selection, history and
+    // top visible line. It is not an editable interval or an undoable user edit.
+    loaded = false;
+    view.dispatch({ changes, filter: false, annotations: Transaction.addToHistory.of(false),
+      effects: [view.scrollSnapshot().map(changes)!, resetDocumentBudget(value.text), readOnlyMode.reconfigure(readonlyExtensions(value.readonly))] });
+    generation = value.generation;
+    revision = 0;
+    loadEpoch++;
+    canRequestEdit = false;
+    loaded = true;
+    updateToolbar();
+  } catch (reason) {
+    loaded = true;
+    error(reason instanceof Error ? reason.message : "保存内容映射失败");
+  }
+}
+
 async function flush(value: { request: number }): Promise<void> {
   if (!Number.isSafeInteger(value?.request) || value.request < 0) { error("保存请求参数无效"); return; }
   const epoch = loadEpoch;
@@ -418,49 +493,26 @@ function restoreSelection(position: number): void {
   view.focus();
 }
 function setTheme(tokens: Record<string, unknown>): void {
-  if (!tokens || typeof tokens !== "object" || Array.isArray(tokens)) return;
-  const root = document.documentElement;
-  if (tokens.mode === "light" || tokens.mode === "dark") root.dataset.theme = tokens.mode;
-  for (const name of ["background","surface","text","muted","border","accent","selection","codeBackground","codeText"]) {
-    const value = tokens[name];
-    if (typeof value === "string" && /^#[a-f0-9]{6}$/i.test(value)) {
-      root.style.setProperty(`--editor-${name.replace(/[A-Z]/g, match => "-"+match.toLowerCase())}`,value);
-    }
-  }
-  // Syntax colors must contrast with the resolved code surface, including
-  // custom palettes whose surface can differ substantially from their body.
-  const style = getComputedStyle(root);
-  const background = style.getPropertyValue("--editor-code-background").trim();
-  const luminance = (hex: string) => {
-    const channels = [1,3,5].map(offset => parseInt(hex.slice(offset,offset+2),16)/255)
-      .map(value => value <= .04045 ? value/12.92 : ((value+.055)/1.055)**2.4);
-    return channels[0]*.2126 + channels[1]*.7152 + channels[2]*.0722;
-  };
-  const contrast = (first: string, second: string) => {
-    const a = luminance(first), b = luminance(second);
-    return (Math.max(a,b)+.05)/(Math.min(a,b)+.05);
-  };
-  const fallback = contrast(background,"#ffffff") >= contrast(background,"#000000") ? "#ffffff" : "#000000";
-  const foreground = style.getPropertyValue("--editor-code-text").trim() || style.getPropertyValue("--editor-text").trim();
-  root.style.setProperty("--editor-code-text",contrast(background,foreground) >= 4.5 ? foreground : fallback);
-  const darkSurface = luminance(background) < .18;
-  for (const [name, light, dark] of [
-    ["keyword","#854191","#d6a4e8"], ["string","#28683e","#9bcea1"],
-    ["number","#91531a","#efbd83"], ["comment","#586b79","#b1bdc9"],
-    ["type","#7c5a19","#e7ce8b"], ["property","#17677b","#8dcbd9"],
-    ["tag","#9b4446","#f0aaad"], ["function","#24648c","#99caec"],
-    ["punctuation","#536473","#c3cbd5"]
-  ]) {
-    const color = darkSurface ? dark : light;
-    root.style.setProperty(`--editor-syntax-${name}`,contrast(background,color) >= 4.5 ? color : fallback);
-  }
-  if (typeof tokens.fontSize === "number" && Number.isFinite(tokens.fontSize) && tokens.fontSize >= 12 && tokens.fontSize <= 24) root.style.setProperty("--editor-font-size",`${tokens.fontSize}px`);
-  if (typeof tokens.spacing === "number" && Number.isFinite(tokens.spacing) && tokens.spacing >= 1.3 && tokens.spacing <= 2.4) root.style.setProperty("--editor-line-height",String(tokens.spacing));
+  applyEditorTheme(tokens);
+  // A changed style module invalidates CodeMirror's measured text geometry,
+  // including its cursor layer, without replacing document/history/selection.
+  view.dispatch({effects:themeMode.reconfigure(EditorView.theme({}))});
   view.requestMeasure();
 }
-const bridge: Bridge = { load, setReadonly, setCanRequestEdit: value => {canRequestEdit = value === true;}, restoreSelection, setTheme, setImages, insertText, setSource, setShortcuts, command, flush };
+applyEditorTheme({});
+
+const bridge: Bridge = { load, rebase, setReadonly, setCanRequestEdit: value => {canRequestEdit = value === true;}, restoreSelection, setTheme, setImages, insertText, setSource, setShortcuts, command, flush };
 if (window.__STUDYAPP_EDITOR_TEST__ === true) {
   const observedKeys: Array<{key:string;code:string;binding:string|undefined;keyCode:number;prevented:boolean}> = [];
+  // Metadata only: native smoke tests must never copy clipboard contents into
+  // diagnostic artifacts. This observer does not alter the real paste event.
+  const observedPastes: Array<{trusted:boolean;types:string[];files:Array<{type:string;size:number}>;prevented:boolean}> = [];
+  document.addEventListener("paste", event => {
+    const observed = {trusted:event.isTrusted,types:[...(event.clipboardData?.types ?? [])],files:[...(event.clipboardData?.files ?? [])].map(file => ({type:file.type,size:file.size})),prevented:false};
+    observedPastes.push(observed);
+    if (observedPastes.length > 8) observedPastes.shift();
+    queueMicrotask(() => {observed.prevented = event.defaultPrevented;});
+  }, true);
   document.addEventListener("keydown", event => {
     const observed = {key:event.key,code:event.code,binding:eventBinding(event),keyCode:event.keyCode,prevented:false};
     observedKeys.push(observed);
@@ -471,10 +523,11 @@ if (window.__STUDYAPP_EDITOR_TEST__ === true) {
     generation, revision, text: view.state.doc.toString(), normalizedText: view.state.doc.toString(),
     utf8Bytes: view.state.field(documentBudget).bytes, rawBytes: view.state.field(documentBudget).rawBytes,
     source, readonly: view.state.readOnly, composing: view.composing,
+    scrollTop: view.scrollDOM.scrollTop, scrollLeft: view.scrollDOM.scrollLeft,
     canRequestEdit,
     bindings, editorFocused:view.hasFocus,
     activeElement:document.activeElement?.tagName+"."+document.activeElement?.className,
-    observedKeys, pendingFlush,
+    observedKeys, observedPastes, pendingFlush,
     bodyClickPosition: view.posAtCoords({x:75 / devicePixelRatio,y:105 / devicePixelRatio}),
     theme: {
       mode: document.documentElement.dataset.theme,

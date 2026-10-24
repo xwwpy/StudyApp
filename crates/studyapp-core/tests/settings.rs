@@ -13,6 +13,59 @@ fn legacy_settings_supply_system_appearance_without_disk_migration() {
 }
 
 #[test]
+fn markdown_styles_load_legacy_presets_and_validate_actual_surfaces() {
+    let legacy = json!({"mode":"custom","active_preset":"paper","custom_presets":[{"id":"paper","name":"Paper","palette":{"accent":"#2478D4","background":"#ffffff","surface":"#ffffff","text":"#24272D"}}]});
+    let settings: studyapp_core::AppearanceSettings =
+        serde_json::from_value(legacy.clone()).unwrap();
+    assert!(settings.validate().is_ok());
+    assert_eq!(
+        serde_json::to_value(&settings).unwrap()["custom_presets"][0]["markdown"]["reading_width"],
+        920
+    );
+    for markdown in [
+        json!({"colors":{"quote":"#ffffff","quote_background":"#ffffff"}}),
+        json!({"colors":{"syntax_keyword":"#eeeeee","code_background":"#ffffff"}}),
+        json!({"colors":{"unknown":"#202020"}}),
+        json!({"code_size":50}),
+        json!({"reading_width":100}),
+    ] {
+        let mut bad = legacy.clone();
+        bad["custom_presets"][0]["markdown"] = markdown;
+        let parsed: studyapp_core::AppearanceSettings = serde_json::from_value(bad).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+    let mut styled = legacy;
+    styled["custom_presets"][0]["markdown"] = json!({"body_font":"serif","code_size":18,"reading_width":740,"table_stripes":true,"colors":{"heading":"#234567","code":"#102030","code_background":"#ffffff"}});
+    let parsed: studyapp_core::AppearanceSettings = serde_json::from_value(styled).unwrap();
+    assert!(parsed.validate().is_ok());
+    assert_eq!(
+        serde_json::from_value::<studyapp_core::AppearanceSettings>(
+            serde_json::to_value(&parsed).unwrap()
+        )
+        .unwrap(),
+        parsed
+    );
+}
+
+#[test]
+fn legacy_midgray_text_on_black_and_white_surfaces_remains_valid() {
+    let palette = studyapp_core::ThemePalette {
+        background: "#FFFFFF".into(),
+        surface: "#000000".into(),
+        text: "#757575".into(),
+        accent: "#808080".into(),
+    };
+    assert!(palette.validate().is_ok());
+    let style = studyapp_core::MarkdownStyle::default();
+    assert!(style.validate(&palette).is_ok());
+    for index in [0, 2, 3, 12] {
+        let value = style.resolved_colors(&palette)[index];
+        assert!(studyapp_core::theme_contrast(value, 0) >= 4.5);
+        assert!(studyapp_core::theme_contrast(value, 0xFFFFFF) >= 4.5);
+    }
+}
+
+#[test]
 fn unsafe_or_unreadable_custom_appearance_cannot_be_saved() {
     let directory = tempfile::tempdir().unwrap().keep();
     let mut engine = Engine::open(&directory.join("appearance.sqlite"), 1000).unwrap();
@@ -39,6 +92,7 @@ fn custom_theme_presets_round_trip_and_reject_missing_selection_and_duplicates()
             id: "paper".into(),
             name: "Paper".into(),
             palette: ThemePalette::default(),
+            markdown: Default::default(),
         }],
         font_size: 16,
         spacing: 12,

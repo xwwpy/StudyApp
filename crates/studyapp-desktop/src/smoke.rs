@@ -45,6 +45,14 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
     cx.spawn(async move |cx| {
         cx.background_executor().timer(Duration::from_secs(2)).await;
         #[cfg(all(windows, feature = "ui-test"))]
+        if std::env::var("WW_STUDYAPP_SMOKE_SCENARIO").as_deref() == Ok("window-drag") {
+            // Movement has its own visibility precondition; unrelated keyboard
+            // editing remains covered by the full smoke's strict first_open.
+            Box::pin(crate::smoke_window_drag::exercise(window, &view, &database, cx)).await;
+            cx.update(|cx| cx.quit());
+            return;
+        }
+        #[cfg(all(windows, feature = "ui-test"))]
         Box::pin(crate::smoke_visibility::first_open(window, &view, &database, cx)).await;
         for (index, page) in [Page::Today, Page::Notes, Page::Reviews, Page::Stats, Page::Settings].into_iter().enumerate() {
             let result = window.update(cx, |_, window, cx| {
@@ -85,6 +93,18 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
         #[cfg(feature = "ui-test")]
         {
             use gpui_kit::test::TestWindowExt;
+            #[cfg(windows)]
+            if std::env::var("WW_STUDYAPP_SMOKE_SCENARIO").as_deref() == Ok("settings") {
+                Box::pin(crate::smoke_settings::exercise(window, &view, &database, cx)).await;
+                cx.update(|cx| cx.quit());
+                return;
+            }
+            #[cfg(windows)]
+            if std::env::var("WW_STUDYAPP_SMOKE_SCENARIO").as_deref() == Ok("clipboard") {
+                Box::pin(crate::smoke_clipboard::exercise(window, &view, &database, cx)).await;
+                cx.update(|cx| cx.quit());
+                return;
+            }
             #[cfg(windows)]
             if std::env::var("WW_STUDYAPP_SMOKE_SCENARIO").as_deref() == Ok("shortcuts") {
                 Box::pin(crate::smoke_workspace::saved_shortcuts(window, &view, &database, cx)).await;
@@ -211,6 +231,8 @@ pub fn exercise(window: AnyWindowHandle, view: Entity<StudyApp>, database: PathB
             }).expect("native file drop");
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let managed_id = Box::pin(crate::smoke_editor::exercise(window, &view, &database, cx)).await;
+            #[cfg(windows)]
+            Box::pin(crate::smoke_editor::exercise_multiple_drafts(window, &view, &database, cx)).await;
             let sync_folder = database.with_file_name("sync-target");
             std::fs::create_dir(&sync_folder).unwrap();
             window.update(cx, |_, window, cx| {

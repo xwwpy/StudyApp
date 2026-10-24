@@ -1,4 +1,6 @@
 use std::{cell::Cell, rc::Rc, sync::atomic::Ordering};
+#[cfg(feature = "test-support")]
+use std::{io::Write as _, path::PathBuf, time::Instant};
 
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -31,6 +33,78 @@ pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
 pub(crate) const WM_GPUI_DISPLAYS_CHANGED: u32 = WM_USER + 10;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
+
+/// Opt-in aggregate diagnostics for the Win32 modal loop. Nothing is written
+/// while the pointer is held, so file I/O cannot distort individual samples.
+#[cfg(feature = "test-support")]
+pub(crate) struct SizeMoveTrace {
+    path: PathBuf,
+    started: Instant,
+    moves: u64,
+    move_micros: u128,
+    timers: u64,
+    runnables: u64,
+    runnable_micros: u128,
+    draws: u64,
+    pub(crate) rendered_frames: u64,
+    draw_micros: u128,
+    draw_samples: Vec<u128>,
+}
+
+#[cfg(feature = "test-support")]
+impl SizeMoveTrace {
+    fn start() -> Option<Self> {
+        let path = std::env::var_os("WW_STUDY_WINDOW_DRAG_TRACE")?;
+        Some(Self {
+            path: path.into(),
+            started: Instant::now(),
+            moves: 0,
+            move_micros: 0,
+            timers: 0,
+            runnables: 0,
+            runnable_micros: 0,
+            draws: 0,
+            rendered_frames: 0,
+            draw_micros: 0,
+            draw_samples: Vec::new(),
+        })
+    }
+
+    fn finish(mut self) {
+        let elapsed_micros = self.started.elapsed().as_micros();
+        self.draw_samples.sort_unstable();
+        let percentile = |percent: usize| {
+            self.draw_samples
+                .get(self.draw_samples.len().saturating_sub(1) * percent / 100)
+                .copied()
+                .unwrap_or(0)
+        };
+        let record = format!(
+            "{{\"elapsedMicros\":{elapsed_micros},\"moves\":{},\"moveMicros\":{},\"timers\":{},\"runnables\":{},\"runnableMicros\":{},\"draws\":{},\"renderedFrames\":{},\"drawMicros\":{},\"drawMedianMicros\":{},\"drawP95Micros\":{},\"drawMaxMicros\":{}}}\n",
+            self.moves,
+            self.move_micros,
+            self.timers,
+            self.runnables,
+            self.runnable_micros,
+            self.draws,
+            self.rendered_frames,
+            self.draw_micros,
+            percentile(50),
+            percentile(95),
+            percentile(100),
+        );
+        match std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.path)
+        {
+            Ok(mut file) => {
+                let _ = file.write_all(record.as_bytes());
+            }
+            Err(error) => log::warn!("unable to write window drag trace: {error}"),
+        }
+    }
+}
 
 /// Coordinates window draws on the UI thread. Owned by the platform and
 /// shared with every window (like `WindowsPlatformState::cursor_visible`),
@@ -172,6 +246,13 @@ impl WindowsWindowInner {
     }
 
     fn handle_move_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+        #[cfg(feature = "test-support")]
+        let trace_started = self
+            .state
+            .size_move_trace
+            .borrow()
+            .as_ref()
+            .map(|_| Instant::now());
         let origin = logical_point(
             lparam.signed_loword() as f32,
             lparam.signed_hiword() as f32,
@@ -201,6 +282,13 @@ impl WindowsWindowInner {
         if let Some(mut callback) = self.state.callbacks.moved.take() {
             callback();
             self.state.callbacks.moved.set(Some(callback));
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(started) = trace_started
+            && let Some(trace) = self.state.size_move_trace.borrow_mut().as_mut()
+        {
+            trace.moves += 1;
+            trace.move_micros += started.elapsed().as_micros();
         }
         Some(0)
     }
@@ -277,6 +365,10 @@ impl WindowsWindowInner {
     }
 
     fn handle_size_move_loop(&self, handle: HWND) -> Option<isize> {
+        #[cfg(feature = "test-support")]
+        {
+            *self.state.size_move_trace.borrow_mut() = SizeMoveTrace::start();
+        }
         unsafe {
             let ret = SetTimer(
                 Some(handle),
@@ -298,14 +390,39 @@ impl WindowsWindowInner {
         unsafe {
             KillTimer(Some(handle), SIZE_MOVE_LOOP_TIMER_ID).log_err();
         }
+        #[cfg(feature = "test-support")]
+        if let Some(trace) = self.state.size_move_trace.take() {
+            trace.finish();
+        }
         None
     }
 
     fn handle_timer_msg(&self, handle: HWND, wparam: WPARAM) -> Option<isize> {
         if wparam.0 == SIZE_MOVE_LOOP_TIMER_ID {
+            #[cfg(feature = "test-support")]
+            let trace_started = self
+                .state
+                .size_move_trace
+                .borrow()
+                .as_ref()
+                .map(|_| Instant::now());
+            #[cfg(feature = "test-support")]
+            let mut count = 0;
             let mut runnables = self.main_receiver.clone().try_iter();
             while let Some(Ok(runnable)) = runnables.next() {
                 WindowsDispatcher::execute_runnable(runnable);
+                #[cfg(feature = "test-support")]
+                {
+                    count += 1;
+                }
+            }
+            #[cfg(feature = "test-support")]
+            if let Some(started) = trace_started
+                && let Some(trace) = self.state.size_move_trace.borrow_mut().as_mut()
+            {
+                trace.timers += 1;
+                trace.runnables += count;
+                trace.runnable_micros += started.elapsed().as_micros();
             }
             self.handle_paint_msg(handle)
         } else {
@@ -1176,8 +1293,10 @@ impl WindowsWindowInner {
                     && WindowFromPoint(point) == handle
                     && ScreenToClient(handle, &mut point).as_bool()
                     && GetClientRect(handle, &mut client).is_ok()
-                    && point.x >= client.left && point.x < client.right
-                    && point.y >= client.top && point.y < client.bottom)
+                    && point.x >= client.left
+                    && point.x < client.right
+                    && point.y >= client.top
+                    && point.y < client.bottom)
         };
         if previous != cursor && owns_pointer && unsafe { IsWindowEnabled(handle).as_bool() } {
             let visible = self.state.cursor_visible.load(Ordering::Relaxed);
@@ -1334,6 +1453,13 @@ impl WindowsWindowInner {
 
     #[inline]
     fn draw_window(&self, handle: HWND, force_render: bool) -> Option<isize> {
+        #[cfg(feature = "test-support")]
+        let trace_started = self
+            .state
+            .size_move_trace
+            .borrow()
+            .as_ref()
+            .map(|_| Instant::now());
         let Some(_guard) = self.state.draw_coordinator.try_begin_draw() else {
             log::debug!("deferring re-entrant draw of window {handle:?}");
             if force_render {
@@ -1382,6 +1508,18 @@ impl WindowsWindowInner {
         self.state.callbacks.request_frame.set(Some(request_frame));
         self.update_ime_enabled(handle);
         unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+
+        #[cfg(feature = "test-support")]
+        if let Some(started) = trace_started
+            && let Some(trace) = self.state.size_move_trace.borrow_mut().as_mut()
+        {
+            let elapsed = started.elapsed().as_micros();
+            trace.draws += 1;
+            trace.draw_micros += elapsed;
+            if trace.draw_samples.len() < 4096 {
+                trace.draw_samples.push(elapsed);
+            }
+        }
 
         Some(0)
     }

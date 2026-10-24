@@ -18,7 +18,14 @@ under Apache-2.0. The original `LICENSE-APACHE` is included.
 
 In `src/menu/menu_item.rs`, `MenuItemElement::render` applies an arrow cursor
 after instance styling, then replaces it with a pointing hand when the row is
-enabled. This is the only behavioral modification.
+enabled.
+
+`PopupMenuLayout` additionally reports the actual popup and active submenu
+rectangles. The native WebView host clips only those rounded surfaces instead
+of hiding the complete document whenever a menu opens. Layout reports are
+coalesced, inactive submenu regions are removed, and dismissal resets reports
+so reopening a retained menu publishes its regions again. Existing activation,
+keyboard navigation and dismissal semantics remain unchanged.
 
 The cursor covers the complete row, including its padding, for ordinary
 actions, custom items and submenu triggers. Disabled rows, labels and

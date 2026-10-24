@@ -63,13 +63,29 @@ jobs:
           cache-on-failure: true
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace --all-features
+      - name: Verify safe updater handoff and rollback (PowerShell 5.1)
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-update-helper.ps1 -FixtureDirectory $env:RUNNER_TEMP -RequireReparseFixture
+          if ($LASTEXITCODE -ne 0) { throw 'Updater regression tests failed' }
       - run: cargo build --locked -p studyapp-desktop --features ui-test
       - name: Exercise native window and capture five pages
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           $smokeDir = Join-Path $env:RUNNER_TEMP ('studyapp-smoke-' + [guid]::NewGuid().ToString('N'))
           "SMOKE_DIR=$smokeDir" >> $env:GITHUB_ENV
           ./scripts/smoke.ps1 -DataDirectory $smokeDir
+      - name: Verify native window movement
+        timeout-minutes: 2
+        run: |
+          $dragDir = Join-Path $env:RUNNER_TEMP ('studyapp-window-drag-' + [guid]::NewGuid().ToString('N'))
+          "DRAG_DIR=$dragDir" >> $env:GITHUB_ENV
+          ./scripts/smoke-window-drag.ps1 -DataDirectory $dragDir -BinaryPath ./target/debug/studyapp.exe
+      - name: Verify real Windows image clipboard
+        timeout-minutes: 4
+        run: |
+          $clipboardDir = Join-Path $env:RUNNER_TEMP ('studyapp-clipboard-' + [guid]::NewGuid().ToString('N'))
+          "CLIPBOARD_DIR=$clipboardDir" >> $env:GITHUB_ENV
+          ./scripts/smoke-clipboard.ps1 -DataDirectory $clipboardDir
       - name: Preserve native screenshots and result
         if: always() && env.SMOKE_DIR != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -86,9 +102,20 @@ jobs:
             ${{ env.SMOKE_DIR }}/workspace-smoke-result.txt
             ${{ env.SMOKE_DIR }}/native-shortcut-settings-result.txt
             ${{ env.SMOKE_DIR }}/native-image-smoke-result.txt
+            ${{ env.SMOKE_DIR }}/native-multiple-drafts-result.txt
+            ${{ env.SMOKE_DIR }}/native-save-view-result.txt
             ${{ env.SMOKE_DIR }}/settings-capture-smoke-result.txt
             ${{ env.SMOKE_DIR }}/workspace-drag-performance.json
             ${{ env.SMOKE_DIR }}/workspace-saved-layout.json
+            ${{ env.SMOKE_DIR }}/settings-*.png
+            ${{ env.SMOKE_DIR }}/settings-render-timing.json
             ${{ env.SMOKE_DIR }}/*.log
+            ${{ env.DRAG_DIR }}/window-drag-*
+            ${{ env.DRAG_DIR }}/window-controls-result.txt
+            ${{ env.DRAG_DIR }}.jsonl
+            ${{ env.DRAG_DIR }}.*.log
+            ${{ env.CLIPBOARD_DIR }}/clipboard-evidence.json
+            ${{ env.CLIPBOARD_DIR }}/native-clipboard.bmp
+            ${{ env.CLIPBOARD_DIR }}/*.log
           if-no-files-found: warn
           retention-days: 14

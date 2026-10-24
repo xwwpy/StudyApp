@@ -6,11 +6,12 @@ use gpui_kit::{
 };
 use std::{
     cell::RefCell,
+    collections::BTreeMap,
     rc::Rc,
     time::{Duration, Instant},
 };
 
-/// Actual card rectangles plus shadow, in the parent window's logical pixels.
+/// Opaque card rectangles in the parent window's logical pixels, without shadows.
 #[derive(Clone, Debug)]
 pub struct NotificationOcclusions(pub Vec<Bounds<Pixels>>);
 
@@ -19,6 +20,7 @@ pub struct NotificationCenter {
     epoch: Instant,
     timer: Option<Task<()>>,
     occlusions: Vec<Bounds<Pixels>>,
+    scrolls: BTreeMap<u64, ScrollHandle>,
     #[cfg(feature = "ui-test")]
     test_time: Option<Duration>,
 }
@@ -32,6 +34,7 @@ impl NotificationCenter {
             epoch: Instant::now(),
             timer: None,
             occlusions: Vec::new(),
+            scrolls: BTreeMap::new(),
             #[cfg(feature = "ui-test")]
             test_time: None,
         }
@@ -179,6 +182,11 @@ mod tests {
 impl Render for NotificationCenter {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = self.now();
+        self.scrolls
+            .retain(|id, _| self.queue.visible().any(|notice| notice.id == *id));
+        for notice in self.queue.visible() {
+            self.scrolls.entry(notice.id).or_default();
+        }
         let palette = crate::theme::palette();
         let available = (window.viewport_size().width - px(32.)).max(px(0.));
         let font_size = px((palette.font_size as f32 - 1.).max(12.));
@@ -192,9 +200,7 @@ impl Render for NotificationCenter {
             .id("floating-notice")
             .test_support()
             .absolute()
-            // Reserve the application and library/editor action rows. Long
-            // notices still grow with their content without covering menus.
-            .top(px(144.))
+            .top(px(crate::window_chrome::TITLE_BAR_HEIGHT + 12.))
             .left_0()
             .w_full()
             .items_center()
@@ -236,6 +242,7 @@ impl Render for NotificationCenter {
                     .id(SharedString::from(format!("notice-{id}")))
                     .test_support()
                     .occlude()
+                    .flex_shrink_0()
                     .w(width)
                     .min_h(px(40.))
                     .px_2()
@@ -245,7 +252,7 @@ impl Render for NotificationCenter {
                     .border_1()
                     .border_color(rgb(palette.border))
                     .bg(rgb(palette.surface))
-                    .shadow_md()
+                    .shadow_sm()
                     .min_w_0()
                     .opacity(opacity)
                     .relative()
@@ -263,22 +270,24 @@ impl Render for NotificationCenter {
                             .child(icon),
                     )
                     .child(
-                        div()
-                            .id(if index == 0 {
+                        scroll_body(
+                            if index == 0 {
                                 SharedString::from("notice-message-scroll")
                             } else {
                                 SharedString::from(format!("notice-message-{id}"))
-                            })
-                            .test_support()
-                            .flex_1()
-                            .min_w_0()
-                            .max_h(px(164.))
-                            .overflow_y_scroll()
-                            .text_size(font_size)
-                            .line_height(px(20.))
-                            .text_color(rgb(palette.text))
-                            .child(message.clone())
-                            .on_scroll_wheel(|_, _, cx| cx.stop_propagation()),
+                            },
+                            &self.scrolls[&id],
+                        )
+                        .test_support()
+                        .flex_1()
+                        .min_w_0()
+                        .max_h(px(164.))
+                        .pr_2()
+                        .text_size(font_size)
+                        .line_height(px(20.))
+                        .text_color(rgb(palette.text))
+                        .child(message.clone())
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation()),
                     )
                     .child(
                         Button::new(if index == 0 {
@@ -306,10 +315,7 @@ impl Render for NotificationCenter {
                                 // Reserve the real visual footprint, not the entire
                                 // centered overlay row, so the rest of the editor remains
                                 // visible and receives native pointer events.
-                                card_bounds.borrow_mut().push(Bounds::new(
-                                    point(bounds.origin.x - px(10.), bounds.origin.y - px(10.)),
-                                    size(bounds.size.width + px(20.), bounds.size.height + px(20.)),
-                                ));
+                                card_bounds.borrow_mut().push(bounds);
                             },
                             |_, _, _, _| {},
                         )

@@ -1,4 +1,4 @@
-import { EditorState, Extension, Facet, StateField, Text, Transaction } from "@codemirror/state";
+import { EditorState, Extension, Facet, StateEffect, StateField, Text, Transaction } from "@codemirror/state";
 import { incompleteScalars, scalarText, splitsScalar } from "./unicode";
 
 export const MAX_DOCUMENT_BYTES = 10 * 1024 * 1024;
@@ -13,6 +13,7 @@ interface Budget {
 }
 const initialBudget = Facet.define<Budget, Budget>({ combine: values => values[0] });
 const estimates = new WeakMap<Transaction, Budget>();
+const rebasedBudget = StateEffect.define<Budget>();
 
 export function stringBytes(value: string): number { return encoder.encode(value).length; }
 
@@ -74,10 +75,11 @@ function estimate(transaction: Transaction): Budget {
 
 export const documentBudget = StateField.define<Budget>({
   create: state => state.facet(initialBudget),
-  update: (budget, transaction) => transaction.docChanged ? estimate(transaction) : budget
+  update: (budget, transaction) => transaction.effects.find(effect => effect.is(rebasedBudget))?.value
+    ?? (transaction.docChanged ? estimate(transaction) : budget)
 });
 
-export function documentLimits(rawText: string, rejected: (message: string) => void, accepted: () => void): Extension {
+function budgetFor(rawText: string): Budget {
   const newlineWidths: number[] = [];
   let crlf = 0, lf = 0, cr = 0;
   for (const match of rawText.matchAll(/\r\n|\r|\n/g)) {
@@ -88,8 +90,16 @@ export function documentLimits(rawText: string, rejected: (message: string) => v
   }
   const rawBytes = stringBytes(rawText);
   const preferredWidth = crlf > 0 && crlf >= lf && crlf >= cr ? 2 : 1;
+  return { bytes: rawBytes - crlf, rawBytes, newlineWidths, preferredWidth, patches: 0 };
+}
+
+export function resetDocumentBudget(rawText: string): StateEffect<Budget> {
+  return rebasedBudget.of(budgetFor(rawText));
+}
+
+export function documentLimits(rawText: string, rejected: (message: string) => void, accepted: () => void): Extension {
   return [
-    initialBudget.of({ bytes: rawBytes - crlf, rawBytes, newlineWidths, preferredWidth, patches: 0 }),
+    initialBudget.of(budgetFor(rawText)),
     documentBudget,
     EditorState.transactionFilter.of(transaction => {
       if (!transaction.docChanged || transaction.startState.readOnly) return transaction;

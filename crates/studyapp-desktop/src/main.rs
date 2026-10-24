@@ -11,8 +11,10 @@ mod editor_lifecycle;
 mod external_drop;
 mod external_drop_ui;
 mod feedback;
+mod folder_picker;
 mod folders_ui;
 mod history_preview;
+mod image_cloud;
 mod imports;
 mod markdown_editor;
 mod media;
@@ -24,11 +26,16 @@ mod note_editor;
 mod notes_view;
 mod notice_queue;
 mod notifications;
+mod overlay_regions;
 mod preferences;
 mod resize_overlay;
+mod settings_cache;
+mod settings_components;
 mod settings_ui;
 mod shortcuts;
 mod smoke;
+#[cfg(all(windows, feature = "ui-test"))]
+mod smoke_clipboard;
 #[cfg(feature = "ui-test")]
 mod smoke_editor;
 #[cfg(all(windows, feature = "ui-test"))]
@@ -40,15 +47,20 @@ mod smoke_settings;
 #[cfg(all(windows, feature = "ui-test"))]
 mod smoke_visibility;
 #[cfg(all(windows, feature = "ui-test"))]
+mod smoke_window_drag;
+#[cfg(all(windows, feature = "ui-test"))]
 mod smoke_workspace;
 mod storage_backend;
 mod storage_ui;
 mod sync_runtime;
 mod sync_ui;
 mod theme;
+mod update_backend;
+mod update_ui;
 mod views;
 #[cfg(windows)]
 mod web_editor_host;
+mod window_chrome;
 mod worker;
 mod workspace_layout;
 
@@ -121,8 +133,10 @@ fn run() -> anyhow::Result<()> {
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
                     title: Some("WW-StudyApp".into()),
+                    appears_transparent: true,
                     ..Default::default()
                 }),
+                app_owns_titlebar_drag: true,
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
                     size(px(1280.), px(860.)),

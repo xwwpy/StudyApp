@@ -2,7 +2,7 @@ use crate::controls::Button;
 use crate::{
     app::{Page, StudyApp},
     components::*,
-    drafts::NoteDraft,
+    drafts::{DraftRecord, DraftStatus},
     markdown_editor::MarkdownEvent,
 };
 use gpui_kit::{
@@ -16,32 +16,49 @@ use studyapp_core::Command;
 pub enum NoteIntent {
     Save { copy: bool },
     Keep,
+    New(Option<String>),
+    OpenDraft(String),
+    ViewNote(String, Option<String>, bool),
+    Filter(crate::folders_ui::FolderFilter),
+    Navigate(Page),
+    Commit,
+    Saved(String),
     Discard,
     SwitchLibrary,
     PrepareMigration,
+    DeferredWork,
     Close,
 }
 
 #[derive(Clone)]
 pub enum NoteConfirmation {
-    DiscardDraft,
+    DiscardDraft(String),
     Unmanage(String),
 }
 
 pub struct DiscardPending {
     pub token: u64,
     pub library: String,
-    pub draft: Option<NoteDraft>,
+    pub id: String,
+    pub revision: u64,
+    pub original: DraftRecord,
 }
 pub struct PersistPending {
     pub token: u64,
     pub library: String,
+    pub id: String,
+    pub revision: u64,
     pub intent: NoteIntent,
 }
 
 impl StudyApp {
     pub fn mark_note_dirty(&mut self) {
-        if self.note_editor.is_some() && self.draft_discard.is_none() {
+        if self.note_editor.is_some()
+            && self
+                .draft_discard
+                .as_ref()
+                .is_none_or(|pending| self.active_draft_id.as_ref() != Some(&pending.id))
+        {
             self.draft_dirty_since
                 .get_or_insert_with(std::time::Instant::now);
         }
@@ -55,7 +72,7 @@ impl StudyApp {
     ) {
         if self.note_editor.is_none()
             || self.storage_busy
-            || self.note_saving
+            || (self.note_saving && !matches!(intent, NoteIntent::Commit))
             || self.media_busy()
             || self.draft_discard.is_some()
             || (self.confirmation.is_some()
@@ -74,6 +91,8 @@ impl StudyApp {
             Ok(request) => self.note_intent = Some((request, intent)),
             Err(error) => {
                 self.note_saving = false;
+                self.close_requested = false;
+                self.pending_update = None;
                 self.push_notice(Err(error.to_string()), cx);
             }
         }
@@ -88,8 +107,16 @@ impl StudyApp {
     ) {
         match event {
             MarkdownEvent::RequestInsertImage => self.request_insert_image(window, cx),
-            MarkdownEvent::PasteImage { name, mime, base64 } => {
-                self.paste_editor_image(name, mime, base64, window, cx);
+            MarkdownEvent::RequestNativeImagePaste { generation } => {
+                self.paste_native_image(generation, window, cx);
+            }
+            MarkdownEvent::PasteImage {
+                generation,
+                name,
+                mime,
+                base64,
+            } => {
+                self.paste_editor_image(generation, name, mime, base64, window, cx);
             }
             MarkdownEvent::ExternalDrag { phase, paths } => {
                 self.handle_external_drag(phase, paths, window, cx);
@@ -126,8 +153,10 @@ impl StudyApp {
             }
             MarkdownEvent::Error(error) => {
                 self.note_intent = None;
-                self.note_saving = false;
+                self.note_saving = self.pending_note_save.is_some();
                 self.close_requested = false;
+                self.pending_update = None;
+                self.cancel_draft_retention();
                 self.push_notice(Err(error), cx);
                 cx.notify();
             }
@@ -145,28 +174,37 @@ impl StudyApp {
                     NoteIntent::Save { copy } => {
                         self.begin_save_images(copy, window, cx);
                     }
+                    NoteIntent::Commit => self.commit_note(cx),
                     NoteIntent::Discard => {
                         self.note_saving = false;
                         self.begin_discard(window, cx);
                     }
-                    NoteIntent::Keep
-                    | NoteIntent::SwitchLibrary
-                    | NoteIntent::Close
-                    | NoteIntent::PrepareMigration => {
-                        static NEXT_PERSIST: AtomicU64 = AtomicU64::new(1);
-                        let token = NEXT_PERSIST.fetch_add(1, Ordering::Relaxed);
-                        self.draft_persist = Some(PersistPending {
-                            token,
-                            library: self.last_library.clone(),
-                            intent,
-                        });
-                        self.drafts
-                            .persist(&self.last_library, self.note_editor.clone(), token);
-                    }
+                    intent => self.begin_draft_retention(intent, window, cx),
                 }
                 cx.notify();
             }
         }
+    }
+
+    pub(crate) fn persist_record_intent(
+        &mut self,
+        record: DraftRecord,
+        intent: NoteIntent,
+        cx: &mut Context<Self>,
+    ) {
+        static NEXT_PERSIST: AtomicU64 = AtomicU64::new(1);
+        let token = NEXT_PERSIST.fetch_add(1, Ordering::Relaxed);
+        self.draft_persist = Some(PersistPending {
+            token,
+            library: self.last_library.clone(),
+            id: record.id.clone(),
+            revision: record.revision,
+            intent,
+        });
+        self.note_saving = true;
+        self.drafts
+            .persist_record(&self.last_library, record, token);
+        cx.notify();
     }
 
     pub fn finish_draft_persist(
@@ -178,37 +216,175 @@ impl StudyApp {
         self.note_saving = false;
         self.draft_failed = false;
         self.confirmation = None;
+        if matches!(intent, NoteIntent::Close) && !self.close_requested {
+            self.note_content
+                .update(cx, |editor, cx| editor.set_readonly(false, cx));
+            return;
+        }
+        if matches!(intent, NoteIntent::Close)
+            && self.guard_settings(crate::settings_ui::SettingsContinuation::Close, cx)
+        {
+            self.close_requested = false;
+            self.pending_update = None;
+            self.note_content
+                .update(cx, |editor, cx| editor.set_readonly(false, cx));
+            return;
+        }
+        if matches!(intent, NoteIntent::Commit) {
+            self.finish_commit_note(cx);
+            return;
+        }
+        if let NoteIntent::Saved(note_id) = intent {
+            self.note_editor = None;
+            self.active_draft_id = None;
+            self.selected_note = Some(note_id.clone());
+            self.selected_version = None;
+            self.show_detached = false;
+            self.reader_key = self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot
+                        .versions
+                        .iter()
+                        .rev()
+                        .find(|version| {
+                            version.note_id == note_id
+                                && version.content == self.note_content.read(cx).value()
+                        })
+                        .map(|version| version.id.clone())
+                })
+                .unwrap_or_default();
+            self.refresh_recoverable();
+            if self.page != Page::Settings {
+                self.page = Page::Notes;
+            }
+            self.finish_library_transition(window, cx);
+            return;
+        }
+        self.note_editor = None;
+        self.active_draft_id = None;
+        self.reader_key.clear();
+        self.refresh_recoverable();
         match intent {
-            NoteIntent::Keep => {
-                self.recoverable_draft = self.note_editor.take();
-                self.reader_key.clear();
-                self.finish_library_transition(window, cx);
+            NoteIntent::Keep => self.finish_library_transition(window, cx),
+            NoteIntent::New(folder) => self.start_new_draft(folder, window, cx),
+            NoteIntent::OpenDraft(id) => self.open_draft(id, window, cx),
+            NoteIntent::ViewNote(id, version, history) => {
+                self.select_note_document(id, version, history, window, cx)
             }
-            NoteIntent::SwitchLibrary => {
-                self.note_editor = None;
-                self.recoverable_draft = None;
-                self.finish_library_transition(window, cx);
-            }
-            NoteIntent::PrepareMigration => {
-                self.recoverable_draft = self.note_editor.take();
-                self.reader_key.clear();
-                self.pick_migration(window, cx);
-            }
+            NoteIntent::Filter(filter) => self.select_folder_document(filter, window, cx),
+            NoteIntent::Navigate(page) => self.navigate(page, window, cx),
+            NoteIntent::SwitchLibrary
+            | NoteIntent::PrepareMigration
+            | NoteIntent::DeferredWork
+            | NoteIntent::Close => self.begin_draft_drain(intent, cx),
+            _ => {}
+        }
+    }
+    pub(crate) fn begin_draft_drain(&mut self, intent: NoteIntent, cx: &mut Context<Self>) {
+        if self.draft_close_drain.is_some() {
+            return;
+        }
+        static NEXT_DRAIN: AtomicU64 = AtomicU64::new(1);
+        let token = NEXT_DRAIN.fetch_add(1, Ordering::Relaxed);
+        self.draft_close_drain = Some(token);
+        self.draft_drain_intent = Some(intent);
+        self.drafts.drain(&self.last_library, token);
+        cx.notify();
+    }
+    pub(crate) fn finish_draft_drain(
+        &mut self,
+        intent: NoteIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match intent {
             NoteIntent::Close => {
-                if self.guard_settings(crate::settings_ui::SettingsContinuation::Close, cx) {
-                    self.close_requested = false;
+                if !self.close_requested {
                     return;
                 }
-                self.close_allowed = true;
-                window.remove_window();
+                if self.guard_settings(crate::settings_ui::SettingsContinuation::Close, cx) {
+                    self.close_requested = false;
+                    self.pending_update = None;
+                } else {
+                    self.complete_close(window, cx);
+                }
+            }
+            NoteIntent::SwitchLibrary => self.finish_library_transition(window, cx),
+            NoteIntent::PrepareMigration => self.pick_migration(window, cx),
+            NoteIntent::DeferredWork => {
+                if let Some((library, work)) = self.draft_deferred_work.take() {
+                    self.draft_work_ready = true;
+                    self.accept_picker_result(library, work, cx);
+                    self.draft_work_ready = false;
+                }
             }
             _ => {}
         }
+    }
+    pub(crate) fn select_note_document(
+        &mut self,
+        id: String,
+        version: Option<String>,
+        history: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.note_saving || self.storage_busy || self.media_busy() {
+            return;
+        }
+        if self.note_editor.is_some() {
+            if self
+                .note_editor
+                .as_ref()
+                .is_some_and(|d| d.note_id.as_ref() == Some(&id))
+                && !history
+                && version.is_none()
+            {
+                return;
+            }
+            self.request_note_action(NoteIntent::ViewNote(id, version, history), window, cx);
+            return;
+        }
+        self.folders.update(cx, |panel, cx| {
+            panel.align_note_context(&id, cx);
+        });
+        self.selected_note = Some(id);
+        self.selected_version = version;
+        self.history = history;
+        self.page = Page::Notes;
+        cx.notify();
+    }
+    pub(crate) fn select_folder_document(
+        &mut self,
+        filter: crate::folders_ui::FolderFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.note_editor.is_some() {
+            self.request_note_action(NoteIntent::Filter(filter), window, cx);
+            return;
+        }
+        self.selected_note = if matches!(filter, crate::folders_ui::FolderFilter::Drafts) {
+            None
+        } else {
+            self.snapshot.as_ref().and_then(|s| {
+                s.notes
+                    .iter()
+                    .find(|n| n.detached == self.show_detached && filter.matches(n))
+                    .map(|n| n.id.clone())
+            })
+        };
+        self.selected_version = None;
+        self.history = false;
+        cx.notify();
     }
 
     pub fn finish_library_transition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.note_editor.is_none()
             && self.draft_discard.is_none()
+            && self.pending_update.is_none()
             && self.draft_persist.is_none()
             && let Some((snapshot, replaced)) = self.pending_library.take()
         {
@@ -223,14 +399,6 @@ impl StudyApp {
         if self.guard_settings(crate::settings_ui::SettingsContinuation::Close, cx) {
             return false;
         }
-        if !self.note_content.read(cx).creating()
-            && !self.storage_busy
-            && !self.media_busy()
-            && self.note_editor.is_none()
-            && self.draft_discard.is_none()
-        {
-            return true;
-        }
         self.close_requested = true;
         self.continue_close(window, cx);
         false
@@ -240,10 +408,13 @@ impl StudyApp {
         if !self.close_requested
             || self.close_allowed
             || self.note_saving
+            || self.draft_persist.is_some()
+            || self.draft_close_drain.is_some()
             || self.media_busy()
             || self.draft_discard.is_some()
             || self.note_content.read(cx).creating()
             || self.storage_busy
+            || self.image_cloud_busy
             || self.preferences_ui.busy
             || self.preferences_ui.leave.is_some()
         {
@@ -256,12 +427,26 @@ impl StudyApp {
                 self.close_requested = false;
                 return;
             }
-            self.close_allowed = true;
-            window.remove_window();
+            self.begin_draft_drain(NoteIntent::Close, cx);
         }
     }
 
     pub fn begin_discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self
+            .active_draft_id
+            .clone()
+            .or_else(|| self.recoverable_draft_id());
+        if let Some(id) = id {
+            self.begin_discard_id(id, window, cx);
+        }
+    }
+
+    pub(crate) fn begin_discard_id(
+        &mut self,
+        id: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.storage_busy
             || self.note_saving
             || self.media_busy()
@@ -270,30 +455,33 @@ impl StudyApp {
         {
             return;
         }
+        let Some(original) = self
+            .draft_catalog
+            .get(&id)
+            .filter(|record| record.active())
+            .cloned()
+        else {
+            return;
+        };
+        let mut deleted = original.clone();
+        deleted.retire(DraftStatus::Deleted, chrono::Utc::now().timestamp_millis());
         static NEXT_DISCARD: AtomicU64 = AtomicU64::new(1);
         let token = NEXT_DISCARD.fetch_add(1, Ordering::Relaxed);
-        let draft = self
-            .note_editor
-            .take()
-            .or_else(|| self.recoverable_draft.take());
-        if draft.is_none() {
-            return;
-        }
         self.draft_discard = Some(DiscardPending {
             token,
             library: self.last_library.clone(),
-            draft,
+            id: id.clone(),
+            revision: deleted.revision,
+            original,
         });
-        self.recoverable_draft = None;
-        self.draft_dirty_since = None;
-        // Remove draft ownership before resetting inputs; blur and delayed IPC
-        // cannot enqueue another save or revive the discarded document.
-        self.note_content.update(cx, |editor, cx| {
-            editor.set_visible(false, cx);
-            editor.set_value(String::new(), window, cx);
-        });
-        self.reader_key.clear();
-        self.drafts.discard(&self.last_library, token);
+        self.draft_catalog.insert(id, deleted.clone());
+        if self.active_draft_id.as_ref() == Some(&deleted.id) {
+            self.draft_dirty_since = None;
+            self.note_content
+                .update(cx, |editor, cx| editor.set_readonly(true, cx));
+        }
+        self.drafts
+            .persist_record(&self.last_library, deleted, token);
         cx.notify();
     }
 
@@ -302,10 +490,12 @@ impl StudyApp {
             return;
         }
         match self.confirmation.take() {
-            Some(NoteConfirmation::DiscardDraft) if self.note_editor.is_some() => {
+            Some(NoteConfirmation::DiscardDraft(id))
+                if self.note_editor.is_some() && self.active_draft_id.as_ref() == Some(&id) =>
+            {
                 self.request_note_action(NoteIntent::Discard, window, cx)
             }
-            Some(NoteConfirmation::DiscardDraft) => self.begin_discard(window, cx),
+            Some(NoteConfirmation::DiscardDraft(id)) => self.begin_discard_id(id, window, cx),
             Some(NoteConfirmation::Unmanage(note_id)) => {
                 self.send(Command::UnmanageNote { note_id }, cx);
             }
@@ -317,11 +507,17 @@ impl StudyApp {
     /// Dialog content only; the window-level shell owns blocking and focus.
     pub fn confirmation_view(&self, cx: &mut Context<Self>) -> Div {
         let message = match self.confirmation.as_ref() {
-            Some(NoteConfirmation::DiscardDraft) => {
-                "删除这份未保存的草稿？原笔记文件和已保存的历史版本会保留。"
+            Some(NoteConfirmation::DiscardDraft(id)) => {
+                let title = self
+                    .draft_catalog
+                    .get(id)
+                    .map(|record| record.draft.title.as_str())
+                    .unwrap_or("未命名草稿");
+                format!("删除草稿「{title}」？原笔记文件和已保存的历史版本会保留。")
             }
             Some(NoteConfirmation::Unmanage(_)) => {
                 "取消管理这份笔记？将停止扫描和同步，磁盘文件、历史版本及学习复习记录会保留。"
+                    .into()
             }
             None => return div(),
         };
@@ -359,11 +555,10 @@ impl StudyApp {
         let mut show = self.page == Page::Notes
             && self.confirmation.is_none()
             && self.storage_confirm.is_none()
-            && !self.folders.read(cx).overlay_open()
+            && !self.folders.read(cx).dialog_open()
             && self.preferences_ui.leave.is_none()
             && !self.preferences_ui.reset_confirmation
-            && self.draft_discard.is_none()
-            && self.active_note_menu.is_none();
+            && self.draft_discard.is_none();
         show &= !self.external_drop.active();
         if self.note_editor.is_none() {
             let version = self.snapshot.as_ref().and_then(|s| {
@@ -396,7 +591,6 @@ impl StudyApp {
             && !self.storage_busy
             && !self.draft_loading
             && !self.draft_failed
-            && self.recoverable_draft.is_none()
             && self.snapshot.as_ref().is_some_and(|snapshot| {
                 snapshot.notes.iter().any(|note| {
                     Some(&note.id) == self.selected_note.as_ref()

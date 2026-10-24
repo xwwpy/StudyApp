@@ -3064,8 +3064,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre"
 version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34f61c1cfd36fc9c436af09308c963822ae27a45a84feb21a77ba5c9e051f1c0"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -7645,8 +7643,11 @@ dependencies = [
  "pulldown-cmark",
  "reqwest",
  "rfd",
+ "semver",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "similar",
  "studyapp-core",
  "studyapp-sync",
  "tempfile",
@@ -7662,6 +7663,8 @@ dependencies = [
 name = "studyapp-sync"
 version = "0.6.0"
 dependencies = [
+ "chrono",
+ "hmac",
  "percent-encoding",
  "quick-xml",
  "reqwest",

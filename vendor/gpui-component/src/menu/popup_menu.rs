@@ -279,6 +279,11 @@ impl PopupMenuItem {
     }
 }
 
+/// Actual popup rectangles, including only the currently visible submenu chain.
+/// Native child-window hosts use this to keep their document visible behind menus.
+#[derive(Clone, Debug)]
+pub struct PopupMenuLayout(pub Vec<Bounds<Pixels>>);
+
 pub struct PopupMenu {
     pub(crate) focus_handle: FocusHandle,
     pub(crate) menu_items: Vec<PopupMenuItem>,
@@ -298,6 +303,9 @@ pub struct PopupMenu {
     max_width: Option<Pixels>,
     max_height: Option<Pixels>,
     bounds: Bounds<Pixels>,
+    child_bounds: Vec<Bounds<Pixels>>,
+    child_id: Option<gpui::EntityId>,
+    reported_bounds: Vec<Bounds<Pixels>>,
     size: Size,
     check_side: Side,
 
@@ -345,6 +353,9 @@ impl PopupMenu {
             max_height: None,
             check_side: Side::Left,
             bounds: Bounds::default(),
+            child_bounds: Vec::new(),
+            child_id: None,
+            reported_bounds: Vec::new(),
             scrollable: false,
             scroll_handle: ScrollHandle::default(),
             external_link_icon: true,
@@ -840,6 +851,38 @@ impl PopupMenu {
         None
     }
 
+    fn publish_layout(&mut self, cx: &mut Context<Self>) {
+        let active_id = self.active_submenu().map(|menu| menu.entity_id());
+        if active_id != self.child_id {
+            self.child_id = active_id;
+            self.child_bounds.clear();
+        }
+        let mut bounds = Vec::new();
+        if self.bounds.size.width > px(0.) && self.bounds.size.height > px(0.) {
+            bounds.push(self.bounds);
+        }
+        bounds.extend_from_slice(&self.child_bounds);
+        if bounds != self.reported_bounds {
+            self.reported_bounds = bounds.clone();
+            cx.emit(PopupMenuLayout(bounds.clone()));
+        }
+        // A retained submenu may reopen at exactly the same coordinates after
+        // the parent has cleared its inactive child region. Always restore that
+        // active relationship; local event deduplication cannot skip propagation.
+        if let Some(parent) = self.parent_menu.clone() {
+            let child_id = cx.entity_id();
+            let _ = parent.update(cx, |parent, cx| {
+                if parent.active_submenu().is_some_and(|menu| menu.entity_id() == child_id)
+                    && (parent.child_id != Some(child_id) || parent.child_bounds != bounds)
+                {
+                    parent.child_id = Some(child_id);
+                    parent.child_bounds = bounds;
+                    parent.publish_layout(cx);
+                }
+            });
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.menu_items.is_empty()
     }
@@ -1063,6 +1106,9 @@ impl PopupMenu {
     /// The submenu is closed together with its parent, same as macOS menus.
     fn dismiss(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_index = None;
+        self.reported_bounds.clear();
+        self.child_bounds.clear();
+        self.child_id = None;
         cx.emit(DismissEvent);
 
         // Focus back to the previous focused handle, unless the item's click
@@ -1428,6 +1474,7 @@ impl PopupMenu {
 
 impl FluentBuilder for PopupMenu {}
 impl EventEmitter<DismissEvent> for PopupMenu {}
+impl EventEmitter<PopupMenuLayout> for PopupMenu {}
 impl Focusable for PopupMenu {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1521,7 +1568,10 @@ impl Render for PopupMenu {
                             .filter(|(ix, item)| !(*ix + 1 == items_count && item.is_separator()))
                             .map(|(ix, item)| self.render_item(ix, item, options, window, cx)),
                     )
-                    .on_prepaint(move |bounds, _, cx| view.update(cx, |r, _| r.bounds = bounds)),
+                    .on_prepaint(move |bounds, _, cx| view.update(cx, |r, cx| {
+                        r.bounds = bounds;
+                        r.publish_layout(cx);
+                    })),
             )
             .when(self.scrollable, |this| {
                 this.vertical_scrollbar(&self.scroll_handle)
@@ -1532,6 +1582,35 @@ impl Render for PopupMenu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn retained_submenu_reopening_restores_parent_occlusion(cx: &mut gpui::TestAppContext) {
+        let parent = cx.update(|cx| cx.new(PopupMenu::new));
+        let child = cx.update(|cx| cx.new(PopupMenu::new));
+        let parent_bounds = Bounds::new(gpui::point(px(20.), px(20.)), gpui::size(px(180.), px(80.)));
+        let child_bounds = Bounds::new(gpui::point(px(200.), px(20.)), gpui::size(px(180.), px(80.)));
+        parent.update(cx, |menu, cx| {
+            menu.bounds = parent_bounds;
+            menu.menu_items = vec![PopupMenuItem::submenu("Move", child.clone())];
+            menu.selected_index = Some(0);
+            menu.publish_layout(cx);
+        });
+        child.update(cx, |menu, cx| {
+            menu.bounds = child_bounds;
+            menu.parent_menu = Some(parent.downgrade());
+            menu.publish_layout(cx);
+        });
+        parent.update(cx, |menu, cx| {
+            assert_eq!(menu.reported_bounds, vec![parent_bounds, child_bounds]);
+            menu.selected_index = None;
+            menu.publish_layout(cx);
+            assert_eq!(menu.reported_bounds, vec![parent_bounds]);
+            menu.selected_index = Some(0);
+            menu.publish_layout(cx);
+        });
+        child.update(cx, |menu, cx| menu.publish_layout(cx));
+        parent.update(cx, |menu, _| assert_eq!(menu.reported_bounds, vec![parent_bounds, child_bounds]));
+    }
 
     #[gpui::test]
     fn popup_menu_item_a11y_label_uses_visible_label(cx: &mut gpui::TestAppContext) {

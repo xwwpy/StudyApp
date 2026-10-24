@@ -166,8 +166,11 @@ impl Engine {
                     false,
                 )? {
                     self.write_managed(next, vec![write], false)?;
+                    return Ok("笔记已保存".into());
                 }
-                return Ok("笔记已保存".into());
+                // Empty success is a deliberate no-op: keep the completion
+                // acknowledgement but do not announce a new saved version.
+                return Ok(String::new());
             }
             Command::ReceiveSyncedNote {
                 note_id,

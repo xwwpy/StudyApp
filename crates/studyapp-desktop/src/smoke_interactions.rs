@@ -379,7 +379,8 @@ pub async fn exercise(
         .update(cx, |_, window, cx| {
             assert_eq!(
                 view.read(cx).note_content.read(cx).native_state().unwrap()["controllerVisible"],
-                false
+                true,
+                "opening a note menu must keep the document visible"
             );
             window.press("down", cx);
             window.press("right", cx);

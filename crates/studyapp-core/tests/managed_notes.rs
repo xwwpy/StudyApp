@@ -43,6 +43,25 @@ fn save(
 }
 
 #[test]
+fn unchanged_save_is_silent_and_does_not_add_a_version() {
+    let (_dir, mut engine) = fixture();
+    let content = "# 原文\r\n\r\n不变的内容";
+    let (id, hash, path) = create(&mut engine, content);
+    let before = engine.snapshot();
+    assert_eq!(save(&mut engine, &id, &hash, content, 1010).unwrap(), "");
+    assert_eq!(
+        serde_json::to_value(&*engine.snapshot().versions).unwrap(),
+        serde_json::to_value(&*before.versions).unwrap()
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), content);
+    assert!(
+        !save(&mut engine, &id, &hash, "# 已修改", 1020)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn retained_draft_id_survives_commit_restart_and_image_removal() {
     let (dir, mut engine) = fixture();
     let note_id = "36b79f08-5128-43ab-a1cb-13f318c455f7";

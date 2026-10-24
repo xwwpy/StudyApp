@@ -22,6 +22,7 @@ pub struct PreferenceSnapshot {
     pub settings: Settings,
     pub shortcuts: BTreeMap<String, String>,
     pub sync: SyncSettings,
+    pub image_secret_saved: bool,
 }
 
 impl PreferenceSnapshot {
@@ -31,6 +32,7 @@ impl PreferenceSnapshot {
             settings: Settings::default(),
             shortcuts: crate::shortcuts::default_bindings(),
             sync: SyncSettings::default(),
+            image_secret_saved: false,
         }
     }
 }
@@ -41,6 +43,7 @@ pub struct SavePreferences {
     pub shortcuts: BTreeMap<String, String>,
     pub sync: SyncSettings,
     pub password: Option<zeroize::Zeroizing<String>>,
+    pub image_secret: crate::image_cloud::SecretChange,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -230,6 +233,7 @@ impl PreferencesStore {
                 settings: engine.snapshot().settings,
                 shortcuts: crate::shortcuts::default_bindings(),
                 sync,
+                image_secret_saved: !credentials.image.protected_secret.is_empty(),
             };
             current.settings.validate()?;
             crate::shortcuts::validate_bindings(&current.shortcuts)?;
@@ -360,8 +364,10 @@ impl PreferencesStore {
             },
             shortcuts: crate::shortcuts::resolved_bindings(&shortcuts.shortcuts),
             sync: sync.sync,
+            image_secret_saved: !credentials.image.protected_secret.is_empty(),
         };
         current.settings.validate()?;
+        crate::image_cloud::validate_binding(&current.settings.images, &credentials.image)?;
         crate::shortcuts::validate_bindings(&current.shortcuts)?;
         crate::sync_runtime::validate_settings(&current.sync)?;
         ensure!(
@@ -392,13 +398,23 @@ impl PreferencesStore {
         for (action, binding) in request.shortcuts {
             shortcuts.insert(action, crate::shortcuts::normalize_binding(&binding)?);
         }
-        let synchronization =
+        let mut synchronization =
             runtime.prepare_configuration(request.sync.clone(), request.password)?;
+        synchronization.credentials.image = crate::image_cloud::prepare(
+            &request.settings.images,
+            request.image_secret,
+            runtime.image_credentials(),
+        )?;
         let snapshot = PreferenceSnapshot {
             revision: unique_revision(),
             settings: request.settings,
             shortcuts,
             sync: request.sync,
+            image_secret_saved: !synchronization
+                .credentials
+                .image
+                .protected_secret
+                .is_empty(),
         };
         let mut files = category_files(&snapshot)?;
         files.push((
@@ -493,6 +509,77 @@ impl PreferencesStore {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn object_store_secret_and_public_settings_publish_in_one_generation() {
+        let (root, mut engine, mut runtime, mut store) = library();
+        let old = store.snapshot();
+        let mut proposal = request(&store);
+        proposal.settings.images.storage = studyapp_core::ImageStorage::Both;
+        proposal.settings.images.cloud =
+            studyapp_core::media_settings::ImageCloudTarget::ObjectStore(
+                studyapp_core::media_settings::ObjectStoreSettings {
+                    endpoint: "https://objects.example.test".into(),
+                    bucket: "study-images".into(),
+                    region: "us-east-1".into(),
+                    access_key_id: "account".into(),
+                    prefix: "studyapp".into(),
+                    addressing: Default::default(),
+                },
+            );
+        proposal.image_secret = crate::image_cloud::SecretChange::Replace(zeroize::Zeroizing::new(
+            "private-object-secret".into(),
+        ));
+        let prepared = store.prepare(proposal, &engine, &runtime).unwrap();
+        assert_eq!(store.snapshot().revision, old.revision);
+        assert!(
+            !runtime
+                .image_credentials()
+                .protected_secret
+                .iter()
+                .any(|b| *b != 0)
+        );
+        let (settings, sync) = store.publish(prepared).unwrap();
+        engine.install_prepared_settings(settings);
+        runtime.install_configuration(sync);
+        assert!(store.snapshot().image_secret_saved);
+        let generation = root
+            .join("settings/generations")
+            .join(store.snapshot().revision);
+        for name in ["images.json", "credentials.json", "sync.json"] {
+            assert!(
+                !std::fs::read_to_string(generation.join(name))
+                    .unwrap()
+                    .contains("private-object-secret")
+            );
+        }
+        let (_, reopened) =
+            PreferencesStore::open(&root.join("studyapp.sqlite3"), &mut engine).unwrap();
+        assert_eq!(
+            runtime.image_credentials().protected_secret,
+            reopened.image_credentials().protected_secret
+        );
+        let original_secret = runtime.image_credentials().protected_secret.clone();
+        let mut changed = request(&store);
+        if let studyapp_core::media_settings::ImageCloudTarget::ObjectStore(target) =
+            &mut changed.settings.images.cloud
+        {
+            target.bucket = "another-bucket".into();
+        }
+        assert!(store.save(changed, &mut engine, &mut runtime).is_err());
+        assert_eq!(
+            runtime.image_credentials().protected_secret,
+            original_secret
+        );
+        let mut edit = request(&store);
+        edit.settings.answer_minutes = 9;
+        store.save(edit, &mut engine, &mut runtime).unwrap();
+        assert_eq!(
+            runtime.image_credentials().protected_secret,
+            original_secret
+        );
+    }
+
     fn library() -> (PathBuf, Engine, SyncRuntime, PreferencesStore) {
         let root = tempfile::tempdir().unwrap().keep();
         let database = root.join("studyapp.sqlite3");
@@ -509,6 +596,7 @@ mod tests {
             shortcuts: current.shortcuts,
             sync: current.sync,
             password: None,
+            image_secret: Default::default(),
         }
     }
 
@@ -585,6 +673,7 @@ mod tests {
         let expected = studyapp_core::ImageSettings {
             root: Some(custom_root),
             storage: studyapp_core::ImageStorage::Both,
+            ..Default::default()
         };
         let mut proposal = request(&store);
         proposal.settings.images = expected.clone();

@@ -1,5 +1,61 @@
 //! Revisioned transactions between the offline editor and native persistence.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize)]
+pub struct RebaseEdit {
+    pub from: usize,
+    pub to: usize,
+    pub insert: String,
+}
+
+/// Character edits preserve unaffected selections and undo ranges when image
+/// ownership changes URLs during Save. Offsets are CodeMirror's UTF-16 units.
+pub fn rebase_edits(before: &str, after: &str) -> Vec<RebaseEdit> {
+    let before = normalize(before);
+    let after = normalize(after);
+    if before == after {
+        return Vec::new();
+    }
+    let diff = similar::TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(250))
+        .diff_chars(&before, &after);
+    let mut edits = Vec::new();
+    let mut current: Option<RebaseEdit> = None;
+    let mut position = 0;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Equal => {
+                if let Some(edit) = current.take() {
+                    edits.push(edit);
+                }
+                position += change.value().encode_utf16().count();
+            }
+            similar::ChangeTag::Delete => {
+                let edit = current.get_or_insert_with(|| RebaseEdit {
+                    from: position,
+                    to: position,
+                    insert: String::new(),
+                });
+                position += change.value().encode_utf16().count();
+                edit.to = position;
+            }
+            similar::ChangeTag::Insert => {
+                current
+                    .get_or_insert_with(|| RebaseEdit {
+                        from: position,
+                        to: position,
+                        insert: String::new(),
+                    })
+                    .insert
+                    .push_str(change.value());
+            }
+        }
+    }
+    if let Some(edit) = current {
+        edits.push(edit);
+    }
+    edits
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -17,6 +73,37 @@ pub struct EditorDocument {
     revision: u64,
     lines: Vec<usize>,
     eol: &'static str,
+}
+
+#[cfg(test)]
+mod rebase_tests {
+    use super::{normalize, rebase_edits};
+
+    #[test]
+    fn save_rebase_maps_disjoint_urls_in_utf16_and_preserves_untouched_text() {
+        let before = "🧠 ![A](a.png)\r\nunchanged selection 中文\r![B](b.png)\n";
+        let after = before
+            .replace("a.png", "studyapp-media:group/alpha.png")
+            .replace("b.png", "studyapp-media:group/beta.png");
+        let normalized = normalize(before);
+        let caret = normalized[..normalized.find("selection").unwrap()]
+            .encode_utf16()
+            .count();
+        let changes = rebase_edits(before, &after);
+        assert!(!changes.is_empty());
+        assert!(
+            changes
+                .iter()
+                .all(|change| change.to <= caret || change.from >= caret),
+            "unchanged caret span was replaced"
+        );
+        let mut applied = normalized.encode_utf16().collect::<Vec<_>>();
+        for change in changes.into_iter().rev() {
+            applied.splice(change.from..change.to, change.insert.encode_utf16());
+        }
+        assert_eq!(String::from_utf16(&applied).unwrap(), normalize(&after));
+        assert!(rebase_edits(before, before).is_empty());
+    }
 }
 
 impl EditorDocument {

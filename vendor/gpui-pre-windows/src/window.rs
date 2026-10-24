@@ -73,6 +73,8 @@ pub struct WindowsWindowState {
     /// and when a forced render was requested while another draw was in
     /// progress and had to be deferred.
     pub force_render_pending: Cell<bool>,
+    #[cfg(feature = "test-support")]
+    pub(crate) size_move_trace: RefCell<Option<SizeMoveTrace>>,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
@@ -179,6 +181,8 @@ impl WindowsWindowState {
             last_visibility: Cell::new(None),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
+            #[cfg(feature = "test-support")]
+            size_move_trace: RefCell::new(None),
             click_state,
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
@@ -1034,6 +1038,10 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        #[cfg(feature = "test-support")]
+        if let Some(trace) = self.state.size_move_trace.borrow_mut().as_mut() {
+            trace.rendered_frames += 1;
+        }
         self.state
             .renderer
             .borrow_mut()

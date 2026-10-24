@@ -15,7 +15,14 @@ use std::{
 };
 use studyapp_core::ImageSettings;
 
+#[cfg(windows)]
+#[path = "native_clipboard.rs"]
+mod native_clipboard;
+
 const MAX_FILES: usize = 20;
+// Bound retained base64 strings as well as item count. Match the browser's
+// 20 MiB batch budget, allowing each separately encoded file's padding.
+const MAX_CLIPBOARD_QUEUE_BYTES: usize = (20 * 1024 * 1024_usize).div_ceil(3) * 4 + MAX_FILES * 4;
 
 #[derive(Clone, PartialEq, Eq)]
 struct DocumentKey {
@@ -34,6 +41,43 @@ struct Insertion {
     settings: ImageSettings,
     inputs: VecDeque<MediaInput>,
     request: Option<u64>,
+    accepted_count: usize,
+    clipboard_bytes: usize,
+}
+
+impl Insertion {
+    fn append(
+        &mut self,
+        library: &str,
+        generation: u64,
+        group: &str,
+        inputs: VecDeque<MediaInput>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.library == library && self.generation == generation && self.group == group,
+            "另一篇笔记的图片仍在处理中，请等待处理完成"
+        );
+        let bytes = inputs.iter().try_fold(0_usize, |sum, input| {
+            sum.checked_add(match input {
+                MediaInput::Encoded(value) => value.len(),
+                MediaInput::Bytes(value) => value.len().div_ceil(3) * 4,
+                MediaInput::Path(_) => 0,
+            })
+        });
+        anyhow::ensure!(
+            self.accepted_count.saturating_add(inputs.len()) <= MAX_FILES
+                && bytes
+                    .is_some_and(|bytes| self.clipboard_bytes.saturating_add(bytes)
+                        <= MAX_CLIPBOARD_QUEUE_BYTES),
+            "每次最多插入 {MAX_FILES} 张图片，剪贴板图片合计最多 20 MiB，请等待当前图片处理完成"
+        );
+        // These totals cover the entire insertion session, including the input
+        // already owned by the worker; draining a slot never bypasses the cap.
+        self.accepted_count += inputs.len();
+        self.clipboard_bytes += bytes.unwrap();
+        self.inputs.extend(inputs);
+        Ok(())
+    }
 }
 
 struct Adoption {
@@ -44,6 +88,15 @@ struct Adoption {
     selected_version: Option<String>,
     draft: NoteDraft,
     commit_after_adoption: bool,
+}
+
+struct DraftRetention {
+    library: String,
+    generation: u64,
+    request: u64,
+    id: String,
+    revision: u64,
+    intent: crate::editor_lifecycle::NoteIntent,
 }
 
 struct PickerResult {
@@ -61,6 +114,7 @@ pub struct MediaUi {
     current_resolve: Option<u64>,
     insertion: Option<Insertion>,
     adoption: Option<Adoption>,
+    retention: Option<DraftRetention>,
     picker: Option<u64>,
     picker_sender: mpsc::Sender<PickerResult>,
     picker_results: mpsc::Receiver<PickerResult>,
@@ -78,6 +132,7 @@ impl MediaUi {
             current_resolve: None,
             insertion: None,
             adoption: None,
+            retention: None,
             picker: None,
             picker_sender,
             picker_results,
@@ -89,7 +144,10 @@ impl MediaUi {
         self.sequence
     }
     pub fn busy(&self) -> bool {
-        self.insertion.is_some() || self.adoption.is_some() || self.picker.is_some()
+        self.insertion.is_some()
+            || self.adoption.is_some()
+            || self.retention.is_some()
+            || self.picker.is_some()
     }
     fn observe(&mut self, key: Option<DocumentKey>) {
         if self.observed != key {
@@ -174,6 +232,12 @@ impl StudyApp {
                 .find(|note| Some(&note.id) == source_id)
                 .map(|note| PathBuf::from(&note.path))
         };
+        let source = source.or_else(|| {
+            self.active_draft_id
+                .as_ref()
+                .and_then(|id| self.draft_catalog.get(id))
+                .and_then(|r| r.source_path.clone())
+        });
         let editor = self.note_content.read(cx);
         Some(DocumentKey {
             library: self.last_library.clone(),
@@ -232,13 +296,19 @@ impl StudyApp {
         {
             let request = self.media_ui.next();
             let control = ResolveControl::default();
-            let job = MediaRequest::Resolve {
+            let job = MediaRequest::ResolveRetained {
                 control: control.clone(),
                 generation: key.generation,
                 request,
                 content: self.note_content.read(cx).value().to_owned(),
                 note_path: key.source.clone(),
                 settings: key.settings.clone(),
+                bindings: self
+                    .active_draft_id
+                    .as_ref()
+                    .and_then(|id| self.draft_catalog.get(id))
+                    .map(|r| r.media_bindings.clone())
+                    .unwrap_or_default(),
             };
             self.media_ui.dirty_since = None;
             if self.send_media(key.library.clone(), job, cx) {
@@ -290,18 +360,46 @@ impl StudyApp {
 
     pub fn paste_editor_image(
         &mut self,
+        generation: u64,
         _name: String,
         _mime: String,
         encoded: String,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.can_insert_image(cx) || self.media_busy() {
+        if generation != self.note_content.read(cx).generation() {
+            return;
+        }
+        if !self.can_insert_image(cx) || (self.media_busy() && self.media_ui.insertion.is_none()) {
             self.push_notice(Err("请等待当前图片操作完成后再粘贴。".into()), cx);
             return;
         }
         match clipboard_input(encoded) {
             Ok(input) => self.queue_image_inputs(VecDeque::from([input]), cx),
+            Err(error) => self.push_notice(Err(format!("无法粘贴图片：{error}")), cx),
+        }
+    }
+
+    pub fn paste_native_image(
+        &mut self,
+        generation: u64,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Check the document again after event delivery, before reading any
+        // clipboard format. The worker owns validation/decoding and durable IO.
+        if generation != self.note_content.read(cx).generation()
+            || !self.can_insert_image(cx)
+            || (self.media_busy() && self.media_ui.insertion.is_none())
+        {
+            return;
+        }
+        #[cfg(windows)]
+        match native_clipboard::png(_window) {
+            Ok(Some(bytes)) => {
+                self.queue_image_inputs(VecDeque::from([MediaInput::Bytes(bytes)]), cx)
+            }
+            Ok(None) => {}
             Err(error) => self.push_notice(Err(format!("无法粘贴图片：{error}")), cx),
         }
     }
@@ -332,6 +430,14 @@ impl StudyApp {
     }
 
     fn queue_image_inputs(&mut self, inputs: VecDeque<MediaInput>, cx: &mut Context<Self>) {
+        if inputs.is_empty()
+            || !self.can_insert_image(cx)
+            || self.media_ui.adoption.is_some()
+            || self.media_ui.retention.is_some()
+            || self.media_ui.picker.is_some()
+        {
+            return;
+        }
         let Some(draft) = self.note_editor.as_mut() else {
             return;
         };
@@ -339,20 +445,37 @@ impl StudyApp {
             draft.asset_group = asset_group(draft.note_id.as_deref(), &draft.content);
         }
         let group = draft.asset_group.clone();
+        let generation = self.note_content.read(cx).generation();
+        if let Some(pending) = self.media_ui.insertion.as_mut() {
+            if let Err(error) = pending.append(&self.last_library, generation, &group, inputs) {
+                self.push_notice(Err(format!("无法粘贴图片：{error}")), cx);
+            } else {
+                self.send_next_image(cx);
+                cx.notify();
+            }
+            return;
+        }
         let settings = self
             .snapshot
             .as_ref()
             .map(|s| s.settings.images.clone())
             .unwrap_or_default();
-        self.media_ui.insertion = Some(Insertion {
+        let mut pending = Insertion {
             library: self.last_library.clone(),
-            generation: self.note_content.read(cx).generation(),
-            group,
+            generation,
+            group: group.clone(),
             title: self.note_title.read(cx).value().to_string(),
             settings,
-            inputs,
+            inputs: VecDeque::new(),
             request: None,
-        });
+            accepted_count: 0,
+            clipboard_bytes: 0,
+        };
+        if let Err(error) = pending.append(&self.last_library, generation, &group, inputs) {
+            self.push_notice(Err(format!("无法插入图片：{error}")), cx);
+            return;
+        }
+        self.media_ui.insertion = Some(pending);
         self.capture_note_draft(cx);
         self.send_next_image(cx);
         cx.notify();
@@ -394,6 +517,71 @@ impl StudyApp {
         }
     }
 
+    pub(crate) fn cancel_draft_retention(&mut self) {
+        self.media_ui.retention = None;
+    }
+
+    pub(crate) fn begin_draft_retention(
+        &mut self,
+        intent: crate::editor_lifecycle::NoteIntent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self
+            .active_draft_id
+            .as_ref()
+            .and_then(|id| self.draft_catalog.get(id))
+            .cloned()
+        else {
+            return;
+        };
+        let request = self.media_ui.next();
+        let generation = self.note_content.read(cx).generation();
+        let content =
+            match crate::media::rewrite_images(&record.draft.content, &record.media_bindings) {
+                Ok(content) => content,
+                Err(error) => {
+                    self.note_saving = false;
+                    self.close_requested = false;
+                    self.pending_update = None;
+                    self.note_content
+                        .update(cx, |editor, cx| editor.set_readonly(false, cx));
+                    self.push_notice(Err(error.to_string()), cx);
+                    return;
+                }
+            };
+        let settings = self
+            .snapshot
+            .as_ref()
+            .map(|s| s.settings.images.clone())
+            .unwrap_or_default();
+        let job = MediaRequest::Retain {
+            generation,
+            request,
+            group: record.draft.asset_group.clone(),
+            title: record.draft.title.clone(),
+            content,
+            source_path: record.source_path.clone(),
+            settings,
+        };
+        if self.send_media(self.last_library.clone(), job, cx) {
+            self.media_ui.retention = Some(DraftRetention {
+                library: self.last_library.clone(),
+                generation,
+                request,
+                id: record.id,
+                revision: record.revision,
+                intent,
+            });
+        } else {
+            self.note_saving = false;
+            self.close_requested = false;
+            self.pending_update = None;
+            self.note_content
+                .update(cx, |editor, cx| editor.set_readonly(false, cx));
+        }
+    }
+
     pub(crate) fn begin_media_adoption(
         &mut self,
         draft: NoteDraft,
@@ -420,11 +608,26 @@ impl StudyApp {
                 .find(|note| Some(&note.id) == draft.note_id.as_ref())
                 .map(|note| PathBuf::from(&note.path))
         });
+        let source_path = source_path.or_else(|| {
+            self.active_draft_id
+                .as_ref()
+                .and_then(|id| self.draft_catalog.get(id))
+                .and_then(|r| r.source_path.clone())
+        });
+        if let Some(record) = self
+            .active_draft_id
+            .as_ref()
+            .and_then(|id| self.draft_catalog.get(id))
+            && let Ok(content) =
+                crate::media::rewrite_images(&draft.content, &record.media_bindings)
+        {
+            draft.content = content;
+        }
         if copy {
             draft.note_id = None;
             draft.expected_hash = None;
             draft.asset_group = crate::media::new_group();
-        } else if draft.note_id.is_some() || draft.asset_group.is_empty() {
+        } else if draft.asset_group.is_empty() {
             draft.asset_group = asset_group(draft.note_id.as_deref(), &draft.content);
         }
         self.start_media_adoption(draft, source_path, true, cx);
@@ -467,15 +670,6 @@ impl StudyApp {
                 draft,
                 commit_after_adoption,
             });
-            self.push_notice(
-                Ok(if commit_after_adoption {
-                    "正在保存笔记图片，请稍候…"
-                } else {
-                    "正在为副本保存图片，请稍候…"
-                }
-                .into()),
-                cx,
-            );
             cx.notify();
         } else if commit_after_adoption {
             self.note_saving = false;
@@ -514,6 +708,60 @@ impl StudyApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.media_ui.retention.as_ref().is_some_and(|p| {
+            p.library == response.library
+                && p.generation == response.generation
+                && p.request == response.request
+        }) {
+            let pending = self.media_ui.retention.take().unwrap();
+            if pending.library != self.last_library
+                || self.active_draft_id.as_ref() != Some(&pending.id)
+                || self.note_content.read(cx).generation() != pending.generation
+                || self
+                    .draft_catalog
+                    .get(&pending.id)
+                    .is_none_or(|r| r.revision != pending.revision)
+            {
+                return;
+            }
+            match response.result {
+                Ok(MediaOutcome::Retained { bindings, missing }) => {
+                    let record = self.draft_catalog.get_mut(&pending.id).unwrap();
+                    let mut merged = record.media_bindings.clone();
+                    for (original, owned) in &record.media_bindings {
+                        if let Some(new) = bindings.get(owned) {
+                            merged.insert(original.clone(), new.clone());
+                        }
+                    }
+                    for (original, owned) in bindings {
+                        if !record.media_bindings.values().any(|old| old == &original) {
+                            merged.insert(original, owned);
+                        }
+                    }
+                    if record.media_bindings != merged {
+                        record.media_bindings = merged;
+                        record.touch(chrono::Utc::now().timestamp_millis());
+                    }
+                    let record = record.clone();
+                    self.warn_missing_images(missing, true, cx);
+                    self.persist_record_intent(record, pending.intent, cx);
+                }
+                Err(error) => {
+                    self.note_saving = false;
+                    self.close_requested = false;
+                    self.pending_update = None;
+                    self.note_content
+                        .update(cx, |editor, cx| editor.set_readonly(false, cx));
+                    self.push_notice(
+                        Err(format!("草稿图片尚未保存，当前正文已保留，请重试：{error}")),
+                        cx,
+                    );
+                }
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
         if let Some(index) = self
             .media_ui
             .resolving
@@ -562,16 +810,19 @@ impl StudyApp {
             match response.result {
                 Ok(MediaOutcome::Adopted { content, missing }) => {
                     pending.draft.content = content;
-                    self.start_note_draft(pending.draft, window, cx);
+                    if !self.start_note_draft(pending.draft, window, cx) {
+                        return;
+                    }
                     if missing.is_empty() && !pending.commit_after_adoption {
-                        self.push_notice(
-                            Ok("已创建可编辑副本，图片已保存到当前资料库。".into()),
-                            cx,
-                        );
+                        self.push_notice(Ok("已创建可编辑副本".into()), cx);
                     }
                     self.warn_missing_images(missing, true, cx);
                     if pending.commit_after_adoption {
-                        self.commit_note(cx);
+                        self.request_note_action(
+                            crate::editor_lifecycle::NoteIntent::Commit,
+                            window,
+                            cx,
+                        );
                     }
                 }
                 Err(error) => {
@@ -623,9 +874,220 @@ impl StudyApp {
     }
 }
 
+#[cfg(all(test, feature = "ui-test"))]
+mod save_barrier_tests {
+    use super::{Adoption, MediaOutcome, MediaResponse, StudyApp};
+    use crate::{editor_lifecycle::NoteIntent, worker::Worker};
+    use gpui_kit::TestAppContext;
+
+    #[gpui_kit::test]
+    fn save_keeps_editor_frozen_across_adoption_commit_and_retirement(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap().keep();
+        let database = directory.join("studyapp.sqlite3");
+        let library = database.to_string_lossy().into_owned();
+        let worker = Worker::start(database, None);
+        let (view, cx) = cx.add_window_view(|window, cx| StudyApp::new(worker, window, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |app, cx| {
+                app.last_library = library.clone();
+                app.draft_loading = false;
+                app.start_new_draft(None, window, cx);
+                let mut draft = app.note_editor.clone().unwrap();
+                draft.content = "正文及已导入图片".into();
+                let note_id = draft.asset_group.clone();
+                let generation = app.note_content.read(cx).generation();
+                app.note_saving = true;
+                app.note_content
+                    .update(cx, |editor, cx| editor.set_readonly(true, cx));
+                app.media_ui.adoption = Some(Adoption {
+                    library: library.clone(),
+                    generation,
+                    request: 901,
+                    selected_note: None,
+                    selected_version: None,
+                    draft,
+                    commit_after_adoption: true,
+                });
+                app.accept_media_result(
+                    MediaResponse {
+                        library: library.clone(),
+                        generation,
+                        request: 901,
+                        result: Ok(MediaOutcome::Adopted {
+                            content: "正文及已导入图片".into(),
+                            missing: vec![],
+                        }),
+                    },
+                    window,
+                    cx,
+                );
+                let request = app.note_intent.as_ref().unwrap().0;
+                app.editor_event(
+                    crate::markdown_editor::MarkdownEvent::Flushed(request),
+                    window,
+                    cx,
+                );
+                assert!(matches!(
+                    app.draft_persist.as_ref().unwrap().intent,
+                    NoteIntent::Commit
+                ));
+                assert!(
+                    app.note_content.read(cx).readonly(),
+                    "image adoption reopened input before the commit receipt was durable"
+                );
+                let commit = app.draft_persist.take().unwrap();
+                app.finish_draft_persist(commit.intent, window, cx);
+                assert!(app.pending_note_save.is_some());
+                let mut snapshot =
+                    studyapp_core::Engine::open(&directory.join("metadata-fixture.sqlite3"), 1)
+                        .unwrap()
+                        .snapshot();
+                snapshot.data_path = library.clone();
+                let active = app.active_draft_id.clone().unwrap();
+                app.draft_catalog.get_mut(&active).unwrap().draft.folder_id =
+                    Some("removed-folder".into());
+                let revision = app.draft_catalog[&active].revision;
+                app.reconcile_draft_folders(&snapshot);
+                assert_eq!(
+                    app.draft_catalog[&active].revision, revision,
+                    "folder metadata invalidated a pending save receipt"
+                );
+                app.accept_note_save_result(Ok(note_id), window, cx);
+                assert!(matches!(
+                    app.draft_persist.as_ref().unwrap().intent,
+                    NoteIntent::Saved(_)
+                ));
+                assert!(
+                    app.note_content.read(cx).readonly(),
+                    "source publication reopened input before the retirement receipt was durable"
+                );
+                assert_eq!(app.note_content.read(cx).value(), "正文及已导入图片");
+                let saved = app.draft_persist.take().unwrap();
+                app.finish_draft_persist(saved.intent, window, cx);
+                assert!(app.note_editor.is_none());
+                assert!(!app.note_saving);
+
+                app.start_new_draft(None, window, cx);
+                let id = app.active_draft_id.clone();
+                app.note_saving = true;
+                app.note_content
+                    .update(cx, |editor, cx| editor.set_readonly(true, cx));
+                app.accept_note_save_result(Err("fixture publication failure".into()), window, cx);
+                assert!(
+                    !app.note_content.read(cx).readonly(),
+                    "failed save must allow a retry in the same draft"
+                );
+                assert_eq!(app.active_draft_id, id);
+                assert!(app.note_editor.is_some());
+                let active = app.active_draft_id.clone().unwrap();
+                app.draft_catalog.get_mut(&active).unwrap().draft.folder_id =
+                    Some("removed-folder".into());
+                app.reconcile_draft_folders(&snapshot);
+                assert_eq!(
+                    app.draft_catalog[&active].draft.folder_id, None,
+                    "deferred folder metadata was never reconciled after failure"
+                );
+            });
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{asset_group, clipboard_input};
+    fn image_insertion() -> super::Insertion {
+        super::Insertion {
+            library: "library".into(),
+            generation: 7,
+            group: "group".into(),
+            title: "title".into(),
+            settings: Default::default(),
+            inputs: Default::default(),
+            request: Some(99),
+            accepted_count: 1,
+            clipboard_bytes: 4,
+        }
+    }
+    #[test]
+    fn clipboard_queue_appends_in_order_without_replacing_the_inflight_request() {
+        use super::MediaInput;
+        let mut pending = image_insertion();
+        pending
+            .append(
+                "library",
+                7,
+                "group",
+                [
+                    MediaInput::Encoded("AgIC".into()),
+                    MediaInput::Encoded("AwMD".into()),
+                ]
+                .into(),
+            )
+            .unwrap();
+        assert_eq!(pending.request, Some(99));
+        assert_eq!(pending.accepted_count, 3);
+        assert_eq!(pending.clipboard_bytes, 12);
+        assert!(
+            matches!(pending.inputs.pop_front(), Some(MediaInput::Encoded(value)) if value == "AgIC")
+        );
+        assert!(
+            matches!(pending.inputs.pop_front(), Some(MediaInput::Encoded(value)) if value == "AwMD")
+        );
+    }
+    #[test]
+    fn clipboard_queue_rejects_old_documents_and_other_asset_groups_atomically() {
+        for (library, generation, group) in [
+            ("other", 7, "group"),
+            ("library", 8, "group"),
+            ("library", 7, "other"),
+        ] {
+            let mut pending = image_insertion();
+            assert!(
+                pending
+                    .append(
+                        library,
+                        generation,
+                        group,
+                        [super::MediaInput::Encoded("AgIC".into())].into()
+                    )
+                    .is_err()
+            );
+            assert_eq!(pending.request, Some(99));
+            assert!(pending.inputs.is_empty());
+            assert_eq!(pending.accepted_count, 1);
+        }
+    }
+    #[test]
+    fn clipboard_queue_limits_include_the_inflight_image_and_completed_session_items() {
+        let mut pending = image_insertion();
+        pending.accepted_count = super::MAX_FILES;
+        assert!(
+            pending
+                .append(
+                    "library",
+                    7,
+                    "group",
+                    [super::MediaInput::Encoded("AgIC".into())].into()
+                )
+                .is_err()
+        );
+        pending.accepted_count = 1;
+        pending.clipboard_bytes = super::MAX_CLIPBOARD_QUEUE_BYTES;
+        assert!(
+            pending
+                .append(
+                    "library",
+                    7,
+                    "group",
+                    [super::MediaInput::Encoded("AgIC".into())].into()
+                )
+                .is_err()
+        );
+        assert_eq!(pending.request, Some(99));
+        assert!(pending.inputs.is_empty());
+        assert_eq!(pending.clipboard_bytes, super::MAX_CLIPBOARD_QUEUE_BYTES);
+    }
     #[test]
     fn document_switch_cancels_old_preview_but_keeps_two_tracked_slots() {
         use super::{DocumentKey, MediaUi, ResolveControl};

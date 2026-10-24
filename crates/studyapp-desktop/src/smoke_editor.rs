@@ -1,6 +1,9 @@
 //! Native WebView/GPUI persistence integration. Browser tests cover real keyboard
 //! selection and IME; these transactions cross the production IPC bridge.
-use crate::{app::StudyApp, markdown_editor::MarkdownEditor};
+use crate::{
+    app::{Page, StudyApp},
+    markdown_editor::MarkdownEditor,
+};
 use gpui_kit::{test::TestWindowExt, *};
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
@@ -395,6 +398,11 @@ pub async fn exercise(
             cx,
         )
         .await;
+        let discarded_id = window
+            .update(cx, |_, _, cx| {
+                view.read(cx).active_draft_id.clone().unwrap()
+            })
+            .unwrap();
         if recovered {
             window
                 .update(cx, |_, window, cx| {
@@ -433,10 +441,16 @@ pub async fn exercise(
                 assert!(view.read(cx).recoverable_draft.is_none());
             })
             .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(database.with_file_name("note-draft.json")).unwrap(),
-            "null"
-        );
+        let record: crate::drafts::DraftRecord = serde_json::from_slice(
+            &std::fs::read(
+                crate::drafts::DraftStore::record_path(database.to_str().unwrap(), &discarded_id)
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record.status, crate::drafts::DraftStatus::Deleted);
+        assert_eq!(record.draft.content, "删除的草稿，不应复活");
     }
     window
         .update(cx, |_, window, cx| {
@@ -492,6 +506,467 @@ pub async fn exercise(
 }
 
 /// The PowerShell runner verifies this last draft after normal window shutdown.
+pub async fn exercise_multiple_drafts(
+    window: AnyWindowHandle,
+    view: &Entity<StudyApp>,
+    database: &Path,
+    cx: &mut AsyncApp,
+) {
+    use crate::drafts::{DraftRecord, DraftStatus, DraftStore, DraftUpdate};
+    use crate::smoke_library::{editor_action, library_add, until};
+    let (editor, selected, baseline, source_files) = window
+        .update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.clear_notices(cx);
+                app.page = Page::Notes;
+            });
+            let app = view.read(cx);
+            assert!(app.note_editor.is_none());
+            let baseline = app
+                .draft_catalog
+                .values()
+                .filter(|r| r.active())
+                .cloned()
+                .collect::<Vec<_>>();
+            let sources = app
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .notes
+                .iter()
+                .filter_map(|n| std::fs::read(&n.path).ok().map(|b| (n.path.clone(), b)))
+                .collect::<Vec<_>>();
+            let result = (
+                app.note_content.clone(),
+                app.selected_note.clone(),
+                baseline,
+                sources,
+            );
+            window.render_frame(cx);
+            result
+        })
+        .unwrap();
+    let mut expected = Vec::<(String, String, String, String)>::new();
+    for (index, raw) in [
+        "# 草稿甲\r\n\r\n第一份原文 🧠\r\n",
+        "# 草稿乙\n\n第二份独立正文。\n",
+        "# 草稿丙\r第三份混合换行\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let previous = window
+            .update(cx, |_, _, cx| view.read(cx).active_draft_id.clone())
+            .unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                window.render_frame(cx);
+                library_add(window, false, cx);
+            })
+            .unwrap();
+        until(
+            window,
+            view,
+            "New automatically parks the preceding document",
+            |app, _| {
+                app.active_draft_id.is_some()
+                    && app.active_draft_id != previous
+                    && app.note_editor.is_some()
+                    && !app.note_saving
+                    && app.draft_persist.is_none()
+            },
+            cx,
+        )
+        .await;
+        let title = format!("多草稿验收 {}", index + 1);
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |app, cx| {
+                    app.note_title
+                        .update(cx, |s, cx| s.set_value(title.clone(), window, cx));
+                });
+                editor.update(cx, |e, cx| e.set_value(raw.into(), window, cx));
+                assert!(
+                    view.read(cx).confirmation.is_none(),
+                    "New required replacing another draft"
+                );
+            })
+            .unwrap();
+        #[cfg(windows)]
+        if index == 0 {
+            crate::smoke_visibility::type_into(window, &editor, "native_multi_draft_🧠", cx).await;
+        }
+        let (id, content, group) = window
+            .update(cx, |_, _, cx| {
+                let app = view.read(cx);
+                let id = app.active_draft_id.clone().unwrap();
+                (
+                    id.clone(),
+                    editor.read(cx).value().to_owned(),
+                    app.draft_catalog[&id].draft.asset_group.clone(),
+                )
+            })
+            .unwrap();
+        assert!(
+            expected
+                .iter()
+                .all(|(old, _, _, old_group)| old != &id && old_group != &group)
+        );
+        expected.push((id, content, title, group));
+        window
+            .update(cx, |_, _, cx| {
+                let app = view.read(cx);
+                assert_eq!(
+                    app.draft_catalog.values().filter(|r| r.active()).count(),
+                    baseline.len() + index + 1
+                );
+                for (id, content, title, group) in expected.iter().take(index) {
+                    let record = &app.draft_catalog[id];
+                    assert_eq!(&record.draft.content, content);
+                    assert_eq!(&record.draft.title, title);
+                    assert_eq!(&record.draft.asset_group, group);
+                    assert!(
+                        app.draft_durable[id] >= record.revision,
+                        "switch completed before the exact draft was durable"
+                    );
+                }
+            })
+            .unwrap();
+    }
+    // Filtering is itself an asynchronous document transition; the active third
+    // draft must be durable before any row can replace the persistent WebView.
+    window
+        .update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("folders-drafts", cx);
+        })
+        .unwrap();
+    until(
+        window,
+        view,
+        "Drafts folder parks the last active draft",
+        |app, _| app.note_editor.is_none() && !app.note_saving && app.draft_persist.is_none(),
+        cx,
+    )
+    .await;
+    for (id, content, title, group) in &expected {
+        window
+            .update(cx, |_, window, cx| {
+                window.render_frame(cx);
+                window.click(SharedString::from(format!("draft-row-{id}")), cx);
+            })
+            .unwrap();
+        until(
+            window,
+            view,
+            "Drafts row opens its exact independent document",
+            |app, cx| {
+                app.active_draft_id.as_ref() == Some(id)
+                    && app.note_editor.is_some()
+                    && app.note_content.read(cx).value() == content
+            },
+            cx,
+        )
+        .await;
+        window
+            .update(cx, |_, window, cx| {
+                let app = view.read(cx);
+                assert_eq!(app.note_title.read(cx).value().as_ref(), title.as_str());
+                assert_eq!(&app.note_editor.as_ref().unwrap().asset_group, group);
+                window.render_frame(cx);
+                let header = window.find("folders-drafts").bounds();
+                let active = window
+                    .find(SharedString::from(format!("draft-row-{id}")))
+                    .bounds();
+                let viewport = window.find("folder-tree-scroll").bounds();
+                let first = expected
+                    .iter()
+                    .map(|(id, _, _, _)| {
+                        window
+                            .find(SharedString::from(format!("draft-row-{id}")))
+                            .bounds()
+                            .top()
+                    })
+                    .reduce(|a, b| if a < b { a } else { b })
+                    .unwrap();
+                assert!(
+                    header.bottom() < first,
+                    "Drafts heading overlaps the first draft row"
+                );
+                assert!(
+                    active.right() <= viewport.right() - px(10.),
+                    "active draft covers the scrollbar gutter"
+                );
+            })
+            .unwrap();
+        #[cfg(windows)]
+        crate::smoke_visibility::focus_body(window, &editor, cx).await;
+    }
+    #[cfg(windows)]
+    crate::smoke_visibility::capture_window(
+        window,
+        &editor,
+        &database.with_file_name("multiple-drafts-native.bmp"),
+        cx,
+    )
+    .await;
+    window
+        .update(cx, |_, window, cx| editor_action(window, view, false, cx))
+        .unwrap();
+    until(
+        window,
+        view,
+        "all drafts parked for independent restart reader",
+        |app, _| app.note_editor.is_none() && !app.note_saving && app.draft_persist.is_none(),
+        cx,
+    )
+    .await;
+    let library = window
+        .update(cx, |_, _, cx| view.read(cx).last_library.clone())
+        .unwrap();
+    let store = DraftStore::new();
+    store.load(&library);
+    let mut restored = None;
+    for attempt in 0..100 {
+        while let Ok(update) = store.receiver.try_recv() {
+            if let DraftUpdate::Catalog {
+                records, errors, ..
+            } = update
+            {
+                assert!(errors.is_empty(), "{errors:?}");
+                restored = Some(records);
+            }
+        }
+        if restored.is_some() {
+            break;
+        }
+        assert!(
+            attempt < 99,
+            "independent draft store did not recover the catalog"
+        );
+        pause(cx).await;
+    }
+    let restored = restored.unwrap();
+    drop(store);
+    for (id, content, title, group) in &expected {
+        let record = restored.iter().find(|r| &r.id == id).unwrap();
+        assert!(record.active());
+        assert_eq!(&record.draft.content, content);
+        assert_eq!(&record.draft.title, title);
+        assert_eq!(&record.draft.asset_group, group);
+    }
+    let untouched = expected
+        .iter()
+        .skip(1)
+        .map(|(id, _, _, _)| {
+            let path = DraftStore::record_path(&library, id).unwrap();
+            (path.clone(), std::fs::read(path).unwrap())
+        })
+        .collect::<Vec<_>>();
+    for (index, (id, content, _, _)) in expected.iter().enumerate() {
+        window
+            .update(cx, |_, window, cx| {
+                window.render_frame(cx);
+                window.click(SharedString::from(format!("draft-row-{id}")), cx);
+            })
+            .unwrap();
+        until(
+            window,
+            view,
+            "open exact draft before its individual deletion",
+            |app, _| {
+                app.active_draft_id.as_ref() == Some(id)
+                    && app.note_editor.is_some()
+                    && !app.note_saving
+            },
+            cx,
+        )
+        .await;
+        window
+            .update(cx, |_, window, cx| {
+                editor_action(window, view, true, cx);
+                window.click("confirm-note-action", cx);
+            })
+            .unwrap();
+        until(
+            window,
+            view,
+            "individual tombstone acknowledged before leaving",
+            |app, _| app.note_editor.is_none() && app.draft_discard.is_none(),
+            cx,
+        )
+        .await;
+        let record: DraftRecord = serde_json::from_slice(
+            &std::fs::read(DraftStore::record_path(&library, id).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record.status, DraftStatus::Deleted);
+        assert_eq!(&record.draft.content, content);
+        if index == 0 {
+            for (path, bytes) in &untouched {
+                assert_eq!(
+                    &std::fs::read(path).unwrap(),
+                    bytes,
+                    "deleting A changed another draft"
+                );
+            }
+        }
+    }
+    window
+        .update(cx, |_, window, cx| {
+            let app = view.read(cx);
+            let active = app
+                .draft_catalog
+                .values()
+                .filter(|r| r.active())
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(active, baseline);
+            if let Some(id) = selected {
+                view.update(cx, |app, cx| {
+                    app.select_note_document(id, None, false, window, cx)
+                });
+            }
+        })
+        .unwrap();
+    for (path, bytes) in source_files {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            bytes,
+            "draft operations changed a source file"
+        );
+    }
+    std::fs::write(database.with_file_name("native-multiple-drafts-result.txt"),"PASS: three independent drafts automatically park on New/filter/row switch; exact titles, raw CRLF/mixed newlines, Unicode, stable asset groups and native body focus survive independent store restart; one confirmed deletion preserves other draft bytes; all source files remain unchanged.\n").unwrap();
+    exercise_save_view(window, view, database, cx).await;
+}
+
+async fn exercise_save_view(
+    window: AnyWindowHandle,
+    view: &Entity<StudyApp>,
+    database: &Path,
+    cx: &mut AsyncApp,
+) {
+    use crate::smoke_library::{library_add, until};
+    let editor = window
+        .update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| app.clear_notices(cx));
+            window.render_frame(cx);
+            library_add(window, false, cx);
+            view.read(cx).note_content.clone()
+        })
+        .unwrap();
+    until(
+        window,
+        view,
+        "new scroll-preservation draft",
+        |app, _| app.note_editor.is_some() && !app.note_saving,
+        cx,
+    )
+    .await;
+    let text = (0..160)
+        .map(|index| format!("Paragraph {index}: 保存保留当前位置 🧠\n\n"))
+        .collect::<String>();
+    bridge(
+        window,
+        &editor,
+        json!({"type":"replace","from":0,"to":0,"text":text}),
+        cx,
+    )
+    .await;
+    let caret = text.find("Paragraph 95").unwrap();
+    let caret = text[..caret].encode_utf16().count();
+    bridge(
+        window,
+        &editor,
+        json!({"type":"select","anchor":caret,"head":caret}),
+        cx,
+    )
+    .await;
+    for _ in 0..12 {
+        pause(cx).await;
+    }
+    bridge(
+        window,
+        &editor,
+        json!({"type":"replace","from":caret,"to":caret,"text":"UNDO-SAVE-MARKER"}),
+        cx,
+    )
+    .await;
+    let before = bridge(window, &editor, json!({"type":"snapshot"}), cx).await;
+    assert!(
+        before["scrollTop"].as_f64().unwrap() > 500.,
+        "save fixture never scrolled"
+    );
+    window
+        .update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("save-note", cx);
+        })
+        .unwrap();
+    until(
+        window,
+        view,
+        "save finished without resetting view",
+        |app, _| app.note_editor.is_none() && !app.note_saving && app.draft_persist.is_none(),
+        cx,
+    )
+    .await;
+    let saved = bridge(window, &editor, json!({"type":"snapshot"}), cx).await;
+    assert_eq!(saved["text"], before["text"]);
+    assert_eq!(saved["selection"], before["selection"]);
+    assert_eq!(
+        saved["generation"], before["generation"],
+        "unchanged save reloaded the document"
+    );
+    assert!(
+        (saved["scrollTop"].as_f64().unwrap() - before["scrollTop"].as_f64().unwrap()).abs() < 5.,
+        "save moved the viewport: {before} -> {saved}"
+    );
+    window
+        .update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("edit-note", cx);
+        })
+        .unwrap();
+    until(
+        window,
+        view,
+        "reopen saved note without replacing state",
+        |app, _| app.note_editor.is_some() && !app.note_saving,
+        cx,
+    )
+    .await;
+    let reopened = bridge(window, &editor, json!({"type":"snapshot"}), cx).await;
+    assert_eq!(reopened["generation"], saved["generation"]);
+    assert_eq!(reopened["selection"], saved["selection"]);
+    let undone = bridge(window, &editor, json!({"type":"command","name":"undo"}), cx).await;
+    assert_eq!(
+        undone["text"], text,
+        "save destroyed the independent undo step"
+    );
+    window
+        .update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.confirmation = app
+                    .active_draft_id
+                    .clone()
+                    .map(crate::editor_lifecycle::NoteConfirmation::DiscardDraft);
+                app.confirm_note_action(window, cx);
+            });
+        })
+        .unwrap();
+    until(
+        window,
+        view,
+        "discard only undo-test recovery draft",
+        |app, _| app.note_editor.is_none() && app.draft_discard.is_none() && !app.note_saving,
+        cx,
+    )
+    .await;
+    std::fs::write(database.with_file_name("native-save-view-result.txt"), "PASS: saving a scrolled long document keeps its generation, text, caret and viewport; reopening retains undo; only the test recovery draft is tombstoned.\n").unwrap();
+}
+
+/// The PowerShell runner verifies this last draft after normal window shutdown.
 pub async fn close_with_draft(window: AnyWindowHandle, view: &Entity<StudyApp>, cx: &mut AsyncApp) {
     let editor = window
         .update(cx, |_, window, cx| {
@@ -513,6 +988,24 @@ pub async fn close_with_draft(window: AnyWindowHandle, view: &Entity<StudyApp>, 
         cx,
     )
     .await;
+    window
+        .update(cx, |_, _, cx| {
+            let app = view.read(cx);
+            let id = app.active_draft_id.as_ref().unwrap();
+            let root = std::path::Path::new(&app.last_library).parent().unwrap();
+            std::fs::write(root.join("native-close-draft-id.txt"), id).unwrap();
+        })
+        .unwrap();
+    #[cfg(windows)]
+    crate::smoke_window_drag::click_window_control(
+        window,
+        view,
+        "window-close",
+        windows::Win32::UI::WindowsAndMessaging::HTCLOSE,
+        cx,
+    )
+    .await;
+    #[cfg(not(windows))]
     window
         .update(cx, |_, window, cx| {
             assert!(

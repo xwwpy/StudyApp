@@ -14,6 +14,8 @@ repository = "https://github.com/xwwpy/StudyApp"
 debug = 0
 
 [patch.crates-io]
+# Preserve bounds observers without repainting unchanged Windows client content.
+gpui-pre = { path = "vendor/gpui-pre" }
 # Preserve native WebView child visibility beneath the GPUI shell.
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 # Consistent hand/arrow feedback on popup actions and nested menu rows.

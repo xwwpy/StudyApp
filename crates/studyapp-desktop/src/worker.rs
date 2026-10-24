@@ -16,6 +16,13 @@ pub enum Work {
     Apply(Command),
     SavePreferences(SavePreferences),
     Media(crate::media::MediaRequest),
+    TestImageCloud,
+    RetryImageCloud,
+    ImageCloudFinished {
+        generation: u64,
+        revision: String,
+        result: Result<String, String>,
+    },
     ImportPaths(Vec<PathBuf>),
     PreparedImport {
         generation: u64,
@@ -49,6 +56,7 @@ pub struct Update {
     pub preferences: Option<PreferenceSnapshot>,
     pub preferences_result: Option<Result<(), String>>,
     pub media_result: Option<crate::media::MediaResponse>,
+    pub image_cloud_busy: Option<bool>,
 }
 
 pub struct Worker {
@@ -132,6 +140,7 @@ fn save_scoped_settings(
             shortcuts: current.shortcuts,
             sync: current.sync,
             password: None,
+            image_secret: Default::default(),
         },
         engine,
         synchronization,
@@ -161,11 +170,13 @@ impl Worker {
                             preferences: None,
                             preferences_result: None,
                             media_result: None,
+                            image_cloud_busy: None,
                         });
                         return;
                     }
                 };
             let mut generation = 0_u64;
+            let mut image_cloud_busy = false;
             let mut last_sync_attempt = Instant::now();
             let _ = updates.send(Update {
                 snapshot: Some(Arc::new(engine.snapshot())),
@@ -179,6 +190,7 @@ impl Worker {
                 preferences: Some(preferences.snapshot()),
                 preferences_result: None,
                 media_result: None,
+                image_cloud_busy: Some(image_cloud_busy),
             });
             let mut last_tick = Instant::now();
             let mut last_scan = Instant::now();
@@ -245,6 +257,7 @@ impl Worker {
                                 preferences: Some(preferences.snapshot()),
                                 preferences_result,
                                 media_result,
+                                image_cloud_busy: Some(image_cloud_busy),
                             });
                             continue;
                         }
@@ -265,7 +278,7 @@ impl Worker {
                 match work {
                     Ok(Work::Media(request)) => {
                         let library = engine.snapshot().data_path;
-                        let factory = synchronization.media_provider_factory();
+                        let factory = synchronization.image_provider_factory(request.settings());
                         let updates = updates.clone();
                         thread::spawn(move || {
                             let generation = request.generation();
@@ -273,11 +286,10 @@ impl Worker {
                             let result = {
                                 // Even unavailable credentials preserve imported clipboard
                                 // bytes in a staged local file before reporting failure.
-                                let provider = factory().unwrap_or(None);
-                                crate::media::execute(
+                                crate::media::execute_with_provider(
                                     std::path::Path::new(&library),
                                     request,
-                                    provider,
+                                    factory(),
                                 )
                             }
                             .map_err(|error| format!("{error:#}"));
@@ -298,8 +310,59 @@ impl Worker {
                                     request: request_id,
                                     result,
                                 }),
+                                image_cloud_busy: None,
                             });
                         });
+                    }
+                    Ok(action @ (Work::TestImageCloud | Work::RetryImageCloud)) => {
+                        if image_cloud_busy {
+                            notice = Some(Err("图片云端任务正在进行，请稍候。".into()));
+                        } else {
+                            let snapshot = Arc::new(engine.snapshot());
+                            let factory =
+                                synchronization.image_provider_factory(&snapshot.settings.images);
+                            let revision = preferences.snapshot().revision;
+                            let sender = command_sender.clone();
+                            let test_only = matches!(action, Work::TestImageCloud);
+                            image_cloud_busy = true;
+                            thread::spawn(move || {
+                                let result = (|| -> anyhow::Result<String> {
+                                    if test_only {
+                                        let provider = factory()?.ok_or_else(|| {
+                                            anyhow::anyhow!("请先配置图片云端服务并保存设置")
+                                        })?;
+                                        provider.check_connection()?;
+                                        Ok("图片云端连接检查成功；上传权限将在实际上传时验证。"
+                                            .into())
+                                    } else {
+                                        crate::image_cloud::retry_with_provider(
+                                            &snapshot,
+                                            factory(),
+                                        )
+                                    }
+                                })()
+                                .map_err(|error| error.to_string());
+                                let _ = sender.send(Work::ImageCloudFinished {
+                                    generation,
+                                    revision,
+                                    result,
+                                });
+                            });
+                        }
+                        changed = true;
+                    }
+                    Ok(Work::ImageCloudFinished {
+                        generation: completed_generation,
+                        revision,
+                        result,
+                    }) => {
+                        image_cloud_busy = false;
+                        if completed_generation == generation
+                            && preferences.snapshot().revision == revision
+                        {
+                            notice = Some(result);
+                        }
+                        changed = true;
                     }
                     Ok(Work::Scoped { .. }) => continue,
                     Ok(Work::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -337,7 +400,7 @@ impl Worker {
                                 | Command::EditSession { .. }
                         );
                         let restoring = matches!(&command, Command::Restore(_));
-                        let result = if synchronization.status.busy
+                        let result = if (synchronization.status.busy || image_cloud_busy)
                             && (restoring || matches!(&command, Command::UnmanageNote { .. }))
                         {
                             Err(if restoring {
@@ -383,7 +446,8 @@ impl Worker {
                             last_sync_attempt = Instant::now();
                             sync_changed = true;
                         }
-                        notice = Some(result);
+                        notice = (!matches!(&result, Ok(message) if message.is_empty()))
+                            .then_some(result);
                         changed = true;
                     }
                     Ok(Work::SavePreferences(request)) => {
@@ -462,7 +526,7 @@ impl Worker {
                     Ok(Work::SwitchLibrary(directory)) => {
                         let result = (|| -> anyhow::Result<String> {
                             anyhow::ensure!(
-                                !synchronization.status.busy,
+                                !synchronization.status.busy && !image_cloud_busy,
                                 "同步正在运行，请等待完成后再切换资料库"
                             );
                             engine.checkpoint()?;
@@ -496,29 +560,22 @@ impl Worker {
                     }
                     Ok(Work::RefreshStorage) => {
                         let result = crate::storage_backend::inspect(&engine.snapshot())
-                            .map_err(|error| format!("{error:#}"));
-                        notice = Some(
-                            result
-                                .as_ref()
-                                .map(|_| "存储用量已更新".into())
-                                .map_err(Clone::clone),
-                        );
+                            .map_err(|error| crate::storage_backend::user_message(&error));
                         storage_event = Some(StorageEvent::Finished(result));
                         changed = true;
                     }
                     Ok(Work::DeleteManagedCopy { note_id }) => {
-                        let result = if synchronization.status.busy {
+                        let result = if synchronization.status.busy || image_cloud_busy {
                             Err("同步正在运行，请等待完成后再删除托管副本".into())
                         } else {
                             crate::storage_backend::delete_managed_copy(&mut engine, &note_id, now)
-                                .map_err(|error| format!("{error:#}"))
+                                .map_err(|error| crate::storage_backend::user_message(&error))
                         };
-                        notice = Some(
-                            result
-                                .as_ref()
-                                .map(|_| "已删除选定的一个托管副本；历史和学习记录仍保留".into())
-                                .map_err(Clone::clone),
-                        );
+                        notice = result
+                            .as_ref()
+                            .ok()
+                            .and_then(|report| report.cleanup.as_ref())
+                            .map(crate::storage_backend::CopyCleanupOutcome::notice);
                         storage_event = Some(StorageEvent::Finished(result));
                         changed = true;
                     }
@@ -526,7 +583,7 @@ impl Worker {
                         let result =
                             (|| -> anyhow::Result<crate::storage_backend::StorageReport> {
                                 anyhow::ensure!(
-                                    !synchronization.status.busy,
+                                    !synchronization.status.busy && !image_cloud_busy,
                                     "同步正在运行，请等待完成后再迁移资料库"
                                 );
                                 let database = crate::storage_backend::prepare_migration(
@@ -550,19 +607,17 @@ impl Worker {
                                 last_tick = Instant::now();
                                 Ok(report)
                             })()
-                            .map_err(|error| format!("{error:#}"));
+                            .map_err(|error| crate::storage_backend::user_message(&error));
                         library_replaced = result.is_ok();
                         if library_replaced {
                             generation += 1;
                             last_sync_attempt = Instant::now();
                             sync_changed = true;
                         }
-                        notice = Some(
-                            result
-                                .as_ref()
-                                .map(|_| "资料库已迁移并验证，原目录和全部源文件仍保留".into())
-                                .map_err(Clone::clone),
-                        );
+                        notice = result
+                            .as_ref()
+                            .ok()
+                            .map(|_| Ok("资料库已迁移并验证，原目录和全部源文件仍保留".into()));
                         storage_event = Some(StorageEvent::Finished(result));
                         changed = true;
                     }
@@ -632,6 +687,7 @@ impl Worker {
                             preferences: Some(preferences.snapshot()),
                             preferences_result,
                             media_result: None,
+                            image_cloud_busy: Some(image_cloud_busy),
                         })
                         .is_err()
                 {
@@ -684,6 +740,7 @@ mod tests {
                     shortcuts: original.shortcuts.clone(),
                     sync: original.sync.clone(),
                     password: None,
+                    image_secret: Default::default(),
                 })),
             })
             .unwrap();
@@ -706,6 +763,7 @@ mod tests {
                 shortcuts: original.shortcuts,
                 sync: original.sync,
                 password: None,
+                image_secret: Default::default(),
             }))
             .unwrap();
         let rejected = receive_notice(&worker);
@@ -1092,6 +1150,7 @@ mod tests {
                     auto_minutes: None,
                 },
                 password: Some(zeroize::Zeroizing::new("fixture".into())),
+                image_secret: Default::default(),
             }))
             .unwrap();
         receive_notice(worker).notice.unwrap().unwrap();
@@ -1291,12 +1350,15 @@ mod tests {
     }
 
     fn receive_notice(worker: &Worker) -> Update {
+        // Storage completion is intentionally silent; notifications are not
+        // the operation protocol. Bound the whole wait, including periodic ticks.
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let update = worker
                 .receiver
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .unwrap();
-            if update.notice.is_some() {
+            if update.notice.is_some() || update.storage_event.is_some() {
                 return update;
             }
             assert!(!update.library_replaced);

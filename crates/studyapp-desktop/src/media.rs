@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 use studyapp_core::{ImageSettings, ImageStorage};
-use studyapp_sync::Provider;
+use studyapp_sync::AssetProvider;
 
 fn remote_image_url(value: &str) -> Result<reqwest::Url> {
     ensure!(value.len() <= 8192, "图片网址过长");
@@ -206,7 +206,6 @@ fn preview_cache_key(
 #[derive(Clone, Debug)]
 pub enum MediaInput {
     Path(PathBuf),
-    #[cfg(test)]
     Bytes(Vec<u8>),
     Encoded(String),
 }
@@ -223,6 +222,15 @@ fn decode_image_input(encoded: &str) -> Result<Vec<u8>> {
 }
 #[derive(Clone, Debug)]
 pub enum MediaRequest {
+    ResolveRetained {
+        control: ResolveControl,
+        generation: u64,
+        request: u64,
+        content: String,
+        note_path: Option<PathBuf>,
+        settings: ImageSettings,
+        bindings: BTreeMap<String, String>,
+    },
     Resolve {
         control: ResolveControl,
         generation: u64,
@@ -240,6 +248,15 @@ pub enum MediaRequest {
         settings: ImageSettings,
     },
     Adopt {
+        generation: u64,
+        request: u64,
+        group: String,
+        title: String,
+        content: String,
+        source_path: Option<PathBuf>,
+        settings: ImageSettings,
+    },
+    Retain {
         generation: u64,
         request: u64,
         group: String,
@@ -282,6 +299,8 @@ impl MediaRequest {
     pub fn generation(&self) -> u64 {
         match self {
             Self::Resolve { generation, .. }
+            | Self::ResolveRetained { generation, .. }
+            | Self::Retain { generation, .. }
             | Self::Import { generation, .. }
             | Self::Adopt { generation, .. } => *generation,
         }
@@ -289,8 +308,19 @@ impl MediaRequest {
     pub fn request(&self) -> u64 {
         match self {
             Self::Resolve { request, .. }
+            | Self::ResolveRetained { request, .. }
+            | Self::Retain { request, .. }
             | Self::Import { request, .. }
             | Self::Adopt { request, .. } => *request,
+        }
+    }
+    pub fn settings(&self) -> &ImageSettings {
+        match self {
+            Self::Resolve { settings, .. }
+            | Self::ResolveRetained { settings, .. }
+            | Self::Import { settings, .. }
+            | Self::Adopt { settings, .. }
+            | Self::Retain { settings, .. } => settings,
         }
     }
 }
@@ -303,6 +333,10 @@ pub struct MediaResponse {
 }
 #[derive(Debug)]
 pub enum MediaOutcome {
+    Retained {
+        bindings: BTreeMap<String, String>,
+        missing: Vec<String>,
+    },
     Resolved {
         images: BTreeMap<String, String>,
         missing: Vec<String>,
@@ -460,7 +494,7 @@ fn load_image(
     settings: &ImageSettings,
     dest: &str,
     source: Option<&Path>,
-    provider: Option<&dyn Provider>,
+    provider: Option<&dyn AssetProvider>,
     control: Option<&ResolveControl>,
 ) -> Result<Vec<u8>> {
     if let Some(control) = control {
@@ -486,7 +520,7 @@ fn load_image(
         }
         let bytes = provider
             .context("云端图片尚未缓存，请配置同步服务并连接后重试")?
-            .read_asset(&key)?
+            .get_asset(&key)?
             .context("云端图片不存在")?;
         validated_image(&bytes)?;
         // A cancelled request must not publish downloaded bytes into storage.
@@ -560,7 +594,7 @@ fn store_image(
     group: &str,
     title: &str,
     bytes: &[u8],
-    provider: Option<&dyn Provider>,
+    provider: Option<&dyn AssetProvider>,
 ) -> Result<String> {
     let (extension, _) = validated_image(bytes)?;
     ensure!(
@@ -586,7 +620,10 @@ fn store_image(
         (|| -> Result<()> {
             provider
                 .context("请先配置可用的 WebDAV 或 NAS 同步目标")?
-                .write_asset(&key, bytes)?;
+                .put_asset(&key, bytes)?;
+            if let Some(provider) = provider {
+                record_uploaded(database, provider, &key, bytes)?;
+            }
             Ok(())
         })()
         .with_context(|| {
@@ -775,8 +812,53 @@ pub fn rewrite_images(text: &str, replacements: &BTreeMap<String, String>) -> Re
 pub fn execute(
     database: &Path,
     request: MediaRequest,
-    provider: Option<Box<dyn Provider>>,
+    provider: Option<Box<dyn AssetProvider>>,
 ) -> Result<MediaOutcome> {
+    let mut bindings = BTreeMap::new();
+    let mut retain_only = false;
+    let request = match request {
+        MediaRequest::ResolveRetained {
+            control,
+            generation,
+            request,
+            content,
+            note_path,
+            settings,
+            bindings: retained,
+        } => {
+            bindings = retained;
+            MediaRequest::Resolve {
+                control,
+                generation,
+                request,
+                content,
+                note_path,
+                settings,
+            }
+        }
+        MediaRequest::Retain {
+            generation,
+            request,
+            group,
+            title,
+            content,
+            source_path,
+            mut settings,
+        } => {
+            retain_only = true;
+            settings.storage = ImageStorage::Local;
+            MediaRequest::Adopt {
+                generation,
+                request,
+                group,
+                title,
+                content,
+                source_path,
+                settings,
+            }
+        }
+        request => request,
+    };
     match request {
         MediaRequest::Import {
             group,
@@ -787,7 +869,6 @@ pub fn execute(
         } => {
             let bytes = match input {
                 MediaInput::Path(path) => read_file(&path)?,
-                #[cfg(test)]
                 MediaInput::Bytes(bytes) => bytes,
                 MediaInput::Encoded(encoded) => decode_image_input(&encoded)?,
             };
@@ -828,13 +909,14 @@ pub fn execute(
                     continue;
                 }
                 let result = (|| -> Result<String> {
+                    let load_dest = bindings.get(&dest).unwrap_or(&dest);
                     let cache_key =
-                        preview_cache_key(database, &settings, &dest, note_path.as_deref());
+                        preview_cache_key(database, &settings, load_dest, note_path.as_deref());
                     let url = cached_data_url(cache_key.as_deref(), Some(&control), || {
                         let bytes = load_image(
                             database,
                             &settings,
-                            &dest,
+                            load_dest,
                             note_path.as_deref(),
                             provider.as_deref(),
                             Some(&control),
@@ -919,17 +1001,564 @@ pub fn execute(
                     )?,
                 );
             }
+            if retain_only {
+                return Ok(MediaOutcome::Retained {
+                    bindings: replacements,
+                    missing,
+                });
+            }
             Ok(MediaOutcome::Adopted {
                 content: rewrite_images(&content, &replacements)?,
                 missing,
             })
         }
+        MediaRequest::Retain { .. } | MediaRequest::ResolveRetained { .. } => unreachable!(),
+    }
+}
+
+pub fn execute_with_provider(
+    database: &Path,
+    request: MediaRequest,
+    provider: Result<Option<Box<dyn AssetProvider>>>,
+) -> Result<MediaOutcome> {
+    match provider {
+        Ok(provider) => execute(database, request, provider),
+        Err(error) => {
+            // Preserve clipboard/file bytes before reporting a credential error.
+            let outcome = execute(database, request, None);
+            match outcome {
+                Ok(MediaOutcome::Resolved {
+                    images,
+                    mut missing,
+                }) => {
+                    if !missing.is_empty() {
+                        missing.push(format!("图片云端不可用：{error:#}"));
+                    }
+                    Ok(MediaOutcome::Resolved { images, missing })
+                }
+                Ok(other) => Ok(other),
+                Err(local) => Err(local).with_context(|| format!("图片云端不可用：{error:#}")),
+            }
+        }
+    }
+}
+
+fn upload_marker(
+    database: &Path,
+    provider: &dyn AssetProvider,
+    key: &str,
+    bytes: &[u8],
+) -> Option<PathBuf> {
+    let identity = provider.identity()?;
+    let digest = studyapp_sync::content_hash_bytes;
+    Some(
+        database
+            .parent()?
+            .join("image-cloud-state")
+            .join(digest(identity.as_bytes()))
+            .join(format!("{}-{}.done", digest(key.as_bytes()), digest(bytes))),
+    )
+}
+fn already_uploaded(
+    database: &Path,
+    provider: &dyn AssetProvider,
+    key: &str,
+    bytes: &[u8],
+) -> Result<bool> {
+    let Some(marker) = upload_marker(database, provider, key, bytes) else {
+        return Ok(false);
+    };
+    if !marker.try_exists()? {
+        return Ok(false);
+    }
+    let _guards = crate::storage_backend::guard_directories(
+        marker.parent().context("图片上传状态目录不存在")?,
+        false,
+    )?;
+    let mut file = crate::storage_backend::plain_handle(&marker, false, true)?;
+    let mut marker_bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(64)
+        .read_to_end(&mut marker_bytes)?;
+    Ok(marker_bytes == b"uploaded")
+}
+fn record_uploaded(
+    database: &Path,
+    provider: &dyn AssetProvider,
+    key: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let Some(marker) = upload_marker(database, provider, key, bytes) else {
+        return Ok(());
+    };
+    if already_uploaded(database, provider, key, bytes)? {
+        return Ok(());
+    }
+    match atomic_publish(&marker, b"uploaded") {
+        Ok(()) => Ok(()),
+        // An import and an explicit retry may confirm the same immutable object.
+        // Losing create-only publication is successful when the winner wrote it.
+        Err(_) if already_uploaded(database, provider, key, bytes)? => Ok(()),
+        Err(error) => Err(error).context("云端已上传，但本地上传状态无法保存；可安全重试"),
+    }
+}
+
+fn retry_cursor_path(database: &Path, provider: &dyn AssetProvider) -> Result<PathBuf> {
+    let identity = provider.identity().unwrap_or_else(|| "unidentified".into());
+    Ok(database
+        .parent()
+        .context("资料库目录不存在")?
+        .join("image-cloud-state")
+        .join(studyapp_sync::content_hash_bytes(identity.as_bytes()))
+        .join("retry-cursor.json"))
+}
+
+fn read_retry_cursor(path: &Path) -> Result<Option<String>> {
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let _guards = crate::storage_backend::guard_directories(path.parent().unwrap(), false)?;
+    let file = crate::storage_backend::plain_handle(path, false, true)?;
+    ensure!(file.metadata()?.len() <= 8192, "图片重试进度超过限制");
+    let cursor: Option<String> = serde_json::from_reader(file.take(8193))?;
+    if let Some(key) = &cursor {
+        studyapp_sync::validate_asset_key(key)?;
+    }
+    Ok(cursor)
+}
+
+fn write_retry_cursor(path: &Path, cursor: Option<&str>) -> Result<()> {
+    let parent = path.parent().context("图片重试进度目录不存在")?;
+    let _guards = crate::storage_backend::guard_directories(parent, true)?;
+    if path.try_exists()? {
+        let _ = crate::storage_backend::plain_handle(path, false, false)?;
+    }
+    let temporary = parent.join(format!(".retry-{}.pending", new_group()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec(&cursor)?)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temporary, path)?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+pub fn retry_existing_assets(
+    database: &Path,
+    settings: &ImageSettings,
+    provider: &dyn AssetProvider,
+) -> Result<String> {
+    retry_existing_assets_bounded(
+        database,
+        settings,
+        provider,
+        MAX_IMAGE_OPERATIONS,
+        MAX_BATCH_BYTES,
+        Duration::from_secs(60),
+    )
+}
+
+fn retry_existing_assets_bounded(
+    database: &Path,
+    settings: &ImageSettings,
+    provider: &dyn AssetProvider,
+    max_checks: usize,
+    max_bytes: usize,
+    max_time: Duration,
+) -> Result<String> {
+    ensure!(
+        settings.storage != ImageStorage::Local,
+        "当前使用本地图片模式，请先选择云端方式并保存设置"
+    );
+    let index = database
+        .parent()
+        .context("资料库目录不存在")?
+        .join("image-index");
+    if !index.try_exists()? {
+        return Ok("没有待上传的本地图片".into());
+    }
+    let _guards = crate::storage_backend::guard_directories(&index, false)?;
+    let started = Instant::now();
+    let cursor_path = retry_cursor_path(database, provider)?;
+    let cursor = read_retry_cursor(&cursor_path)?;
+    let mut keys = Vec::new();
+    let mut index_entries = 0;
+    for group in std::fs::read_dir(&index)? {
+        let group = group?;
+        index_entries += 1;
+        ensure!(index_entries <= 100_000, "图片索引数量超过本次检查限制");
+        if !group.file_type()?.is_dir() {
+            continue;
+        }
+        let name = group.file_name().to_string_lossy().into_owned();
+        if uuid::Uuid::parse_str(&name).is_err() {
+            continue;
+        }
+        let _group_guards = crate::storage_backend::guard_directories(&group.path(), false)?;
+        for entry in std::fs::read_dir(group.path())? {
+            let entry = entry?;
+            index_entries += 1;
+            ensure!(index_entries <= 100_000, "图片索引数量超过本次检查限制");
+            let filename = entry.file_name().to_string_lossy().into_owned();
+            let Some(filename) = filename.strip_suffix(".json") else {
+                continue;
+            };
+            let key = format!("assets/{name}/{filename}");
+            if studyapp_sync::validate_asset_key(&key).is_err() {
+                continue;
+            }
+            keys.push(key);
+        }
+    }
+    keys.sort();
+    let mut next = cursor
+        .as_ref()
+        .map_or(0, |cursor| keys.partition_point(|key| key <= cursor));
+    if next == keys.len() {
+        next = 0;
+    }
+    let start = next;
+    let mut uploaded = 0;
+    let mut pending = 0;
+    let mut checked = 0;
+    let mut remaining_bytes = max_bytes;
+    let mut errors = Vec::new();
+    while next < keys.len() {
+        // Reserve a whole bounded read before opening a file. Failed/invalid reads
+        // consume that reservation too; successful reads refund unused capacity.
+        // Confirmed assets count as checks, so a large cache cannot bypass limits.
+        if checked >= max_checks
+            || remaining_bytes < MAX_IMAGE_BYTES
+            || started.elapsed() >= max_time
+        {
+            break;
+        }
+        checked += 1;
+        remaining_bytes -= MAX_IMAGE_BYTES;
+        let key = &keys[next];
+        let result = (|| -> Result<Option<bool>> {
+            let bytes = read_file(&local_asset(database, settings, key)?)?;
+            remaining_bytes += MAX_IMAGE_BYTES - bytes.len();
+            if started.elapsed() >= max_time {
+                return Ok(None);
+            }
+            if already_uploaded(database, provider, key, &bytes)? {
+                return Ok(Some(false));
+            }
+            if started.elapsed() >= max_time {
+                return Ok(None);
+            }
+            provider.put_asset(key, &bytes)?;
+            record_uploaded(database, provider, key, &bytes)?;
+            Ok(Some(true))
+        })();
+        match result {
+            Ok(None) => break,
+            Ok(Some(true)) => uploaded += 1,
+            Ok(Some(false)) => {}
+            Err(error) => {
+                pending += 1;
+                if errors.len() < 3 {
+                    errors.push(error.to_string());
+                }
+            }
+        }
+        next += 1;
+    }
+    if next > start {
+        let cursor = (next < keys.len()).then(|| keys[next - 1].as_str());
+        write_retry_cursor(&cursor_path, cursor).context("本地图片已保留，但重试进度无法保存")?;
+    }
+    let remaining = keys.len() - next;
+    if pending == 0 && remaining == 0 {
+        Ok(format!(
+            "本批图片检查完成：本次上传 {uploaded} 张；已确认的图片无需重复上传，本地缓存保留"
+        ))
+    } else {
+        let mut message = format!("本地图片已保留；本次上传 {uploaded} 张");
+        if pending > 0 {
+            message.push_str(&format!("，{pending} 张云端待重试：{}", errors.join("；")));
+        }
+        if remaining > 0 {
+            message.push_str(&format!(
+                "；另有 {remaining} 张尚未检查，请再次重试继续后续图片"
+            ));
+        }
+        Ok(message)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use studyapp_sync::Provider;
+
+    struct RetryImages {
+        uploads: Mutex<Vec<String>>,
+    }
+    impl AssetProvider for RetryImages {
+        fn get_asset(&self, _: &str) -> studyapp_sync::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn put_asset(&self, key: &str, _: &[u8]) -> studyapp_sync::Result<()> {
+            self.uploads.lock().unwrap().push(key.to_owned());
+            Ok(())
+        }
+        fn check_connection(&self) -> studyapp_sync::Result<()> {
+            Ok(())
+        }
+        fn identity(&self) -> Option<String> {
+            Some("bounded-retry-fixture".into())
+        }
+    }
+    fn retry_fixture(count: usize) -> (PathBuf, ImageSettings, RetryImages, Vec<String>) {
+        let database = database();
+        let settings = ImageSettings {
+            storage: ImageStorage::Both,
+            ..Default::default()
+        };
+        let group = new_group();
+        let keys: Vec<_> = (0..count)
+            .map(|n| format!("assets/{group}/{n:04}.gif"))
+            .collect();
+        for key in &keys {
+            publish_local(&database, &settings, key, GIF).unwrap();
+        }
+        (
+            database,
+            settings,
+            RetryImages {
+                uploads: Mutex::new(Vec::new()),
+            },
+            keys,
+        )
+    }
+
+    #[test]
+    fn retry_budget_stops_before_reading_the_next_image() {
+        let (database, settings, provider, keys) = retry_fixture(2);
+        let second = local_asset(&database, &settings, &keys[1]).unwrap();
+        std::fs::write(&second, b"invalid image must not be opened in this batch").unwrap();
+        let result = retry_existing_assets_bounded(
+            &database,
+            &settings,
+            &provider,
+            1,
+            MAX_BATCH_BYTES,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(*provider.uploads.lock().unwrap(), vec![keys[0].clone()]);
+        assert!(result.contains("尚未检查"));
+        assert!(!result.contains("格式无法识别"), "{result}");
+        assert!(!result.contains("待重试"), "{result}");
+    }
+
+    #[test]
+    fn retry_cursor_reaches_later_images_after_acknowledged_batches() {
+        let (database, settings, provider, keys) = retry_fixture(3);
+        record_uploaded(&database, &provider, &keys[0], GIF).unwrap();
+        for expected in [0, 1, 2] {
+            retry_existing_assets_bounded(
+                &database,
+                &settings,
+                &provider,
+                1,
+                MAX_BATCH_BYTES,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+            assert_eq!(provider.uploads.lock().unwrap().len(), expected);
+        }
+        assert_eq!(*provider.uploads.lock().unwrap(), keys[1..]);
+    }
+
+    #[test]
+    fn retry_zero_time_or_insufficient_byte_budget_does_not_read_images() {
+        let (database, settings, provider, keys) = retry_fixture(1);
+        std::fs::write(
+            local_asset(&database, &settings, &keys[0]).unwrap(),
+            b"invalid",
+        )
+        .unwrap();
+        for (bytes, time) in [
+            (MAX_BATCH_BYTES, Duration::ZERO),
+            (0, Duration::from_secs(60)),
+        ] {
+            let result =
+                retry_existing_assets_bounded(&database, &settings, &provider, 200, bytes, time)
+                    .unwrap();
+            assert!(result.contains("尚未检查"));
+            assert!(!result.contains("格式无法识别"), "{result}");
+        }
+        assert!(provider.uploads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_upload_acknowledgements_are_idempotent() {
+        let (database, _, provider, keys) = retry_fixture(1);
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        record_uploaded(&database, &provider, &keys[0], GIF)
+                    })
+                })
+                .collect();
+            for job in jobs {
+                job.join().unwrap().unwrap();
+            }
+        });
+        assert!(already_uploaded(&database, &provider, &keys[0], GIF).unwrap());
+    }
+
+    #[test]
+    fn explicit_retry_uploads_existing_local_assets_after_cloud_mode_change() {
+        struct Images {
+            uploads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl studyapp_sync::AssetProvider for Images {
+            fn get_asset(&self, _: &str) -> studyapp_sync::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn put_asset(&self, _: &str, bytes: &[u8]) -> studyapp_sync::Result<()> {
+                assert_eq!(bytes, GIF);
+                self.uploads.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn check_connection(&self) -> studyapp_sync::Result<()> {
+                Ok(())
+            }
+            fn identity(&self) -> Option<String> {
+                Some("fixture-target".into())
+            }
+        }
+        let database = database();
+        let request = MediaRequest::Import {
+            generation: 1,
+            request: 1,
+            group: new_group(),
+            title: "local".into(),
+            input: MediaInput::Bytes(GIF.to_vec()),
+            settings: Default::default(),
+        };
+        let MediaOutcome::Inserted { markdown } = execute(&database, request, None).unwrap() else {
+            panic!()
+        };
+        let uploads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Images {
+            uploads: uploads.clone(),
+        };
+        let settings = ImageSettings {
+            storage: ImageStorage::Both,
+            ..Default::default()
+        };
+        let result = retry_existing_assets(&database, &settings, &provider).unwrap();
+        assert!(result.contains("1"));
+        assert_eq!(uploads.load(Ordering::SeqCst), 1);
+        retry_existing_assets(&database, &settings, &provider).unwrap();
+        assert_eq!(
+            uploads.load(Ordering::SeqCst),
+            1,
+            "acknowledged stable assets need no duplicate upload"
+        );
+        let key = asset_key(&image_uses(&markdown).unwrap()[0].destination).unwrap();
+        assert_eq!(
+            std::fs::read(local_asset(&database, &settings, &key).unwrap()).unwrap(),
+            GIF
+        );
+    }
+
+    #[test]
+    fn provider_factory_error_is_preserved_after_import_bytes_are_staged_locally() {
+        let database = database();
+        let group = new_group();
+        let result = execute_with_provider(
+            &database,
+            MediaRequest::Import {
+                generation: 1,
+                request: 1,
+                group: group.clone(),
+                title: "pending".into(),
+                input: MediaInput::Bytes(GIF.to_vec()),
+                settings: ImageSettings {
+                    storage: ImageStorage::Both,
+                    ..Default::default()
+                },
+            },
+            Err(anyhow::anyhow!("fixture credential cannot decrypt")),
+        );
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("fixture credential cannot decrypt"));
+        assert!(error.contains("本地"));
+        let files: Vec<_> =
+            std::fs::read_dir(database.parent().unwrap().join("images").join(group))
+                .unwrap()
+                .collect();
+        assert!(
+            files
+                .iter()
+                .any(|file| std::fs::read(file.as_ref().unwrap().path()).unwrap() == GIF)
+        );
+    }
+
+    #[test]
+    fn retained_draft_images_resolve_original_markdown_after_source_is_moved() {
+        let database = database();
+        let source = database.parent().unwrap().join("source.md");
+        let image = database.parent().unwrap().join("external.gif");
+        std::fs::write(&source, "![old](external.gif)").unwrap();
+        std::fs::write(&image, GIF).unwrap();
+        let content = std::fs::read_to_string(&source).unwrap();
+        let MediaOutcome::Retained { bindings, missing } = execute(
+            &database,
+            MediaRequest::Retain {
+                generation: 1,
+                request: 1,
+                group: new_group(),
+                title: "draft".into(),
+                content: content.clone(),
+                source_path: Some(source),
+                settings: Default::default(),
+            },
+            None,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert!(missing.is_empty());
+        assert!(bindings["external.gif"].starts_with(PREFIX));
+        std::fs::rename(
+            image,
+            database.parent().unwrap().join("retained-external.gif"),
+        )
+        .unwrap();
+        let MediaOutcome::Resolved { images, missing } = execute(
+            &database,
+            MediaRequest::ResolveRetained {
+                control: Default::default(),
+                generation: 1,
+                request: 2,
+                content: content.clone(),
+                note_path: None,
+                bindings,
+                settings: Default::default(),
+            },
+            None,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert!(missing.is_empty());
+        assert!(images.contains_key("external.gif"));
+        assert_eq!(content, "![old](external.gif)");
+    }
     const GIF:&[u8]=b"GIF89a\x01\0\x01\0\x80\0\0\0\0\0\xff\xff\xff!\xf9\x04\x01\0\0\0\0,\0\0\0\0\x01\0\x01\0\0\x02\x02D\x01\0;";
     fn database() -> PathBuf {
         tempfile::tempdir().unwrap().keep().join("library.sqlite3")
@@ -975,6 +1604,7 @@ mod tests {
                     .into_owned(),
             ),
             storage: ImageStorage::Local,
+            ..Default::default()
         };
         let MediaOutcome::Resolved { images, missing } = execute(
             &database,
@@ -1044,6 +1674,7 @@ mod tests {
             settings: ImageSettings {
                 root: None,
                 storage: ImageStorage::Cloud,
+                ..Default::default()
             },
         };
         let MediaOutcome::Inserted { markdown } =
@@ -1091,6 +1722,7 @@ mod tests {
                 settings: ImageSettings {
                     root: None,
                     storage: ImageStorage::Cloud,
+                    ..Default::default()
                 },
             },
             None,

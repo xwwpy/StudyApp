@@ -61,6 +61,259 @@ async function shortcuts(page, bindings) {
   assert.equal(await page.evaluate(() => typeof window.studyappEditor.setShortcuts), "function", "shortcut bridge must support live reconfiguration");
   await page.evaluate(bindings => window.studyappEditor.setShortcuts(bindings), bindings);
 }
+
+test("saving rebases image references without losing selection scroll or undo", async () => {
+  const original = "![first](old-a.png)\n\n" + Array.from({ length: 180 }, (_, i) => `A visible paragraph ${i} 🧠\n\n`).join("") + "![last](old-b.png)\n";
+  const { page, errors } = await setup(original);
+  const caret = original.indexOf("paragraph", 1000) + 4;
+  await select(page, caret);
+  await page.keyboard.type("kept-edit");
+  const edited = (await state(page)).text;
+  await page.evaluate(() => { document.querySelector('.cm-scroller').scrollTop = 2400; });
+  await page.waitForTimeout(100);
+  const before = await state(page);
+  const visibleAnchor = () => {
+    const viewport = document.querySelector('.cm-scroller').getBoundingClientRect();
+    const line = [...document.querySelectorAll('.cm-line')].find(line => line.textContent.trim() && line.getBoundingClientRect().top >= viewport.top);
+    return { text: line.textContent, top: line.getBoundingClientRect().top - viewport.top, scrollTop: document.querySelector('.cm-scroller').scrollTop };
+  };
+  const anchor = await page.evaluate(visibleAnchor);
+  await page.evaluate(() => window.studyappEditor.flush({ request: 77 }));
+  const frozenAnchor = await page.evaluate(visibleAnchor);
+  const first = edited.indexOf("old-a.png"), last = edited.indexOf("old-b.png");
+  const changes = [
+    { from: first, to: first + "old-a.png".length, insert: "studyapp-media:group/first.png" },
+    { from: last, to: last + "old-b.png".length, insert: "studyapp-media:group/last.png" }
+  ];
+  const target = edited.replace("old-a.png", changes[0].insert).replace("old-b.png", changes[1].insert);
+  const revision = (await state(page)).revision;
+  await page.evaluate(value => window.studyappEditor.rebase(value), {
+    previousGeneration: 41, previousRevision: revision, generation: 42, text: target, readonly: true, changes
+  });
+  await page.waitForTimeout(100);
+  const rebased = await state(page);
+  const shift = changes[0].insert.length - "old-a.png".length;
+  assert.equal(rebased.text, target);
+  assert.equal(rebased.readonly, true);
+  assert.deepEqual(rebased.selection, { anchor: before.selection.anchor + shift, head: before.selection.head + shift });
+  const savedAnchor = await page.evaluate(visibleAnchor);
+  assert.equal(savedAnchor.text, anchor.text, JSON.stringify({ anchor, savedAnchor }));
+  assert.ok(Math.abs(savedAnchor.top - anchor.top) < 5, JSON.stringify({ anchor, frozenAnchor, savedAnchor }));
+  await page.evaluate(() => window.studyappEditor.setReadonly(false));
+  await action(page, { type: "command", name: "undo" });
+  const undone = await state(page);
+  assert.equal(undone.text, original.replace("old-a.png", changes[0].insert).replace("old-b.png", changes[1].insert));
+  assert.equal(undone.generation, 42);
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+async function pasteFiles(page, sizes = [3, 3, 3]) {
+  return page.evaluate(sizes => {
+    const clipboard = new DataTransfer();
+    sizes.forEach((size, index) => clipboard.items.add(new File([new Uint8Array(size).fill(index + 1)], `image-${index}.png`, { type: "image/png" })));
+    const event = new ClipboardEvent("paste", { clipboardData: clipboard, bubbles: true, cancelable: true });
+    document.querySelector(".cm-content").dispatchEvent(event);
+    return event.defaultPrevented;
+  }, sizes);
+}
+
+test("image clipboard paste preserves file order while reading only one image at a time", async () => {
+  const { page, errors } = await setup("keep text");
+  await page.evaluate(() => {
+    const read = FileReader.prototype.readAsDataURL;
+    window.readerStarts = [];
+    FileReader.prototype.readAsDataURL = function (file) {
+      window.readerStarts.push(file.name);
+      setTimeout(() => read.call(this, file), file.name === "image-0.png" ? 120 : 0);
+    };
+  });
+  assert.equal(await pasteFiles(page), true);
+  await page.waitForTimeout(30);
+  assert.deepEqual(await page.evaluate(() => window.readerStarts), ["image-0.png"]);
+  await page.waitForFunction(() => window.messages.filter(message => message.type === "pasteImage").length === 3);
+  assert.deepEqual(await page.evaluate(() => window.messages.filter(message => message.type === "pasteImage").map(message => [message.name, message.base64, message.generation])), [
+    ["image-0.png", "AQEB", 41], ["image-1.png", "AgIC", 41], ["image-2.png", "AwMD", 41]
+  ]);
+  assert.equal((await state(page)).text, "keep text");
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test("image clipboard paste rejects oversized files and bounded batches before reading", async () => {
+  const { page, errors } = await setup("keep text");
+  await page.evaluate(() => {
+    window.readerStarts = 0;
+    const read = FileReader.prototype.readAsDataURL;
+    FileReader.prototype.readAsDataURL = function (file) { window.readerStarts++; read.call(this, file); };
+  });
+  for (const sizes of [[10 * 1024 * 1024 + 1], Array(21).fill(1), Array(3).fill(8 * 1024 * 1024)]) {
+    assert.equal(await pasteFiles(page, sizes), true);
+    assert.equal(await page.evaluate(() => window.readerStarts), 0);
+  }
+  assert.equal((await state(page)).text, "keep text");
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test("image clipboard paste discards late readers and queued files after a document switch", async () => {
+  const { page, errors } = await setup("old document");
+  await page.evaluate(() => {
+    const read = FileReader.prototype.readAsDataURL;
+    window.readerStarts = [];
+    FileReader.prototype.readAsDataURL = function (file) {
+      window.readerStarts.push(file.name);
+      setTimeout(() => read.call(this, file), 100);
+    };
+  });
+  await pasteFiles(page);
+  await page.evaluate(() => window.studyappEditor.load({ generation: 42, text: "new document", readonly: false }));
+  await page.waitForTimeout(180);
+  assert.deepEqual(await page.evaluate(() => window.messages.filter(message => message.type === "pasteImage")), []);
+  assert.deepEqual(await page.evaluate(() => window.readerStarts), ["image-0.png"]);
+  assert.equal((await state(page)).text, "new document");
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test("image clipboard handler leaves normal text paste unchanged", async () => {
+  const { page, errors } = await setup("before ");
+  await select(page, 7);
+  await page.evaluate(() => {
+    const clipboard = new DataTransfer();
+    clipboard.setData("text/plain", "pasted 文本");
+    document.querySelector(".cm-content").dispatchEvent(new ClipboardEvent("paste", { clipboardData: clipboard, bubbles: true, cancelable: true }));
+  });
+  assert.equal((await state(page)).text, "before pasted 文本");
+  assert.deepEqual(await page.evaluate(() => window.messages.filter(message => ["pasteImage", "requestNativeImagePaste"].includes(message.type))), []);
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test("image clipboard native fallback ignores synthetic empty paste events", async () => {
+  const { page, errors } = await setup("keep text");
+  await select(page, 9);
+  await page.evaluate(() => {
+    const clipboard = new DataTransfer();
+    document.querySelector(".cm-content").dispatchEvent(new ClipboardEvent("paste", { clipboardData: clipboard, bubbles: true, cancelable: true }));
+  });
+  assert.deepEqual(await page.evaluate(() => window.messages.filter(message => ["pasteImage", "requestNativeImagePaste"].includes(message.type))), []);
+  assert.equal((await state(page)).text, "keep text");
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test("image clipboard paste bounds overlapping paste events and resumes after a read error", async () => {
+  const { page, errors } = await setup("keep text");
+  await page.evaluate(() => {
+    const read = FileReader.prototype.readAsDataURL;
+    window.readerStarts = [];
+    let first = true;
+    FileReader.prototype.readAsDataURL = function (file) {
+      window.readerStarts.push(file.name);
+      if (first) {
+        first = false;
+        setTimeout(() => this.dispatchEvent(new Event("error")), 120);
+      } else read.call(this, file);
+    };
+  });
+  await pasteFiles(page, Array(20).fill(1));
+  await pasteFiles(page, [1]);
+  await page.waitForFunction(() => window.messages.filter(message => message.type === "pasteImage").length === 19);
+  assert.equal(await page.evaluate(() => window.readerStarts.length), 20);
+  assert.deepEqual(await page.evaluate(() => window.messages.filter(message => message.type === "pasteImage").map(message => message.name)), Array.from({ length: 19 }, (_, index) => `image-${index + 1}.png`));
+  await pasteFiles(page, [1]);
+  await page.waitForFunction(() => window.messages.filter(message => message.type === "pasteImage").length === 20);
+  assert.equal((await state(page)).text, "keep text");
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test("semantic themes retain an aligned editable table and nested list geometry", async () => {
+  const text = "# Reading\n\n| Name | Count |\n| :--- | ---: |\n| alpha | 123 |\n| beta | 4 |\n\n- first\n  - child\n    - grandchild\n\n```js\nconst value = 42;\n```";
+  const {page, errors} = await setup(text);
+  await select(page,text.indexOf("alpha")+2);
+  const rows = await page.locator(".md-table-row").evaluateAll(rows => rows.map(row => [...row.querySelectorAll(".md-table-cell")].map(cell => ({left:cell.getBoundingClientRect().left,width:cell.getBoundingClientRect().width,align:getComputedStyle(cell).textAlign}))));
+  assert.ok(rows.every(row => row.length === 2),"editing one row must preserve every table cell");
+  for (const row of rows) { assert.ok(Math.abs(row[1].left-rows[0][1].left)<2); assert.equal(row[1].align,"right"); }
+  const depth = await page.locator(".md-list-line").evaluateAll(lines => lines.map(line => ({depth:Number(line.dataset.listDepth),padding:parseFloat(getComputedStyle(line).paddingLeft)})));
+  assert.deepEqual(depth.map(item => item.depth),[1,2,3]);
+  assert.ok(depth[2].padding>depth[1].padding && depth[1].padding>depth[0].padding);
+  await page.evaluate(() => window.studyappEditor.setTheme({fontSize:20,markdown:{code_size:18,line_height:190,reading_width:700,body_font:"serif",mono_font:"mono",colors:{heading:"#102030",code:"#102030",code_background:"#ffffff"},table_grid:true,table_stripes:true,code_border:true,code_radius:12}}));
+  assert.equal(await page.locator(".md-code-line").first().evaluate(line => getComputedStyle(line).fontSize),"18px");
+  assert.equal(await page.locator(".md-code-start").count(),1);
+  assert.equal(await page.locator(".md-code-end").count(),1);
+  assert.equal((await state(page)).text,text);
+  assert.deepEqual(errors,[]);
+  await page.close();
+});
+
+test("semantic reading fixtures remain readable in light dark and two custom themes", async () => {
+  const text = "# 清晰阅读与自然编辑\n\n正文包含 **重点**、*强调*、[延伸阅读](https://example.test) 和 `inline code`。\n\n> 引用文字与背景保持可读。\n\n- 一级要点\n  1. 二级编号\n     - [x] 三级任务\n       延续任务内容\n\n| 名称 | 状态 | 数量 |\n| :--- | :---: | ---: |\n| alpha | 完成 | 123 |\n| beta | 进行中 | 4 |\n\n```javascript\nconst answer = 'readable'; // annotation\nfunction study() { return 42; }\n```";
+  const {page,errors} = await setup(text);
+  await page.setViewportSize({width:1100,height:1000});
+  await select(page,text.indexOf("alpha")+2);
+  const themes = [
+    ["light",{mode:"light",background:"#F4F5F7",surface:"#FFFFFF",text:"#24272D",accent:"#2478D4",muted:"#AAAAAA"}],
+    ["dark",{mode:"dark",background:"#1D1F23",surface:"#272A30",text:"#EFF0F3",accent:"#70ACF7",muted:"#999999"}],
+    ["custom-paper",{mode:"light",background:"#FFF8E7",surface:"#F5EEDB",text:"#393229",accent:"#655436",markdown:{body_font:"serif",body_size:17,code_size:16,line_height:185,reading_width:850,code_radius:12,colors:{heading:"#5B3D23",link:"#365F60",quote_background:"#ECE5D4",code_background:"#E8E1D0",code:"#272C33",table_stripe:"#EEE7D5",list:"#59482F"}}}],
+    ["custom-ink",{mode:"dark",background:"#111827",surface:"#1E293B",text:"#E2E8F0",accent:"#7DD3FC",markdown:{body_size:16,code_size:15,line_height:180,reading_width:820,table_grid:true,table_stripes:true,colors:{heading:"#BAE6FD",link:"#7DD3FC",quote:"#CBD5E1",quote_background:"#263449",code_background:"#0B1220",code:"#E2E8F0",table_stripe:"#263449",syntax_keyword:"#C4B5FD",syntax_string:"#86EFAC"}}}],
+  ];
+  const directory=fileURLToPath(new URL("../test-results/",import.meta.url));await mkdir(directory,{recursive:true});
+  for (const [name,theme] of themes) {
+    await page.evaluate(theme=>window.studyappEditor.setTheme(theme),theme);
+    await page.waitForTimeout(60);
+    const samples=await page.evaluate(()=>{
+      const background=node=>{for(let item=node;item;item=item.parentElement){const value=getComputedStyle(item).backgroundColor;if(value!=="rgba(0, 0, 0, 0)"&&value!=="transparent")return value;}return "rgb(255, 255, 255)";};
+      return [...document.querySelectorAll('.md-heading,.md-link,.md-quote,.md-inline-code,.md-table-cell,.md-bullet,.md-list-marker,.md-task[aria-checked="true"],.md-code-line,[class*="tok-"]')].map(node=>({class:node.className,foreground:getComputedStyle(node).color,background:background(node)}));
+    });
+    const luminance=css=>css.match(/[\d.]+/g).slice(0,3).map(Number).map(v=>v/255).map(v=>v<=.04045?v/12.92:((v+.055)/1.055)**2.4).reduce((sum,v,i)=>sum+v*[.2126,.7152,.0722][i],0);
+    assert.ok(samples.length>20);
+    for(const sample of samples){const a=luminance(sample.foreground),b=luminance(sample.background);assert.ok((Math.max(a,b)+.05)/(Math.min(a,b)+.05)>=4.5,JSON.stringify({name,sample}));}
+    const cells=await page.locator('.md-table-row').evaluateAll(rows=>rows.map(row=>[...row.querySelectorAll('.md-table-cell')].map(cell=>({left:cell.getBoundingClientRect().left,width:cell.getBoundingClientRect().width,align:getComputedStyle(cell).textAlign}))));
+    assert.ok(cells.every(row=>row.length===3));
+    for(const row of cells){assert.ok(Math.abs(row[1].left-cells[0][1].left)<2);assert.equal(row[1].align,"center");assert.equal(row[2].align,"right");}
+    const caretBox=await page.locator('.cm-cursor').first().boundingBox();
+    const activeCell=await page.locator('.md-table-row').nth(1).locator('.md-table-cell').first().boundingBox();
+    assert.ok(caretBox.x>=activeCell.x && caretBox.y>=activeCell.y && caretBox.y<activeCell.y+activeCell.height,`${name}: caret must follow changed reading geometry`);
+    await page.screenshot({path:directory+`product-theme-${name}.png`});
+  }
+  const cell=page.locator('.md-table-row').nth(1).locator('.md-table-cell').first();
+  await cell.click({position:{x:35,y:15}});
+  const caret=(await state(page)).selection.anchor;
+  assert.ok(caret>=text.indexOf("alpha")-1 && caret<=text.indexOf("alpha")+6,"real click must resolve within its source cell");
+  await page.keyboard.insertText("X");
+  assert.equal((await state(page)).text,text.slice(0,caret)+"X"+text.slice(caret));
+  await page.keyboard.press("Control+z");
+  assert.equal((await state(page)).text,text);
+  assert.deepEqual(errors,[]);await page.close();
+});
+
+test("empty and escaped table cells preserve shared columns and source selection",async()=>{
+  const text="| Left || Right |\n| :--- | :---: | ---: |\n|a||3|\n| escaped \\| pipe | `code` | 4 |\n";
+  const {page,errors}=await setup(text);await select(page,text.indexOf("|a||")+2);
+  const rows=await page.locator('.md-table-row').evaluateAll(rows=>rows.map(row=>[...row.querySelectorAll('.md-table-cell')].map(cell=>({text:cell.textContent,left:cell.getBoundingClientRect().left,align:getComputedStyle(cell).textAlign}))));
+  assert.equal(rows[1].length,3);assert.equal(rows[1][1].text,"");assert.equal(rows[1][2].text,"3");
+  assert.equal(rows[0].length,3);assert.equal(rows[0][1].text,"");
+  const overflow=await page.locator('.md-table-row').evaluateAll(rows=>rows.some(row=>[...row.querySelectorAll('.md-table-cell')].some(cell=>cell.getBoundingClientRect().right>row.getBoundingClientRect().right+1)));
+  assert.equal(overflow,false,"empty headers must not make the declared columns overflow the table");
+  assert.equal(rows[2].length,3);assert.equal(rows[2][2].align,"right");
+  for(const row of rows) assert.ok(Math.abs(row[2].left-rows[0][2].left)<2);
+  assert.equal((await state(page)).text,text);assert.deepEqual(errors,[]);await page.close();
+});
+
+test("custom code surfaces keep language labels and source highlighting readable",async()=>{
+  const text="# Plain paper\n\n```js\nconst value = 'text'; // comment\n```";
+  const {page}=await setup(text);await select(page,0);
+  await page.evaluate(()=>window.studyappEditor.setTheme({background:"#FFFFFF",surface:"#FFFFFF",text:"#24272D",markdown:{colors:{code_background:"#111827",code:"#EEEEEE"}}}));
+  const ratio=(a,b)=>{const l=css=>css.match(/[\d.]+/g).slice(0,3).map(v=>Number(v)/255).map(v=>v<=.04045?v/12.92:((v+.055)/1.055)**2.4).reduce((s,v,i)=>s+v*[.2126,.7152,.0722][i],0);const x=l(a),y=l(b);return(Math.max(x,y)+.05)/(Math.min(x,y)+.05);};
+  const label=await page.locator('.md-code-language').evaluate(node=>({fg:getComputedStyle(node).color,bg:getComputedStyle(node.closest('.md-code-line')).backgroundColor}));
+  assert.ok(ratio(label.fg,label.bg)>=4.5);
+  await page.evaluate(()=>window.studyappEditor.setSource(true));
+  const colors=await page.locator('[class*="tok-"]').evaluateAll(nodes=>nodes.map(node=>getComputedStyle(node).color));
+  assert.ok(colors.length>3);for(const color of colors)assert.ok(ratio(color,"rgb(255,255,255)")>=4.5,`source highlight ${color}`);
+  assert.equal((await state(page)).text,text);await page.close();
+});
 function replayRawChanges(raw, messages, preferredEol) {
   for (const [index, message] of messages.entries()) {
     assert.ok(message.changes.length <= 4096, `emitted ${message.changes.length} patches`);

@@ -1,7 +1,6 @@
 use crate::controls::Button;
 use crate::{app::StudyApp, components::*, editor_lifecycle::NoteIntent, worker::Work};
 use gpui_kit::{
-    base::{Scrollbar, ScrollbarMode},
     component::{Disableable, Sizable, button::ButtonVariants},
     prelude::FluentBuilder,
     *,
@@ -19,21 +18,13 @@ fn size_label(bytes: u64) -> String {
 }
 
 fn storage_copy_list(scroll: &ScrollHandle) -> Stateful<Div> {
-    column()
-        .id("storage-copy-list")
-        .relative()
+    scroll_body("storage-copy-list", scroll)
+        .flex_shrink_0()
         .max_h(px(340.))
         .pr_4()
-        .overflow_y_scroll()
-        .track_scroll(scroll)
         // GPUI dispatches the built-in scrolling before this bubble callback.
         // Consume every wheel event here, even after the offset reaches an end.
         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-        .child(
-            Scrollbar::vertical(scroll)
-                .id("storage-copy-scrollbar")
-                .mode(ScrollbarMode::Always),
-        )
 }
 
 impl StudyApp {
@@ -102,7 +93,7 @@ impl StudyApp {
         } else if self.note_editor.is_some() {
             self.request_note_action(NoteIntent::PrepareMigration, window, cx);
         } else {
-            self.pick_migration(window, cx);
+            self.begin_draft_drain(NoteIntent::PrepareMigration, cx);
         }
     }
 
@@ -122,12 +113,14 @@ impl StudyApp {
         self.sync_panel
             .update(cx, |panel, cx| panel.set_editing_locked(true, cx));
         cx.spawn_in(window, async move |this, cx| {
+            let initial_directory = std::path::PathBuf::from(&library);
             let path = cx
                 .background_executor()
-                .spawn(async {
-                    rfd::FileDialog::new()
-                        .set_title("选择新的空文件夹（迁移后保留原资料）")
-                        .pick_folder()
+                .spawn(async move {
+                    crate::folder_picker::pick_folder(
+                        "选择新的空文件夹（迁移后保留原资料）",
+                        Some(initial_directory),
+                    )
                 })
                 .await;
             let _ = this.update_in(cx, |this, _, cx| {
@@ -167,39 +160,59 @@ impl StudyApp {
         )
         .child(muted("只可逐个删除当前资料库的托管副本。跟踪的外部文件不可删除；学习记录与历史版本始终保留。"))
         .when_some(self.storage_report.as_ref().filter(|r| r.data_path == self.last_library), |view, report| {
-            let total = report.database_bytes.saturating_add(report.managed_bytes)
-                .saturating_add(report.retained_bytes).saturating_add(report.auxiliary_bytes)
-                .saturating_add(report.backup_bytes);
-            view.child(heading(format!("当前资料库合计 {}", size_label(total))))
-                .child(muted(format!("数据库与历史 {} · 托管副本 {} · 保留文件 {} · 备份 {} · 缓存与配置 {}",
-                    size_label(report.database_bytes), size_label(report.managed_bytes),
-                    size_label(report.retained_bytes), size_label(report.backup_bytes), size_label(report.auxiliary_bytes))))
+            let timestamp = chrono::DateTime::from_timestamp(report.scanned_at, 0)
+                .map(|time| time.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "尚未统计".into());
+            view.child(heading(format!("已统计逻辑大小 {}{}", size_label(report.logical_bytes()), if report.incomplete { "（统计不完整）" } else { "" })))
+                .child(muted(format!("统计时间：{timestamp} · 包含已登记的外置图片")))
+                .child(muted("按文件路径的逻辑长度统计。硬链接可能共享磁盘空间；此数值不代表物理占用或清理后实际释放量，云端空间未计入。"))
                 .child(storage_copy_list(&self.storage_copy_scroll).test_support()
+                    .child(column().flex_shrink_0().gap_2().children([
+                        ("数据库与历史", report.database_bytes, "笔记历史、学习记录与数据库日志"),
+                        ("托管笔记", report.managed_bytes, "当前资料库自有的 Markdown 副本"),
+                        ("本地图片", report.image_bytes, "库内图片及索引登记的当前、历史位置"),
+                        ("草稿", report.draft_bytes, "未提交的笔记草稿，支持多份草稿"),
+                        ("保留与恢复文件", report.retained_bytes, "发布暂存、原始副本及未归属文件"),
+                        ("备份", report.backup_bytes, "资料库目录内的数据库备份"),
+                        ("配置与其他", report.auxiliary_bytes, "设置版本、图片索引与其他文件"),
+                    ].into_iter().map(|(title, bytes, description)| column().flex_shrink_0().gap_1().py_2()
+                        .child(row().child(div().flex_1().child(title)).child(muted(size_label(bytes))))
+                        .child(muted(description).text_xs()))))
+                    .when(!report.image_locations.is_empty(), |view| view.child(column().flex_shrink_0()
+                        .child(muted(format!("已登记图片位置：{} 处；只统计已知资产，不扫描外置目录中的其他文件。", report.image_locations.len())))
+                        .when(show_file_paths, |view| view.children(report.image_locations.iter().map(|location| muted(display_path(location)).text_xs())))))
+                    .when(report.incomplete, |view| view.child(column().flex_shrink_0()
+                        .child(muted("部分位置未能统计，下方是原因；已统计的数据仍然有效。"))
+                        .children(report.issues.iter().map(|issue| column().flex_shrink_0().gap_1()
+                            .child(muted(issue.message.clone()))
+                            .when(show_file_paths, |view| view.child(muted(display_path(&issue.path)).text_xs()))))))
+                    .child(heading("托管副本").flex_shrink_0())
                     .when(report.copies.is_empty(), |v| v.child(muted("没有可清理的托管副本。")))
                     .children(report.copies.iter().map(|copy| {
                         let id = copy.note_id.clone();
                         let history_id = id.clone();
+                        let reveal_path = display_path(&copy.path);
                         let path_id = SharedString::from(format!("storage-copy-path-{id}"));
-                        let in_draft = self.note_editor.as_ref().or(self.recoverable_draft.as_ref())
-                            .is_some_and(|d| d.note_id.as_ref() == Some(&id));
-                        column().gap_2().p_3().rounded_lg().bg(crate::theme::color(BG))
+                        let in_draft = self.draft_catalog.values().any(|r|r.active() && r.draft.note_id.as_ref()==Some(&id));
+                        column().flex_shrink_0().gap_2().p_3().rounded_lg().bg(crate::theme::color(BG))
                             .child(row().child(div().flex_1().min_w_0().truncate().child(copy.title.clone()))
-                                .child(muted(size_label(copy.bytes)).flex_shrink_0())
+                                .child(muted(size_label(copy.bytes)).flex_shrink_0()))
+                            .child(muted(copy.state.label()))
+                            .child(row().flex_wrap()
+                                .child(Button::new(SharedString::from(format!("copy-reveal-{id}")))
+                                    .small().ghost().label("定位文件").disabled(!copy.deletable)
+                                    .on_click(move |_, _, cx| cx.reveal_path(std::path::Path::new(&reveal_path))))
                                 .child(Button::new(SharedString::from(format!("copy-history-{id}")))
-                                    .small().ghost().label("历史与恢复").disabled(blocked || self.note_editor.is_some())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .small().ghost().label("历史与恢复").disabled(blocked)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
                                         if this.guard_settings(crate::settings_ui::SettingsContinuation::ViewNote(history_id.clone()), cx) {
                                             return;
                                         }
-                                        this.selected_note = Some(history_id.clone());
-                                        this.selected_version = this.snapshot.as_ref().and_then(|s|
-                                            s.versions.iter().rev().find(|v| v.note_id == history_id).map(|v| v.id.clone()));
-                                        this.page = crate::app::Page::Notes;
-                                        this.history = true;
-                                        cx.notify();
+                                        let version=this.snapshot.as_ref().and_then(|s|s.versions.iter().rev().find(|v|v.note_id==history_id).map(|v|v.id.clone()));
+                                        this.select_note_document(history_id.clone(),version,true,window,cx);
                                     })))
                                 .child(Button::new(SharedString::from(format!("delete-copy-{id}")))
-                                    .small().ghost().label("删除托管副本")
+                                    .small().ghost().label("清理这一份副本")
                                     .disabled(blocked || !copy.deletable || in_draft)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if this.guard_settings(crate::settings_ui::SettingsContinuation::ConfirmDeleteCopy(id.clone()), cx) {
@@ -209,7 +222,6 @@ impl StudyApp {
                                     }))))
                             .when(show_file_paths, |v| v.child(muted(display_path(&copy.path))
                                 .id(path_id).test_support().text_xs().truncate()))
-                            .when(copy.detached, |v| v.child(muted("已取消管理")))
                             .when(in_draft, |v| v.child(muted("请先保存或删除该笔记的草稿，再清理副本。")))
                             .when_some(copy.reason.as_ref(), |v, reason| v.child(muted(reason.clone())))
                     })))
@@ -223,10 +235,9 @@ impl StudyApp {
             && self.draft_discard.is_none()
             && self.draft_persist.is_none()
             && !self
-                .note_editor
-                .as_ref()
-                .or(self.recoverable_draft.as_ref())
-                .is_some_and(|draft| draft.note_id.as_deref() == Some(note_id))
+                .draft_catalog
+                .values()
+                .any(|r| r.active() && r.draft.note_id.as_deref() == Some(note_id))
             && self
                 .storage_report
                 .as_ref()

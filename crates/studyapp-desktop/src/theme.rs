@@ -4,7 +4,10 @@ use gpui_kit::{
     *,
 };
 use std::cell::Cell;
-use studyapp_core::{AppearanceSettings, ThemeMode, parse_theme_color, theme_contrast};
+use studyapp_core::{
+    AppearanceSettings, MARKDOWN_COLORS, MarkdownLayout, ThemeMode, ThemePalette,
+    parse_theme_color, readable_theme_color, theme_contrast,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedTheme {
@@ -21,6 +24,8 @@ pub struct ResolvedTheme {
     pub warning: u32,
     pub font_size: u16,
     pub spacing: u16,
+    pub markdown_colors: [u32; 24],
+    pub markdown_layout: MarkdownLayout,
 }
 
 fn blend(first: u32, second: u32, weight: f32) -> u32 {
@@ -39,9 +44,9 @@ pub fn resolve(settings: &AppearanceSettings, system_dark: bool) -> ResolvedThem
         _ => false,
     };
     let (mut background, mut surface, mut text, mut accent) = if dark {
-        (0x1D1F23, 0x272A30, 0xEFF0F3, 0x70ACF7)
+        (0x1D1F23, 0x272A30, 0xEFF0F3, 0x9EC5B6)
     } else {
-        (0xF4F5F7, 0xFFFFFF, 0x24272D, 0x2478D4)
+        (0xF4F5F7, 0xFFFFFF, 0x24272D, 0x507F72)
     };
     if settings.mode == ThemeMode::Custom
         && let Some(custom) = settings
@@ -54,24 +59,60 @@ pub fn resolve(settings: &AppearanceSettings, system_dark: bool) -> ResolvedThem
         accent = parse_theme_color(&custom.accent).unwrap_or(accent);
         dark = theme_contrast(background, 0xFFFFFF) > theme_contrast(background, 0x000000);
     }
+    let markdown = if settings.mode == ThemeMode::Custom {
+        settings
+            .custom_presets
+            .iter()
+            .find(|preset| Some(&preset.id) == settings.active_preset.as_ref())
+            .filter(|preset| {
+                preset.palette.validate().is_ok()
+                    && preset.markdown.validate(&preset.palette).is_ok()
+            })
+            .map(|preset| preset.markdown.clone())
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    let resolved_palette = ThemePalette {
+        background: format!("#{background:06X}"),
+        surface: format!("#{surface:06X}"),
+        text: format!("#{text:06X}"),
+        accent: format!("#{accent:06X}"),
+    };
+    let selected_surface = blend(surface, accent, if dark { 0.22 } else { 0.10 });
+    let accent_soft = if theme_contrast(text, selected_surface) >= 4.5 {
+        selected_surface
+    } else {
+        surface
+    };
     ResolvedTheme {
         dark,
         background,
         surface,
         text,
         accent,
-        muted: blend(text, surface, 0.38),
+        muted: readable_theme_color(
+            blend(text, surface, 0.38),
+            &[
+                background,
+                surface,
+                accent_soft,
+                neutral_selection(surface, text),
+            ],
+        ),
         accent_text: if theme_contrast(accent, 0xFFFFFF) >= theme_contrast(accent, 0x000000) {
             0xFFFFFF
         } else {
             0x000000
         },
-        accent_soft: blend(surface, accent, if dark { 0.22 } else { 0.10 }),
+        accent_soft,
         border: blend(surface, text, 0.14),
         danger: if dark { 0xFF9393 } else { 0xBE3434 },
         warning: if dark { 0xF3BE79 } else { 0x9B5719 },
         font_size: settings.font_size.clamp(12, 22),
         spacing: settings.spacing.clamp(4, 16),
+        markdown_colors: markdown.resolved_colors(&resolved_palette),
+        markdown_layout: markdown.layout,
     }
 }
 
@@ -101,6 +142,13 @@ pub fn color(token: u32) -> Rgba {
 impl ResolvedTheme {
     pub fn editor_tokens(self) -> serde_json::Value {
         let hex = |color| format!("#{color:06X}");
+        let mut markdown = serde_json::to_value(self.markdown_layout).expect("safe style layout");
+        markdown["colors"] = MARKDOWN_COLORS
+            .into_iter()
+            .zip(self.markdown_colors)
+            .map(|(key, value)| (key.to_owned(), serde_json::Value::String(hex(value))))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
         serde_json::json!({
             "mode": if self.dark { "dark" } else { "light" },
             "accent": hex(self.accent), "background": hex(self.background),
@@ -109,6 +157,7 @@ impl ResolvedTheme {
             "muted": hex(self.muted), "border": hex(self.border),
             "selection": hex(self.accent_soft), "fontSize": self.font_size,
             "spacing": 1.3 + (self.spacing as f64 - 4.) / 12. * 1.1,
+            "markdown": markdown,
         })
     }
 }
@@ -118,6 +167,24 @@ pub fn system_is_dark(appearance: WindowAppearance) -> bool {
         appearance,
         WindowAppearance::Dark | WindowAppearance::VibrantDark
     )
+}
+
+/// A quiet surface selection, shared by tree rows and collection navigation.
+pub fn selection_color() -> Hsla {
+    rgb(selection_surface(palette())).into()
+}
+
+fn selection_surface(current: ResolvedTheme) -> u32 {
+    neutral_selection(current.surface, current.text)
+}
+
+fn neutral_selection(surface: u32, text: u32) -> u32 {
+    let fill = blend(surface, text, 0.08);
+    if theme_contrast(text, fill) >= 4.5 {
+        fill
+    } else {
+        surface
+    }
 }
 
 pub fn apply(settings: &AppearanceSettings, system_dark: bool, cx: &mut App) -> ResolvedTheme {
@@ -133,6 +200,7 @@ pub fn apply(settings: &AppearanceSettings, system_dark: bool, cx: &mut App) -> 
         cx,
     );
     Theme::update(cx, |theme| {
+        theme.scrollbar_mode = gpui_kit::component::scroll::ScrollbarMode::Always;
         theme.font_family = "Microsoft YaHei UI".into();
         theme.font_size = px(p.font_size as f32);
         let c = &mut theme.colors;
@@ -190,6 +258,18 @@ mod tests {
     use super::resolve;
     use studyapp_core::{AppearanceSettings, ThemeMode};
     #[test]
+    fn built_in_selection_is_visible_and_all_labels_remain_readable() {
+        for dark in [false, true] {
+            let current = resolve(&AppearanceSettings::default(), dark);
+            let selection = super::selection_surface(current);
+            assert_ne!(selection, current.surface, "selection must remain visible");
+            for label in [current.text, current.muted] {
+                assert!(studyapp_core::theme_contrast(label, selection) >= 4.5);
+            }
+        }
+    }
+
+    #[test]
     fn system_resolution_and_editor_tokens_follow_same_safe_palette() {
         let settings = AppearanceSettings::default();
         assert!(!resolve(&settings, false).dark);
@@ -212,6 +292,7 @@ mod tests {
         settings.custom_presets.push(studyapp_core::ThemePreset {
             id: "bad".into(),
             name: "bad".into(),
+            markdown: Default::default(),
             palette: studyapp_core::ThemePalette {
                 text: "url(x)".into(),
                 ..Default::default()
@@ -223,6 +304,44 @@ mod tests {
                 .editor_tokens()
                 .to_string()
                 .contains("url(")
+        );
+    }
+    #[test]
+    fn semantic_styles_change_resolution_and_protect_derived_text() {
+        let mut settings = AppearanceSettings {
+            mode: ThemeMode::Custom,
+            active_preset: Some("gray".into()),
+            ..Default::default()
+        };
+        settings.custom_presets.push(studyapp_core::ThemePreset {
+            id: "gray".into(),
+            name: "Gray".into(),
+            palette: studyapp_core::ThemePalette {
+                background: "#FFFFFF".into(),
+                surface: "#FFFFFF".into(),
+                text: "#767676".into(),
+                accent: "#808080".into(),
+            },
+            markdown: Default::default(),
+        });
+        let before = resolve(&settings, false);
+        for text in [before.text, before.muted] {
+            assert!(studyapp_core::theme_contrast(text, super::selection_surface(before)) >= 4.5);
+        }
+        assert!(studyapp_core::theme_contrast(before.muted, before.background) >= 4.5);
+        assert!(studyapp_core::theme_contrast(before.text, before.accent_soft) >= 4.5);
+        assert!(studyapp_core::theme_contrast(before.muted, before.accent_soft) >= 4.5);
+        assert!(studyapp_core::theme_contrast(before.markdown_colors[2], before.background) >= 4.5);
+        settings.custom_presets[0].markdown.layout.code_size = 19;
+        let after = resolve(&settings, false);
+        assert_ne!(
+            before, after,
+            "appearance refresh must see a Markdown-only edit"
+        );
+        assert_eq!(after.editor_tokens()["markdown"]["code_size"], 19);
+        assert_eq!(
+            after.editor_tokens()["markdown"]["colors"]["body"],
+            "#767676"
         );
     }
 }

@@ -45,3 +45,14 @@ The regression moves once per target and reads the actual UI-thread
 `GetCursor` handle, requiring a non-null expected hand/resize/arrow. A
 non-null global `GetCursorInfo` handle must also agree; suppressed CI
 desktop cursors may have a null global handle.
+
+## Window movement diagnostics (test-support only)
+
+With the `test-support` feature, `WW_STUDY_WINDOW_DRAG_TRACE` may name a JSONL
+file for one aggregate record per Win32 move/resize modal loop. It reports move
+callbacks, queued work, draw requests, actual rendered scenes and elapsed time.
+The file is written only after leaving the loop. These diagnostics are absent
+from ordinary builds; they do not change the timer or callback behavior.
+
+The separate `vendor/gpui-pre` patch avoids rebuilding an unchanged Windows
+client scene on pure desktop movement while retaining every bounds observer.

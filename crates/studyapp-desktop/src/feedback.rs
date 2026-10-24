@@ -10,6 +10,7 @@ pub struct ModalFocus {
     handle: FocusHandle,
     previous: Option<WeakFocusHandle>,
     active: bool,
+    scroll: ScrollHandle,
 }
 
 impl ModalFocus {
@@ -18,6 +19,7 @@ impl ModalFocus {
             handle: cx.focus_handle(),
             previous: None,
             active: false,
+            scroll: ScrollHandle::new(),
         }
     }
 
@@ -60,13 +62,13 @@ impl ModalFocus {
 /// Its focus trap and occluding popup provide keyboard and pointer containment.
 pub fn modal_shell(
     content: impl IntoElement,
-    focus: &FocusHandle,
+    focus: &ModalFocus,
     window: &Window,
     cx: &mut App,
 ) -> Dialog {
     let viewport = window.viewport_size();
     Dialog::new(cx)
-        .focus_handle(focus.clone())
+        .focus_handle(focus.handle().clone())
         .close_on_backdrop_press(false)
         .backdrop(
             div()
@@ -86,8 +88,7 @@ pub fn modal_shell(
                 .bg(crate::theme::color(0xFFFFFF))
                 .text_color(crate::theme::color(INK))
                 .child(
-                    div()
-                        .id("modal-content-scroll")
+                    scroll_body("modal-content-scroll", &focus.scroll)
                         .test_support()
                         .max_h((viewport.height - px(112.)).max(px(120.)))
                         .overflow_y_scroll()
@@ -151,7 +152,7 @@ mod tests {
                         row()
                             .child(Button::new("modal-first").label("First"))
                             .child(Button::new("modal-last").label("Last")),
-                        self.focus.handle(),
+                        &self.focus,
                         window,
                         cx,
                     )

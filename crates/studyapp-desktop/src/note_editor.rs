@@ -2,7 +2,7 @@ use crate::controls::Button;
 use crate::{
     app::{Page, StudyApp},
     components::*,
-    drafts::{DraftStore, DraftUpdate, NoteDraft},
+    drafts::{DraftRecord, DraftStatus, DraftUpdate, NoteDraft},
 };
 use gpui_kit::{
     component::{
@@ -16,12 +16,36 @@ use gpui_kit::{
 use studyapp_core::Command;
 
 impl StudyApp {
+    pub(crate) fn recoverable_draft_id(&self) -> Option<String> {
+        self.draft_catalog
+            .values()
+            .filter(|r| r.active() && Some(&r.id) != self.active_draft_id.as_ref())
+            .max_by_key(|r| r.updated_at)
+            .map(|r| r.id.clone())
+    }
+
+    pub fn refresh_recoverable(&mut self) {
+        self.recoverable_draft = self
+            .draft_catalog
+            .values()
+            .filter(|r| r.active() && Some(&r.id) != self.active_draft_id.as_ref())
+            .max_by_key(|r| r.updated_at)
+            .map(|r| r.draft.clone());
+    }
+
     pub fn capture_note_draft(&mut self, cx: &mut Context<Self>) {
         self.draft_dirty_since = None;
         if let Some(draft) = self.note_editor.as_mut() {
             draft.title = self.note_title.read(cx).value().to_string();
             draft.content = self.note_content.read(cx).value().to_string();
-            self.drafts.save(&self.last_library, Some(draft.clone()));
+            if let Some(record) = self
+                .active_draft_id
+                .as_ref()
+                .and_then(|id| self.draft_catalog.get_mut(id))
+            {
+                record.update(draft.clone(), chrono::Utc::now().timestamp_millis());
+                self.drafts.save_record(&self.last_library, record.clone());
+            }
         }
     }
 
@@ -29,71 +53,185 @@ impl StudyApp {
         let mut changed = false;
         while let Ok(update) = self.drafts.receiver.try_recv() {
             match update {
-                DraftUpdate::Loaded(path, draft)
-                    if path == DraftStore::path(&self.last_library)
-                        && self.draft_discard.is_none()
-                        && self.note_editor.is_none() =>
-                {
+                DraftUpdate::Catalog {
+                    library,
+                    records,
+                    errors,
+                } if library == self.last_library => {
                     self.draft_loading = false;
-                    self.recoverable_draft = draft;
+                    for mut record in records {
+                        // A persisted save attempt is also a restart receipt: a source write
+                        // can succeed just before the terminal-draft acknowledgement is lost.
+                        if record.active()
+                            && let Some(target) = record.save_target.as_ref()
+                            && self.snapshot.as_ref().is_some_and(|s| {
+                                s.versions
+                                    .iter()
+                                    .rev()
+                                    .find(|v| &v.note_id == target)
+                                    .is_some_and(|v| v.content == record.draft.content)
+                            })
+                        {
+                            record.retire(
+                                DraftStatus::Saved {
+                                    note_id: target.clone(),
+                                    hash: Self::draft_hash(&record.draft.content),
+                                },
+                                chrono::Utc::now().timestamp_millis(),
+                            );
+                            self.drafts.save_record(&library, record.clone());
+                        }
+                        let id = record.id.clone();
+                        if self
+                            .draft_catalog
+                            .get(&id)
+                            .is_none_or(|old| old.revision <= record.revision)
+                        {
+                            self.draft_durable.insert(id.clone(), record.revision);
+                            self.draft_catalog.insert(id, record);
+                        }
+                    }
+                    for error in errors {
+                        self.push_notice(Err(error), cx);
+                    }
+                    self.refresh_recoverable();
                 }
-                DraftUpdate::Loaded(_, _) => {}
-                DraftUpdate::Persisted(path, token) => {
+                DraftUpdate::Written {
+                    library,
+                    id,
+                    revision,
+                    token,
+                } if library == self.last_library => {
+                    self.draft_durable
+                        .entry(id.clone())
+                        .and_modify(|r| *r = (*r).max(revision))
+                        .or_insert(revision);
                     if self
-                        .draft_persist
-                        .as_ref()
-                        .is_some_and(|p| p.token == token && path == DraftStore::path(&p.library))
+                        .draft_catalog
+                        .get(&id)
+                        .is_some_and(|r| r.revision <= revision)
                     {
-                        let pending = self.draft_persist.take().expect("matching persist");
+                        self.draft_errors.remove(&id);
+                    }
+                    if self.draft_persist.as_ref().is_some_and(|p| {
+                        p.library == library
+                            && p.id == id
+                            && p.revision == revision
+                            && Some(p.token) == token
+                    }) {
+                        let pending = self.draft_persist.take().unwrap();
                         self.finish_draft_persist(pending.intent, window, cx);
                     }
-                }
-                DraftUpdate::PersistFailed(path, token, error) => {
-                    if self
-                        .draft_persist
-                        .as_ref()
-                        .is_some_and(|p| p.token == token && path == DraftStore::path(&p.library))
-                    {
-                        self.draft_persist = None;
-                        self.note_saving = false;
-                        self.draft_failed = true;
-                        self.close_requested = false;
-                        self.note_content
-                            .update(cx, |editor, cx| editor.set_readonly(false, cx));
-                        self.push_notice(
-                            Err(format!("{error}；窗口及编辑内容已保留，请重试保存。")),
-                            cx,
-                        );
-                    }
-                }
-                DraftUpdate::Discarded(path, token) => {
-                    if self.draft_discard.as_ref().is_some_and(|pending| {
-                        pending.token == token && path == DraftStore::path(&pending.library)
+                    if self.draft_discard.as_ref().is_some_and(|p| {
+                        p.library == library
+                            && p.id == id
+                            && p.revision == revision
+                            && Some(p.token) == token
                     }) {
                         self.draft_discard = None;
                         self.draft_failed = false;
-                        self.push_notice(Ok("草稿已删除，原笔记和历史版本已保留。".into()), cx);
+                        if self.active_draft_id.as_ref() == Some(&id) {
+                            self.note_editor = None;
+                            self.active_draft_id = None;
+                            self.note_content.update(cx, |editor, cx| {
+                                editor.set_visible(false, cx);
+                                editor.set_value(String::new(), window, cx);
+                            });
+                            self.reader_key.clear();
+                        } else if self.note_editor.is_some() {
+                            self.note_content
+                                .update(cx, |editor, cx| editor.set_readonly(false, cx));
+                        }
+                        self.refresh_recoverable();
+                        self.push_notice(
+                            Ok("这一份草稿已删除，原笔记、历史及其他草稿均保留。".into()),
+                            cx,
+                        );
                         self.finish_library_transition(window, cx);
                     }
                 }
-                DraftUpdate::DiscardFailed(path, token, error) => {
-                    if self.draft_discard.as_ref().is_some_and(|pending| {
-                        pending.token == token && path == DraftStore::path(&pending.library)
+                DraftUpdate::Error {
+                    library,
+                    id,
+                    revision,
+                    token,
+                    message,
+                } if library == self.last_library => {
+                    if let Some(id) = id.as_ref() {
+                        self.draft_errors.insert(id.clone(), message.clone());
+                    }
+                    self.pending_update = None;
+                    if self.draft_persist.as_ref().is_some_and(|p| {
+                        p.library == library
+                            && Some(&p.id) == id.as_ref()
+                            && p.revision == revision
+                            && Some(p.token) == token
                     }) {
-                        let pending = self.draft_discard.take().expect("matching discard");
-                        if let Some(draft) = pending.draft {
-                            self.start_note_draft(draft, window, cx);
+                        let pending = self.draft_persist.take().unwrap();
+                        if let crate::editor_lifecycle::NoteIntent::Saved(note_id) = pending.intent
+                            && let Some(record) = self.draft_catalog.get_mut(&pending.id)
+                        {
+                            // The formal note is already durable. Keep a usable editing
+                            // session if only retiring its recovery record failed.
+                            record.status = DraftStatus::Active;
+                            record.draft.note_id = Some(note_id);
+                            record.draft.expected_hash =
+                                Some(Self::draft_hash(&record.draft.content));
+                            record.touch(chrono::Utc::now().timestamp_millis());
+                            self.note_editor = Some(record.draft.clone());
+                            self.drafts.save_record(&library, record.clone());
                         }
+                        self.note_saving = false;
+                        self.draft_failed = true;
                         self.close_requested = false;
-                        self.push_notice(Err(format!("{error}；草稿内容仍可恢复。")), cx);
+                        self.pending_update = None;
+                        if self.note_editor.is_some() {
+                            self.note_content
+                                .update(cx, |editor, cx| editor.set_readonly(false, cx));
+                        }
+                    }
+                    if self.draft_discard.as_ref().is_some_and(|p| {
+                        p.library == library
+                            && Some(&p.id) == id.as_ref()
+                            && p.revision == revision
+                            && Some(p.token) == token
+                    }) {
+                        let pending = self.draft_discard.take().unwrap();
+                        let mut original = pending.original;
+                        original.revision = revision;
+                        original.touch(chrono::Utc::now().timestamp_millis());
+                        self.drafts.save_record(&library, original.clone());
+                        self.draft_catalog.insert(original.id.clone(), original);
+                        self.close_requested = false;
+                        self.pending_update = None;
+                        if self.note_editor.is_some() {
+                            self.note_content
+                                .update(cx, |editor, cx| editor.set_readonly(false, cx));
+                        }
+                    }
+                    self.push_notice(Err(message), cx);
+                }
+                DraftUpdate::Drained {
+                    library,
+                    token,
+                    result,
+                } if library == self.last_library && self.draft_close_drain == Some(token) => {
+                    self.draft_close_drain = None;
+                    let intent = self.draft_drain_intent.take();
+                    match result {
+                        Ok(()) => {
+                            if let Some(intent) = intent {
+                                self.finish_draft_drain(intent, window, cx);
+                            }
+                        }
+                        Err(error) => {
+                            self.close_requested = false;
+                            self.pending_update = None;
+                            self.push_notice(Err(error), cx);
+                        }
                     }
                 }
-                DraftUpdate::Error(path, error) if path == DraftStore::path(&self.last_library) => {
-                    self.draft_loading = false;
-                    self.draft_failed = true;
-                    self.push_notice(Err(error), cx);
-                }
-                DraftUpdate::Error(_, _) => {}
+                _ => {}
             }
             changed = true;
         }
@@ -103,15 +241,19 @@ impl StudyApp {
         changed
     }
 
+    pub(crate) fn draft_hash(content: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(content.as_bytes()))
+    }
+
     pub(crate) fn start_note_draft(
         &mut self,
         mut draft: NoteDraft,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        if draft.note_id.is_some() || draft.asset_group.is_empty() {
-            draft.asset_group =
-                crate::media_ui::asset_group(draft.note_id.as_deref(), &draft.content);
+    ) -> bool {
+        if draft.asset_group.is_empty() {
+            draft.asset_group = crate::media::new_group();
         }
         if draft.folder_id.as_ref().is_some_and(|id| {
             self.snapshot
@@ -119,49 +261,110 @@ impl StudyApp {
                 .is_none_or(|s| !s.folders.iter().any(|f| &f.id == id))
         }) {
             draft.folder_id = None;
-            self.push_notice(Ok("草稿原目录已不存在，已转为未分类。".into()), cx);
+        }
+        if self.active_draft_id.is_none() {
+            let mut record = DraftRecord::new(draft.clone(), chrono::Utc::now().timestamp_millis());
+            record.source_path = self
+                .snapshot
+                .as_ref()
+                .and_then(|s| {
+                    s.notes.iter().find(|n| {
+                        Some(&n.id) == draft.note_id.as_ref().or(self.selected_note.as_ref())
+                    })
+                })
+                .map(|n| std::path::PathBuf::from(&n.path));
+            self.active_draft_id = Some(record.id.clone());
+            self.draft_catalog.insert(record.id.clone(), record);
         }
         self.confirmation = None;
         self.note_title
             .update(cx, |s, cx| s.set_value(draft.title.clone(), window, cx));
-        self.note_content
-            .update(cx, |s, cx| s.set_value(draft.content.clone(), window, cx));
+        let saving = self.note_saving;
+        let same_reader = !self.reader_key.is_empty()
+            && self.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.versions.iter().any(|version| {
+                    version.id == self.reader_key
+                        && Some(&version.note_id) == draft.note_id.as_ref()
+                })
+            })
+            && self.note_content.read(cx).value() == draft.content;
+        if saving {
+            if let Err(error) = self.note_content.update(cx, |editor, cx| {
+                editor.rebase_saved_value(draft.content.clone(), cx)
+            }) {
+                self.note_saving = false;
+                self.close_requested = false;
+                self.pending_update = None;
+                self.push_notice(Err(error.to_string()), cx);
+                return false;
+            }
+        } else if same_reader {
+            self.note_content
+                .update(cx, |editor, cx| editor.set_readonly(false, cx));
+        } else {
+            self.note_content
+                .update(cx, |s, cx| s.set_value(draft.content.clone(), window, cx));
+        }
         self.note_editor = Some(draft);
         self.reader_key.clear();
         self.history = false;
-        self.note_saving = false;
         self.page = Page::Notes;
         self.capture_note_draft(cx);
+        self.refresh_recoverable();
+        cx.notify();
+        true
+    }
+
+    pub fn open_draft(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_draft_id.as_ref() == Some(&id) && self.note_editor.is_some() {
+            return;
+        }
+        if self.note_editor.is_some() {
+            self.request_note_action(
+                crate::editor_lifecycle::NoteIntent::OpenDraft(id),
+                window,
+                cx,
+            );
+            return;
+        }
+        if self.storage_busy
+            || self.media_busy()
+            || self.draft_loading
+            || self.draft_discard.is_some()
+        {
+            return;
+        }
+        if let Some(record) = self.draft_catalog.get(&id).filter(|r| r.active()).cloned() {
+            self.active_draft_id = Some(id);
+            self.selected_note = record.draft.note_id.clone();
+            self.selected_version = None;
+            self.start_note_draft(record.draft, window, cx);
+        }
     }
 
     pub fn open_note_editor(&mut self, copy: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.confirmation.is_some() || self.storage_busy || self.media_busy() {
+        if self.confirmation.is_some() || self.storage_busy || self.media_busy() || self.note_saving
+        {
             return;
         }
         self.page = Page::Notes;
         if self.note_editor.is_some() {
-            cx.notify();
+            return;
+        }
+        if self.draft_loading || self.draft_discard.is_some() {
             return;
         }
         if !copy
-            && self
-                .recoverable_draft
-                .as_ref()
-                .is_some_and(|d| d.note_id.is_some() && d.note_id == self.selected_note)
+            && let Some(id) = self
+                .draft_catalog
+                .values()
+                .filter(|r| {
+                    r.active() && r.draft.note_id.is_some() && r.draft.note_id == self.selected_note
+                })
+                .max_by_key(|r| r.updated_at)
+                .map(|r| r.id.clone())
         {
-            self.recover_note(window, cx);
-            return;
-        }
-        if self.draft_loading
-            || self.draft_failed
-            || self.recoverable_draft.is_some()
-            || self.draft_discard.is_some()
-        {
-            self.push_notice(
-                Err("请先恢复未保存草稿，保存或保留草稿后再开始另一份笔记。".into()),
-                cx,
-            );
-            cx.notify();
+            self.open_draft(id, window, cx);
             return;
         }
         let draft = self.snapshot.as_ref().and_then(|s| {
@@ -174,11 +377,7 @@ impl StudyApp {
                     && (!copy || self.selected_version.as_ref().is_none_or(|id| id == &v.id))
             })?;
             Some(NoteDraft {
-                asset_group: if copy {
-                    crate::media::new_group()
-                } else {
-                    crate::media_ui::asset_group(Some(&note.id), &version.content)
-                },
+                asset_group: crate::media::new_group(),
                 note_id: (!copy).then(|| note.id.clone()),
                 expected_hash: (!copy).then(|| version.hash.clone()),
                 folder_id: note.folder_id.clone(),
@@ -192,14 +391,16 @@ impl StudyApp {
         });
         if let Some(draft) = draft {
             if copy {
-                let source_path = self.snapshot.as_ref().and_then(|snapshot| {
-                    snapshot
-                        .notes
-                        .iter()
-                        .find(|note| Some(&note.id) == self.selected_note.as_ref())
-                        .map(|note| std::path::PathBuf::from(&note.path))
-                });
-                self.begin_media_adoption(draft, source_path, window, cx);
+                let source = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| {
+                        s.notes
+                            .iter()
+                            .find(|n| Some(&n.id) == self.selected_note.as_ref())
+                    })
+                    .map(|n| std::path::PathBuf::from(&n.path));
+                self.begin_media_adoption(draft, source, window, cx);
             } else {
                 self.start_note_draft(draft, window, cx);
             }
@@ -210,55 +411,60 @@ impl StudyApp {
         if self.guard_settings(crate::settings_ui::SettingsContinuation::NewNote, cx) {
             return;
         }
-        #[cfg(feature = "ui-test")]
-        eprintln!("native new_note: requested");
-        if self.confirmation.is_some() || self.storage_busy || self.media_busy() {
-            return;
-        }
-        self.page = Page::Notes;
-        if self.note_editor.is_some()
+        if self.confirmation.is_some()
+            || self.storage_busy
+            || self.media_busy()
+            || self.note_saving
             || self.draft_loading
-            || self.draft_failed
-            || self.recoverable_draft.is_some()
             || self.draft_discard.is_some()
         {
-            self.push_notice(Err("已有未保存的笔记，请先恢复或保存草稿。".into()), cx);
-            cx.notify();
             return;
         }
+        let folder = self
+            .folders
+            .read(cx)
+            .filter()
+            .folder_id()
+            .map(str::to_owned);
+        if self.note_editor.is_some() {
+            self.request_note_action(crate::editor_lifecycle::NoteIntent::New(folder), window, cx);
+            return;
+        }
+        self.start_new_draft(folder, window, cx);
+    }
+    pub(crate) fn start_new_draft(
+        &mut self,
+        folder_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_draft_id = None;
+        self.selected_note = None;
+        self.selected_version = None;
         self.start_note_draft(
             NoteDraft {
                 asset_group: crate::media::new_group(),
                 note_id: None,
                 expected_hash: None,
-                folder_id: self
-                    .folders
-                    .read(cx)
-                    .filter()
-                    .folder_id()
-                    .map(str::to_owned),
+                folder_id,
                 title: "新笔记".into(),
                 content: String::new(),
             },
             window,
             cx,
         );
-        #[cfg(feature = "ui-test")]
-        eprintln!("native new_note: draft activated");
     }
-
     pub fn recover_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.storage_busy
-            && !self.media_busy()
-            && self.note_editor.is_none()
-            && self.confirmation.is_none()
-            && self.draft_discard.is_none()
-            && let Some(draft) = self.recoverable_draft.take()
+        if let Some(id) = self
+            .draft_catalog
+            .values()
+            .filter(|r| r.active() && Some(&r.id) != self.active_draft_id.as_ref())
+            .max_by_key(|r| r.updated_at)
+            .map(|r| r.id.clone())
         {
-            self.start_note_draft(draft, window, cx);
+            self.open_draft(id, window, cx);
         }
     }
-
     pub fn save_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.request_note_action(
             crate::editor_lifecycle::NoteIntent::Save { copy: false },
@@ -268,9 +474,34 @@ impl StudyApp {
     }
 
     pub fn commit_note(&mut self, cx: &mut Context<Self>) {
-        let Some(draft) = self.note_editor.clone() else {
+        self.capture_note_draft(cx);
+        let Some(id) = self.active_draft_id.clone() else {
             return;
         };
+        let Some(record) = self.draft_catalog.get_mut(&id) else {
+            return;
+        };
+        record.save_target = Some(
+            record
+                .draft
+                .note_id
+                .clone()
+                .unwrap_or_else(|| record.draft.asset_group.clone()),
+        );
+        record.touch(chrono::Utc::now().timestamp_millis());
+        let record = record.clone();
+        self.persist_record_intent(record, crate::editor_lifecycle::NoteIntent::Commit, cx);
+    }
+    pub(crate) fn finish_commit_note(&mut self, cx: &mut Context<Self>) {
+        let Some(record) = self
+            .active_draft_id
+            .as_ref()
+            .and_then(|id| self.draft_catalog.get(id))
+            .cloned()
+        else {
+            return;
+        };
+        let draft = record.draft;
         let command = if let Some(note_id) = draft.note_id {
             Command::SaveNote {
                 note_id,
@@ -285,10 +516,63 @@ impl StudyApp {
                 content: draft.content,
             }
         };
+        self.pending_note_save = Some((self.last_library.clone(), record.id, record.revision));
         self.note_saving = true;
         self.note_content
             .update(cx, |editor, cx| editor.set_readonly(true, cx));
         self.send(command, cx);
+    }
+    pub(crate) fn complete_note_save(
+        &mut self,
+        note_id: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((library, id, revision)) = self.pending_note_save.take() else {
+            return;
+        };
+        if library != self.last_library {
+            return;
+        }
+        let Some(record) = self
+            .draft_catalog
+            .get_mut(&id)
+            .filter(|r| r.revision == revision)
+        else {
+            return;
+        };
+        record.retire(
+            DraftStatus::Saved {
+                note_id: note_id.clone(),
+                hash: Self::draft_hash(&record.draft.content),
+            },
+            chrono::Utc::now().timestamp_millis(),
+        );
+        let record = record.clone();
+        self.persist_record_intent(
+            record,
+            crate::editor_lifecycle::NoteIntent::Saved(note_id),
+            cx,
+        );
+    }
+
+    pub(crate) fn accept_note_save_result(
+        &mut self,
+        result: Result<String, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            // The editor remains frozen until the terminal draft record is
+            // acknowledged. Its recovery/error path explicitly restores input.
+            Ok(note_id) => self.complete_note_save(note_id, window, cx),
+            Err(_) => {
+                self.note_saving = false;
+                self.pending_note_save = None;
+                self.note_content
+                    .update(cx, |editor, cx| editor.set_readonly(false, cx));
+            }
+        }
     }
 
     pub fn note_editor_view(&self, cx: &mut Context<Self>) -> Div {
@@ -348,7 +632,7 @@ impl StudyApp {
                         move |_, _, cx| {
                             let _ = discard.update(cx, |this, cx| {
                                 if !this.note_saving && !this.storage_busy && !this.media_busy() {
-                                    this.confirmation = Some(
+                                    this.confirmation = this.active_draft_id.clone().map(
                                         crate::editor_lifecycle::NoteConfirmation::DiscardDraft,
                                     );
                                     cx.notify();
@@ -429,6 +713,79 @@ impl StudyApp {
                     })),
                 });
             }
+        });
+    }
+}
+
+#[cfg(all(test, feature = "ui-test"))]
+mod deletion_tests {
+    use crate::{
+        app::StudyApp,
+        drafts::{DraftRecord, DraftStatus},
+        editor_lifecycle::NoteConfirmation,
+        worker::Worker,
+    };
+    use gpui_kit::TestAppContext;
+
+    #[gpui_kit::test]
+    fn deleting_recoverable_draft_preserves_the_other_active_editor(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap().keep();
+        let database = directory.join("studyapp.sqlite3");
+        let library = database.to_string_lossy().into_owned();
+        let worker = Worker::start(database, None);
+        let (view, cx) = cx.add_window_view(|window, cx| StudyApp::new(worker, window, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |app, cx| {
+                app.last_library = library.clone();
+                app.draft_loading = false;
+                app.start_new_draft(None, window, cx);
+                app.note_content.update(cx, |editor, cx| {
+                    editor.set_value("A 的未保存正文".into(), window, cx)
+                });
+                app.capture_note_draft(cx);
+                let active = app.active_draft_id.clone().unwrap();
+                let before = app.draft_catalog[&active].clone();
+                let mut recovered = DraftRecord::new(before.draft.clone(), before.updated_at + 1);
+                recovered.draft.title = "B 的恢复草稿".into();
+                recovered.draft.content = "只应删除 B".into();
+                let target = recovered.id.clone();
+                app.draft_catalog.insert(target.clone(), recovered);
+                app.refresh_recoverable();
+                app.confirmation = app
+                    .recoverable_draft_id()
+                    .map(NoteConfirmation::DiscardDraft);
+                app.confirm_note_action(window, cx);
+                assert_eq!(app.draft_discard.as_ref().unwrap().id, target);
+                assert_eq!(app.active_draft_id.as_ref(), Some(&active));
+                app.mark_note_dirty();
+                assert!(
+                    app.draft_dirty_since.is_some(),
+                    "deleting another draft must not suspend active autosave"
+                );
+                let started = std::time::Instant::now();
+                while app.draft_discard.is_some() {
+                    app.poll_drafts(window, cx);
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(5),
+                        "draft deletion was not acknowledged"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert_eq!(app.active_draft_id.as_ref(), Some(&active));
+                assert_eq!(app.draft_catalog[&active], before);
+                assert_eq!(app.note_content.read(cx).value(), "A 的未保存正文");
+                assert!(!app.note_content.read(cx).readonly());
+                let deleted: DraftRecord = serde_json::from_slice(
+                    &std::fs::read(
+                        crate::drafts::DraftStore::record_path(&library, &target).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(deleted.status, DraftStatus::Deleted);
+                assert_eq!(deleted.draft.content, "只应删除 B");
+            });
         });
     }
 }

@@ -57,6 +57,8 @@ pub(crate) struct CredentialPayload {
     pub protected_password: Vec<u8>,
     #[serde(default)]
     pub legacy_state_compatible: bool,
+    #[serde(default)]
+    pub image: crate::image_cloud::ImageCredential,
 }
 
 pub(crate) struct PreparedSyncConfiguration {
@@ -137,8 +139,36 @@ fn remote_copy_id(source: &str, content: &str) -> String {
 }
 
 type MediaProviderFactory = Box<dyn FnOnce() -> Result<Option<Box<dyn Provider>>> + Send>;
+pub type ImageProviderFactory =
+    Box<dyn FnOnce() -> Result<Option<Box<dyn studyapp_sync::AssetProvider>>> + Send>;
 
 impl SyncRuntime {
+    pub fn image_credentials(&self) -> &crate::image_cloud::ImageCredential {
+        &self.credentials.image
+    }
+
+    pub fn image_provider_factory(
+        &self,
+        settings: &studyapp_core::ImageSettings,
+    ) -> ImageProviderFactory {
+        let settings = settings.clone();
+        let credentials = self.credentials.image.clone();
+        let legacy = self.media_provider_factory();
+        let identity = serde_json::to_string(&self.data.settings.target).unwrap_or_default();
+        Box::new(move || match &settings.cloud {
+            studyapp_core::media_settings::ImageCloudTarget::ObjectStore(_) => {
+                crate::image_cloud::object_provider(&settings, &credentials)
+            }
+            studyapp_core::media_settings::ImageCloudTarget::NoteSync => {
+                Ok(legacy()?.map(|provider| {
+                    Box::new(studyapp_sync::NoteAssets::new(
+                        provider,
+                        format!("note-sync-{identity}"),
+                    )) as Box<dyn studyapp_sync::AssetProvider>
+                }))
+            }
+        })
+    }
     /// Only the background job sees decrypted credentials or a provider. The
     /// frontend receives image bytes/data URLs and never service credentials.
     pub fn media_provider_factory(&self) -> MediaProviderFactory {
@@ -188,6 +218,7 @@ impl SyncRuntime {
                 target_epoch: crate::preferences::unique_revision(),
                 protected_password: data.protected_password,
                 legacy_state_compatible: true,
+                image: Default::default(),
             },
         ))
     }
@@ -288,6 +319,7 @@ impl SyncRuntime {
             },
             protected_password: encrypted,
             legacy_state_compatible: !changed_target && self.credentials.legacy_state_compatible,
+            image: self.credentials.image.clone(),
         };
         Ok(PreparedSyncConfiguration {
             settings,
@@ -345,6 +377,7 @@ impl SyncRuntime {
             target_epoch: crate::preferences::unique_revision(),
             protected_password: data.protected_password.clone(),
             legacy_state_compatible: true,
+            image: Default::default(),
         };
         Self {
             path,

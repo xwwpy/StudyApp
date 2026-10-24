@@ -67,31 +67,14 @@ impl Render for NoteDragPreview {
             .position_mode(AnchoredPositionMode::Local)
             .position(offset)
             .snap_to_window()
-            .child(
+            .child(library_drag_card(
+                "note-drag-preview",
+                self.title.clone(),
                 div()
-                    .id("note-drag-preview")
-                    .test_support()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .w(px(220.))
-                    .px_3()
-                    .py_2()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(crate::theme::color(GREEN))
-                    .bg(crate::theme::color(LIGHT))
-                    .text_color(crate::theme::color(INK))
-                    .text_sm()
-                    .shadow_md()
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_color(crate::theme::color(GREEN))
-                            .child("MD"),
-                    )
-                    .child(div().min_w_0().truncate().child(self.title.clone())),
-            )
+                    .flex_shrink_0()
+                    .text_color(crate::theme::color(GREEN))
+                    .child("MD"),
+            ))
     }
 }
 

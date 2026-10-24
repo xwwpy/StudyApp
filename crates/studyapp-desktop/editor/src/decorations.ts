@@ -4,6 +4,18 @@ import { markdownLanguage } from "@codemirror/lang-markdown";
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate, WidgetType } from "@codemirror/view";
 import { completeFenceLanguage, normalizeFenceLanguage } from "./languages";
 import { isolateHistory } from "@codemirror/commands";
+import type { SyntaxNode } from "@lezer/common";
+
+type TableModel = { columns:number; alignment:string[]; firstLine:number };
+function tableModel(node:SyntaxNode,state:EditorView["state"]):TableModel {
+  const separator=node.getChild("TableDelimiter");
+  const alignment=separator ? state.sliceDoc(separator.from,separator.to).trim().replace(/^\||\|$/g,"").split("|").map(value=>/^\s*:.*:\s*$/.test(value)?"center":/:\s*$/.test(value)?"right":"left") : [];
+  return {
+    columns:alignment.length || node.getChild("TableHeader")?.getChildren("TableCell").length || 1,
+    alignment,
+    firstLine:state.doc.lineAt(node.from).number,
+  };
+}
 
 export const imageMapChanged = StateEffect.define<void>();
 let resolvedImages: ReadonlyMap<string, string> = new Map();
@@ -149,6 +161,19 @@ class BulletWidget extends WidgetType {
   }
 }
 
+class EmptyCellWidget extends WidgetType {
+  constructor(readonly columns:number, readonly alignment:string) { super(); }
+  eq(other:EmptyCellWidget) { return this.columns === other.columns && this.alignment === other.alignment; }
+  toDOM() {
+    const cell = document.createElement("span");
+    cell.className = "md-table-cell md-empty-cell";
+    cell.style.width = `${100/this.columns}%`;
+    cell.style.textAlign = this.alignment;
+    cell.setAttribute("aria-label","空单元格");
+    return cell;
+  }
+}
+
 class TaskWidget extends WidgetType {
   constructor(readonly from: number, readonly checked: boolean, readonly disabled: boolean) { super(); }
   eq(other: TaskWidget) { return this.from === other.from && this.checked === other.checked && this.disabled === other.disabled; }
@@ -197,6 +222,7 @@ export const renderedMarkdown = ViewPlugin.fromClass(class {
     const ranges: Range<Decoration>[] = [];
     const lines = new Set<string>();
     const seen = new Set<string>();
+    const tables = new Map<number,TableModel>();
     const { state } = view;
     const references = () => {
       if (this.referenceDocument !== state.doc) {
@@ -232,14 +258,15 @@ export const renderedMarkdown = ViewPlugin.fromClass(class {
         position = current.to + 1;
       }
     };
-    const line = (position: number, className: string) => {
+    const line = (position: number, className: string, attributes?: Record<string,string>) => {
       const from = state.doc.lineAt(position).from;
       const key = `${from}:${className}`;
       if (!lines.has(key)) {
         lines.add(key);
-        ranges.push(Decoration.line({ class: className }).range(from));
+        ranges.push(Decoration.line({ class: className, attributes }).range(from));
       }
     };
+    const listLines = new Map<number,{depth:number;marker:boolean}>();
     for (const visible of view.visibleRanges) {
       this.tree.iterate({
         from: visible.from, to: visible.to,
@@ -268,6 +295,8 @@ export const renderedMarkdown = ViewPlugin.fromClass(class {
             const first = state.doc.lineAt(Math.max(from, visible.from)).number;
             const last = state.doc.lineAt(Math.min(to, visible.to)).number;
             for (let i = first; i <= last; i++) line(state.doc.line(i).from, "md-code-line");
+            line(from,"md-code-start");
+            line(to,"md-code-end");
             if (name === "FencedCode") {
               const opening = state.doc.lineAt(from);
               const fence = node.getChild("CodeMark");
@@ -291,8 +320,18 @@ export const renderedMarkdown = ViewPlugin.fromClass(class {
             if (parent.name === "FencedCode") line(from, "md-code-fence");
           } else if (name === "CodeInfo" && parent && !active(parent.from, parent.to)) {
             mark(from, to, "md-code-language");
+          } else if (name === "ListItem") {
+            let depth = 0;
+            for (let ancestor = node.parent; ancestor; ancestor = ancestor.parent) {
+              if (ancestor.name === "BulletList" || ancestor.name === "OrderedList") depth++;
+            }
+            const first = state.doc.lineAt(Math.max(from,visible.from)).number;
+            const last = state.doc.lineAt(Math.min(to,visible.to)).number;
+            for (let i = first; i <= last; i++) {
+              const current = state.doc.line(i);
+              if ((listLines.get(current.from)?.depth ?? 0) < depth) listLines.set(current.from,{depth,marker:current.number===state.doc.lineAt(from).number});
+            }
           } else if (name === "ListMark") {
-            line(from, "md-list-line");
             const current = state.doc.lineAt(from);
             if (!active(current.from, current.to) && /^[-+*]$/.test(state.sliceDoc(from, to))) {
               const task = parent?.getChild("Task");
@@ -335,15 +374,33 @@ export const renderedMarkdown = ViewPlugin.fromClass(class {
               }
             }
           } else if (name === "TableHeader" || name === "TableRow") {
-            line(from, `md-table-row${name === "TableHeader" ? " md-table-header" : ""}`);
-            const cells = node.getChildren("TableCell");
-            const columns = parent?.getChild("TableHeader")?.getChildren("TableCell").length || cells.length;
-            if (!active(from, to)) {
-              for (const cell of cells) mark(cell.from, cell.to, "md-table-cell", { style: `width:calc((100% - ${columns * 26}px) / ${columns})` });
+            if (!parent) return;
+            let model=tables.get(parent.from);
+            if (!model) {model=tableModel(parent,state);tables.set(parent.from,model);}
+            const {columns,alignment}=model;
+            const rowNumber = state.doc.lineAt(from).number-model.firstLine;
+            line(from, `md-table-row${name === "TableHeader" ? " md-table-header" : rowNumber%2===0 ? " md-table-stripe" : ""}`, {"data-table-columns":String(columns)});
+            const delimiters = node.getChildren("TableDelimiter");
+            // Include cell whitespace so there are no anonymous text flex items.
+            // The same source ranges remain decorated while the caret is inside.
+            let start = from;
+            let index = 0;
+            for (const [delimiterIndex,delimiter] of delimiters.entries()) {
+              if (delimiter.from > start || delimiterIndex > 0) {
+                if (delimiter.from === start) ranges.push(Decoration.widget({widget:new EmptyCellWidget(columns,alignment[index]||"left"),side:-1}).range(start));
+                else mark(start,delimiter.from,"md-table-cell",{style:`width:${100/columns}%;text-align:${alignment[index]||"left"}`});
+                index++;
+              }
+              hide(delimiter.from,delimiter.to);
+              start = delimiter.to;
+            }
+            if (start < to) { mark(start,to,"md-table-cell",{style:`width:${100/columns}%;text-align:${alignment[index]||"left"}`}); index++; }
+            for (; index < columns; index++) {
+              ranges.push(Decoration.widget({widget:new EmptyCellWidget(columns,alignment[index]||"left"),side:1}).range(to));
             }
           } else if (name === "TableDelimiter") {
             const current = state.doc.lineAt(from);
-            if (!active(current.from, current.to)) {
+            if (parent?.name === "Table" && !active(current.from, current.to)) {
               hide(from, to);
               if (parent?.name === "Table") line(from, "md-table-separator");
             }
@@ -353,6 +410,12 @@ export const renderedMarkdown = ViewPlugin.fromClass(class {
           }
         }
       });
+    }
+    for (const [position,{depth,marker}] of listLines) {
+      const current = state.doc.lineAt(position);
+      const indentation = /^\s*/.exec(current.text)![0].length;
+      if (indentation) hide(position,position+indentation);
+      line(position,`md-list-line${marker ? "" : " md-list-continuation"}`,{"data-list-depth":String(depth),style:`--list-depth:${depth}`});
     }
     return Decoration.set(ranges, true);
   }

@@ -4,6 +4,43 @@ use std::path::PathBuf;
 pub type LogicalRect = (f64, f64, f64, f64);
 pub type PhysicalRect = (i32, i32, i32, i32);
 
+/// Keep the original rounded card bounds even when part lies outside the child.
+/// Clipping the rectangle first would invent rounded corners at the editor edge.
+pub fn rounded_occlusion_rects(
+    editor: LogicalRect,
+    dpi: u32,
+    cards: &[LogicalRect],
+) -> Vec<PhysicalRect> {
+    let (x, y, width, height) = editor;
+    let scale = f64::from(dpi) / 96.;
+    let origin_x = (x * scale).round();
+    let origin_y = (y * scale).round();
+    let mut result: Vec<_> = cards
+        .iter()
+        .filter_map(|&(left, top, w, h)| {
+            if ![left, top, w, h].iter().all(|v| v.is_finite())
+                || w <= 0.
+                || h <= 0.
+                || left + w <= x
+                || top + h <= y
+                || left >= x + width
+                || top >= y + height
+            {
+                return None;
+            }
+            Some((
+                (left * scale).floor() as i32 - origin_x as i32,
+                (top * scale).floor() as i32 - origin_y as i32,
+                ((left + w) * scale).ceil() as i32 - origin_x as i32,
+                ((top + h) * scale).ceil() as i32 - origin_y as i32,
+            ))
+        })
+        .collect();
+    result.sort_unstable();
+    result.dedup();
+    result
+}
+
 pub fn clipped_occlusions(
     editor: LogicalRect,
     dpi: u32,
@@ -59,6 +96,17 @@ impl DragGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rounded_popup_preserves_original_corners_when_clipped_by_editor() {
+        assert_eq!(
+            rounded_occlusion_rects(
+                (100., 60., 400., 300.),
+                144,
+                &[(90., 50., 40.5, 40.5), (600., 60., 10., 10.)]
+            ),
+            vec![(-15, -15, 46, 46)]
+        );
+    }
     #[test]
     fn occlusions_translate_clip_and_round_outward_at_fractional_dpi() {
         assert_eq!(

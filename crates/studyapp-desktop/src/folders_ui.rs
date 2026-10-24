@@ -21,6 +21,7 @@ pub enum FolderFilter {
     #[default]
     All,
     Root,
+    Drafts,
     Folder(String),
 }
 
@@ -30,6 +31,7 @@ impl FolderFilter {
         match self {
             Self::All => true,
             Self::Root => note.folder_id.is_none(),
+            Self::Drafts => false,
             Self::Folder(id) => note.folder_id.as_ref() == Some(id),
         }
     }
@@ -45,8 +47,9 @@ impl FolderFilter {
 #[derive(Clone, Debug)]
 pub enum FolderEvent {
     Filter(FolderFilter),
-    Command(Command),
+    Command(Box<Command>),
     OverlayChanged(bool),
+    MenuRegions(Vec<Bounds<Pixels>>),
 }
 
 #[derive(Clone, Debug)]
@@ -78,32 +81,13 @@ impl Render for FolderDragPreview {
             .position_mode(AnchoredPositionMode::Local)
             .position(self.source_offset + point(px(12.), px(12.)))
             .snap_to_window()
-            .child(
-                row()
-                    .id("folder-drag-preview")
-                    .test_support()
-                    .w(px(200.))
-                    .px_3()
-                    .py_2()
-                    .gap_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(crate::theme::color(GREEN))
-                    .bg(crate::theme::color(LIGHT))
-                    .shadow_md()
-                    .child(
-                        Icon::new(IconName::Folder)
-                            .small()
-                            .text_color(crate::theme::color(GREEN)),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .child(self.title.clone()),
-                    ),
-            )
+            .child(library_drag_card(
+                "folder-drag-preview",
+                self.title.clone(),
+                Icon::new(IconName::Folder)
+                    .small()
+                    .text_color(crate::theme::color(GREEN)),
+            ))
     }
 }
 
@@ -151,6 +135,8 @@ pub struct FolderPanel {
     counts: HashMap<String, usize>,
     all_count: usize,
     root_count: usize,
+    draft_count: usize,
+    draft_entries: Vec<AnyElement>,
     filter: FolderFilter,
     collapsed: HashSet<String>,
     name: Entity<InputState>,
@@ -159,6 +145,9 @@ pub struct FolderPanel {
     busy: bool,
     active_menu: Option<u64>,
     menu_sequence: u64,
+    tree_scroll: ScrollHandle,
+    action_scroll: ScrollHandle,
+    destination_scroll: ScrollHandle,
 }
 
 impl EventEmitter<FolderEvent> for FolderPanel {}
@@ -192,6 +181,8 @@ impl FolderPanel {
             counts: HashMap::new(),
             all_count: 0,
             root_count: 0,
+            draft_count: 0,
+            draft_entries: Vec::new(),
             filter: FolderFilter::All,
             collapsed: HashSet::new(),
             name,
@@ -200,11 +191,19 @@ impl FolderPanel {
             busy: false,
             active_menu: None,
             menu_sequence: 0,
+            tree_scroll: ScrollHandle::new(),
+            action_scroll: ScrollHandle::new(),
+            destination_scroll: ScrollHandle::new(),
         }
     }
 
     pub fn library_index(&self) -> Arc<studyapp_desktop::library_tree::LibraryIndex> {
         self.index.clone()
+    }
+
+    pub fn set_draft_entries(&mut self, count: usize, entries: Vec<AnyElement>) {
+        self.draft_count = count;
+        self.draft_entries = entries;
     }
 
     pub fn filter(&self) -> &FolderFilter {
@@ -215,6 +214,7 @@ impl FolderPanel {
         match &self.filter {
             FolderFilter::All => "全部笔记".into(),
             FolderFilter::Root => "未分类".into(),
+            FolderFilter::Drafts => "草稿箱".into(),
             FolderFilter::Folder(id) => self.destination_name(Some(id)),
         }
     }
@@ -251,6 +251,10 @@ impl FolderPanel {
 
     pub fn overlay_open(&self) -> bool {
         self.action.is_some() || self.active_menu.is_some()
+    }
+
+    pub fn dialog_open(&self) -> bool {
+        self.action.is_some()
     }
 
     pub fn modal_initial_focus(&self, cx: &App) -> Option<FocusHandle> {
@@ -380,6 +384,7 @@ impl FolderPanel {
             self.collapsed.clear();
             self.action = None;
             self.active_menu = None;
+            cx.emit(FolderEvent::MenuRegions(vec![]));
             self.error = None;
             self.name
                 .update(cx, |input, cx| input.set_value("", window, cx));
@@ -494,10 +499,10 @@ impl FolderPanel {
         if !self.can_drop_note(drag, destination.clone()) {
             return;
         }
-        cx.emit(FolderEvent::Command(Command::MoveNote {
+        cx.emit(FolderEvent::Command(Box::new(Command::MoveNote {
             note_id: drag.note_id.clone(),
             folder_id: destination,
-        }));
+        })));
         cx.notify();
     }
 
@@ -522,10 +527,10 @@ impl FolderPanel {
         if !self.can_drop_folder(drag, destination.as_deref()) {
             return;
         }
-        cx.emit(FolderEvent::Command(Command::MoveFolder {
+        cx.emit(FolderEvent::Command(Box::new(Command::MoveFolder {
             folder_id: drag.folder_id.clone(),
             parent_id: destination,
-        }));
+        })));
         cx.notify();
     }
 
@@ -667,6 +672,7 @@ impl FolderPanel {
     fn close_menu(&mut self, token: u64, cx: &mut Context<Self>) {
         if self.active_menu == Some(token) {
             self.active_menu = None;
+            cx.emit(FolderEvent::MenuRegions(vec![]));
             cx.emit(FolderEvent::OverlayChanged(self.overlay_open()));
             cx.notify();
         }
@@ -700,6 +706,17 @@ impl FolderPanel {
         let Ok(Some((token, can_create, can_delete))) = opened else {
             return menu;
         };
+        let layout_owner = owner.clone();
+        cx.subscribe_self(
+            move |_, event: &gpui_kit::component::menu::PopupMenuLayout, cx| {
+                let _ = layout_owner.update(cx, |this, cx| {
+                    if this.active_menu == Some(token) {
+                        cx.emit(FolderEvent::MenuRegions(event.0.clone()));
+                    }
+                });
+            },
+        )
+        .detach();
         let dismissed = owner.clone();
         cx.subscribe_self(move |_, _: &DismissEvent, cx| {
             let _ = dismissed.update(cx, |this, cx| this.close_menu(token, cx));
@@ -813,7 +830,7 @@ impl FolderPanel {
                 self.action = None;
                 self.error = None;
                 cx.emit(FolderEvent::OverlayChanged(false));
-                cx.emit(FolderEvent::Command(command));
+                cx.emit(FolderEvent::Command(Box::new(command)));
             }
             Err(message) => self.error = Some(message),
         }
@@ -825,8 +842,7 @@ impl FolderPanel {
             return div().into_any_element();
         };
         // Root presents this body in its shared modal layer, above every pane.
-        let mut form = column()
-            .id("folder-action-scroll")
+        let mut form = scroll_body("folder-action-scroll", &self.action_scroll)
             .test_support()
             .gap_2()
             .p_2()
@@ -936,14 +952,14 @@ impl FolderPanel {
                         }
                     })
                     .unwrap_or_default();
-                let mut destinations = column()
-                    .id("folder-destination-scroll")
-                    .test_support()
-                    .gap_1()
-                    .h(px(132.))
-                    .flex_shrink_0()
-                    .min_h_0()
-                    .overflow_y_scroll();
+                let mut destinations =
+                    scroll_body("folder-destination-scroll", &self.destination_scroll)
+                        .test_support()
+                        .gap_1()
+                        .h(px(132.))
+                        .flex_shrink_0()
+                        .min_h_0()
+                        .overflow_y_scroll();
                 for choice in choices {
                     let id = choice.id;
                     let element_id = id
@@ -1094,11 +1110,11 @@ impl FolderPanel {
             .h_full()
             .min_h_0()
             .min_w_0();
-        let mut tree = column()
-            .id("note-list-scroll")
+        let mut tree = scroll_body("note-list-scroll", &self.tree_scroll)
             .test_support()
-            .gap_0()
+            .gap_1()
             .p_2()
+            .pr(px(18.))
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -1106,10 +1122,17 @@ impl FolderPanel {
                 Button::new("folders-all")
                     .small()
                     .ghost()
+                    .h(px(LIBRARY_ROW_HEIGHT))
+                    .flex_shrink_0()
                     .w_full()
+                    .justify_start()
                     .icon(IconName::FileText)
                     .label(format!("全部笔记  {}", self.all_count))
-                    .selected(self.filter == FolderFilter::All)
+                    .bg(if self.filter == FolderFilter::All {
+                        crate::theme::selection_color()
+                    } else {
+                        rgba(0).into()
+                    })
                     .disabled(self.busy)
                     .on_click(cx.listener(|this, _, _, cx| this.set_filter(FolderFilter::All, cx))),
             )
@@ -1121,17 +1144,50 @@ impl FolderPanel {
                             .small()
                             .ghost()
                             .w_full()
+                            .justify_start()
                             .icon(IconName::Inbox)
                             .label(format!("未分类  {}", self.root_count))
                             .tooltip("笔记移到未分类；目录移到根目录")
                             .tooltip_placement(Placement::Left)
-                            .selected(self.filter == FolderFilter::Root)
+                            .bg(if self.filter == FolderFilter::Root {
+                                crate::theme::selection_color()
+                            } else {
+                                rgba(0).into()
+                            })
                             .disabled(self.busy)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.set_filter(FolderFilter::Root, cx)
                             })),
                     ),
             );
+        tree = tree.child(
+            Button::new("folders-drafts")
+                .small()
+                .ghost()
+                .h(px(LIBRARY_ROW_HEIGHT))
+                .flex_shrink_0()
+                .w_full()
+                .justify_start()
+                .icon(IconName::FileText)
+                .label(format!("草稿箱  {}", self.draft_count))
+                .text_color(crate::theme::color(
+                    if self.filter == FolderFilter::Drafts {
+                        INK
+                    } else {
+                        MUTED
+                    },
+                ))
+                .bg(if self.filter == FolderFilter::Drafts {
+                    crate::theme::selection_color()
+                } else {
+                    rgba(0).into()
+                })
+                .disabled(self.busy)
+                .on_click(cx.listener(|this, _, _, cx| this.set_filter(FolderFilter::Drafts, cx))),
+        );
+        if self.filter == FolderFilter::Drafts {
+            tree = tree.children(std::mem::take(&mut self.draft_entries));
+        }
         tree = tree.children(note_rows.remove(&None).unwrap_or_default());
         for folder in self
             .rows
@@ -1207,23 +1263,21 @@ impl FolderPanel {
             let tip = format!("{} · 直接包含 {count} 份笔记", folder.path);
             tree = tree.child(
                 self.folder_drop_target(format!("folder-drop-{id}").into(), Some(id.clone()), cx)
+                    .h(px(LIBRARY_ROW_HEIGHT))
                     .test_support()
                     .debug_selector({
                         let selector = format!("folder-drop-{id}");
                         move || selector
                     })
                     .aria_selected(chosen)
-                    .when(chosen, |style| {
-                        style
-                            .bg(crate::theme::color(LIGHT))
-                            .border_color(crate::theme::color(0xBDD7C8))
-                    })
+                    .when(chosen, |style| style.bg(crate::theme::selection_color()))
                     .tooltip(move |window, cx| sidebar_tooltip(tip.clone(), window, cx))
                     .child(
                         entry
                             .child(
                                 Button::new(SharedString::from(format!("folder-row-{id}")))
                                     .small()
+                                    .h(px(LIBRARY_ROW_HEIGHT - 2.))
                                     .ghost()
                                     .flex_1()
                                     .min_w_0()
@@ -2120,7 +2174,7 @@ mod ui_tests {
         );
         assert_eq!(
             surfaces[0].background,
-            crate::theme::color(crate::components::LIGHT).into()
+            crate::theme::selection_color().into()
         );
     }
 
@@ -2135,7 +2189,7 @@ mod ui_tests {
         cx.update(|window, cx| {
             cx.subscribe(&panel, move |_, event: &FolderEvent, _| {
                 if let FolderEvent::Command(command) = event {
-                    observed.borrow_mut().push(command.clone());
+                    observed.borrow_mut().push(command.as_ref().clone());
                 }
             })
             .detach();
@@ -2199,7 +2253,7 @@ mod ui_tests {
         cx.update(|_, cx| {
             cx.subscribe(&panel, move |_, event: &FolderEvent, _| {
                 if let FolderEvent::Command(command) = event {
-                    observed.borrow_mut().push(command.clone());
+                    observed.borrow_mut().push(command.as_ref().clone());
                 }
             })
             .detach();
@@ -2252,7 +2306,7 @@ mod ui_tests {
         cx.update(|_, cx| {
             cx.subscribe(&panel, move |_, event: &FolderEvent, _| {
                 if let FolderEvent::Command(command) = event {
-                    observed.borrow_mut().push(command.clone());
+                    observed.borrow_mut().push(command.as_ref().clone());
                 }
             })
             .detach();

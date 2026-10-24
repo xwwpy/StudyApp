@@ -2,15 +2,12 @@ use crate::controls::Button;
 use crate::controls::Checkbox;
 use crate::{
     components::*,
+    settings_components as form,
     sync_runtime::{SyncSettings, SyncStatus, SyncTarget},
     worker::Work,
 };
 use gpui_kit::{
-    component::{
-        Disableable, Selectable,
-        button::ButtonVariants,
-        input::{Input, InputState},
-    },
+    component::{Disableable, Selectable, button::ButtonVariants, input::InputState},
     *,
 };
 use std::sync::mpsc;
@@ -33,16 +30,14 @@ pub struct SyncPanel {
     interval: Entity<InputState>,
     automatic: bool,
     initialized: bool,
-    picker_epoch: u64,
-    picked_sender: mpsc::Sender<(String, u64, std::path::PathBuf)>,
-    picked: mpsc::Receiver<(String, u64, std::path::PathBuf)>,
+    folder_picker: crate::folder_picker::FolderPicker,
 }
 
 impl EventEmitter<SyncEvent> for SyncPanel {}
 
 impl SyncPanel {
     fn invalidate_folder_picker(&mut self) {
-        self.picker_epoch = self.picker_epoch.wrapping_add(1);
+        self.folder_picker.invalidate();
     }
 
     /// Locking begins a new draft epoch, even if a failed save later unlocks
@@ -57,12 +52,13 @@ impl SyncPanel {
         }
     }
 
-    fn begin_folder_picker(&mut self) -> Option<(String, u64)> {
+    #[cfg(all(test, feature = "ui-test"))]
+    fn begin_folder_picker(&mut self) -> Option<crate::folder_picker::FolderRequest> {
         if self.editing_locked || self.status.busy || self.target != 1 {
             return None;
         }
         self.invalidate_folder_picker();
-        Some((self.status.library.clone(), self.picker_epoch))
+        Some(self.folder_picker.begin(&self.status.library))
     }
 
     pub fn has_unsaved_changes(&self, cx: &App) -> bool {
@@ -88,7 +84,6 @@ impl SyncPanel {
         };
         let password = input("应用密码；留空保留已保存密码", window, cx);
         password.update(cx, |s, cx| s.set_masked(true, window, cx));
-        let (picked_sender, picked) = mpsc::channel();
         let panel = Self {
             sender,
             status: SyncStatus::default(),
@@ -101,9 +96,7 @@ impl SyncPanel {
             interval: input("5–1440 分钟", window, cx),
             automatic: false,
             initialized: false,
-            picker_epoch: 0,
-            picked_sender,
-            picked,
+            folder_picker: Default::default(),
         };
         for input in [
             &panel.folder,
@@ -168,15 +161,11 @@ impl SyncPanel {
     }
 
     pub fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        while let Ok((library, epoch, path)) = self.picked.try_recv() {
-            if library != self.status.library || epoch != self.picker_epoch {
-                continue;
-            }
-            // Consume this request once, even when a current lock rejects it.
+        if self.editing_locked || self.status.busy || self.target != 1 {
             self.invalidate_folder_picker();
-            if self.editing_locked || self.status.busy || self.target != 1 {
-                continue;
-            }
+            return;
+        }
+        if let Some(path) = self.folder_picker.poll(&self.status.library) {
             self.folder.update(cx, |s, cx| {
                 s.set_value(path.to_string_lossy().into_owned(), window, cx)
             });
@@ -290,9 +279,9 @@ impl Render for SyncPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.status.busy || self.editing_locked;
         let unsaved = self.has_unsaved_changes(cx);
-        let mut panel = card().child(heading("笔记文件同步"))
+        let mut panel = form::section("笔记文件同步")
             .child(muted("连接自己的 WebDAV 或文件夹/NAS。同步 Markdown 文件，完整历史和学习记录由本地资料库与备份管理。"))
-            .child(row().children(["关闭同步", "文件夹 / NAS", "WebDAV"].into_iter().enumerate().map(|(i, label)| {
+            .child(row().flex_wrap().children(["关闭同步", "文件夹 / NAS", "WebDAV"].into_iter().enumerate().map(|(i, label)| {
                 Button::new(("sync-target", i)).label(label).selected(self.target == i).disabled(busy)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.editing_locked || this.status.busy { return; }
@@ -302,35 +291,40 @@ impl Render for SyncPanel {
             })));
         if self.target == 1 {
             panel = panel.child(
-                row()
-                    .child(Input::new(&self.folder).disabled(busy).flex_1())
-                    .child(
-                        Button::new("pick-sync-folder")
-                            .label("选择文件夹")
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, _| {
-                                let Some((library, epoch)) = this.begin_folder_picker() else {
-                                    return;
-                                };
-                                let sender = this.picked_sender.clone();
-                                std::thread::spawn(move || {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .set_title("选择同步根目录")
-                                        .pick_folder()
-                                    {
-                                        let _ = sender.send((library, epoch, path));
-                                    }
-                                });
-                            })),
-                    ),
+                row().child(form::input(&self.folder, busy).flex_1()).child(
+                    Button::new("pick-sync-folder")
+                        .label("选择文件夹")
+                        .disabled(busy)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.editing_locked || this.status.busy || this.target != 1 {
+                                return;
+                            }
+                            let current =
+                                std::path::PathBuf::from(this.folder.read(cx).value().trim());
+                            this.folder_picker.choose(
+                                &this.status.library,
+                                Some(current),
+                                "选择同步根目录",
+                            );
+                        })),
+                ),
             );
         } else if self.target == 2 {
             panel = panel
-                .child(Input::new(&self.url).disabled(busy))
+                .child(form::field("WebDAV 地址", form::input(&self.url, busy)))
                 .child(
                     row()
-                        .child(Input::new(&self.username).disabled(busy).flex_1())
-                        .child(Input::new(&self.password).disabled(busy).flex_1()),
+                        .flex_wrap()
+                        .child(
+                            form::field("账户", form::input(&self.username, busy))
+                                .min_w(px(180.))
+                                .flex_1(),
+                        )
+                        .child(
+                            form::field("密码", form::input(&self.password, busy))
+                                .min_w(px(180.))
+                                .flex_1(),
+                        ),
                 )
                 .child(muted(if self.status.credential_saved {
                     "密码已由当前 Windows 用户保护；此字段留空可继续使用。"
@@ -343,7 +337,7 @@ impl Render for SyncPanel {
                 if this.editing_locked || this.status.busy { return; }
                 this.automatic = *checked; cx.notify();
             })))
-            .child(Input::new(&self.interval).disabled(busy || !self.automatic).w(px(150.))).child(muted("分钟")))
+            .child(form::input(&self.interval, busy || !self.automatic).w(px(150.))).child(muted("分钟")))
             .child(row().child(Button::new("save-sync-settings").primary().label("保存全部设置").disabled(busy).on_click(cx.listener(|this, _, window, cx| this.save(window, cx))))
                 .child(Button::new("test-sync").label("测试连接").disabled(busy || unsaved || matches!(self.status.settings.target, SyncTarget::Disabled)).on_click(cx.listener(|this, _, _, cx| this.start(true, cx))))
                 .child(Button::new("sync-now").label(if busy { "正在同步…" } else { "立即同步" }).disabled(busy || unsaved || matches!(self.status.settings.target, SyncTarget::Disabled)).on_click(cx.listener(|this, _, _, cx| this.start(false, cx)))))
@@ -447,18 +441,9 @@ mod picker_tests {
                 panel.accept(status("library-a", "saved"), false, window, cx);
                 let old = panel.begin_folder_picker().unwrap();
                 let current = panel.begin_folder_picker().unwrap();
-                panel
-                    .picked_sender
-                    .send((old.0, old.1, "stale".into()))
-                    .unwrap();
-                panel
-                    .picked_sender
-                    .send((current.0.clone(), current.1, "chosen".into()))
-                    .unwrap();
-                panel
-                    .picked_sender
-                    .send((current.0, current.1, "duplicate".into()))
-                    .unwrap();
+                panel.folder_picker.reply_test(old, "stale");
+                panel.folder_picker.reply_test(current.clone(), "chosen");
+                panel.folder_picker.reply_test(current, "duplicate");
                 panel.poll(window, cx);
                 assert_eq!(panel.folder.read(cx).value(), "chosen");
             })
@@ -475,19 +460,15 @@ mod picker_tests {
                 panel.accept(status("library-a", "saved"), false, window, cx);
                 let before_reset = panel.begin_folder_picker().unwrap();
                 panel.reset_draft(status("library-a", "reset").settings, window, cx);
-                panel
-                    .picked_sender
-                    .send((before_reset.0, before_reset.1, "stale-reset".into()))
-                    .unwrap();
+                panel.folder_picker.reply_test(before_reset, "stale-reset");
                 panel.poll(window, cx);
                 assert_eq!(panel.folder.read(cx).value(), "reset");
                 let before_switch = panel.begin_folder_picker().unwrap();
                 panel.accept(status("library-b", "other"), false, window, cx);
                 panel.accept(status("library-a", "restored"), false, window, cx);
                 panel
-                    .picked_sender
-                    .send((before_switch.0, before_switch.1, "stale-library".into()))
-                    .unwrap();
+                    .folder_picker
+                    .reply_test(before_switch, "stale-library");
                 panel.poll(window, cx);
                 assert_eq!(panel.folder.read(cx).value(), "restored");
             })
@@ -508,23 +489,16 @@ mod picker_tests {
                 panel.set_editing_locked(true, cx);
                 assert!(panel.begin_folder_picker().is_none());
                 panel
-                    .picked_sender
-                    .send((before_save.0.clone(), before_save.1, "while-locked".into()))
-                    .unwrap();
+                    .folder_picker
+                    .reply_test(before_save.clone(), "while-locked");
                 panel.poll(window, cx);
                 assert_eq!(panel.folder.read(cx).value(), "saved");
                 panel.set_editing_locked(false, cx);
-                panel
-                    .picked_sender
-                    .send((before_save.0, before_save.1, "after-unlock".into()))
-                    .unwrap();
+                panel.folder_picker.reply_test(before_save, "after-unlock");
                 panel.poll(window, cx);
                 assert_eq!(panel.folder.read(cx).value(), "saved");
                 let valid = panel.begin_folder_picker().unwrap();
-                panel
-                    .picked_sender
-                    .send((valid.0, valid.1, "new-picker".into()))
-                    .unwrap();
+                panel.folder_picker.reply_test(valid, "new-picker");
                 panel.poll(window, cx);
                 assert_eq!(panel.folder.read(cx).value(), "new-picker");
             })

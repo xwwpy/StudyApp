@@ -1,9 +1,13 @@
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -18,157 +22,425 @@ pub struct NoteDraft {
     pub content: String,
 }
 
-fn read_draft(path: &Path) -> anyhow::Result<Option<NoteDraft>> {
-    use std::io::Read;
-    // A valid 10 MiB Markdown can expand to 60 MiB of JSON escapes.
-    const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    anyhow::ensure!(file.metadata()?.len() <= MAX_JSON_BYTES, "草稿超过大小限制");
-    let mut bytes = Vec::new();
-    file.take(MAX_JSON_BYTES + 1).read_to_end(&mut bytes)?;
-    anyhow::ensure!(bytes.len() as u64 <= MAX_JSON_BYTES, "草稿超过大小限制");
-    let draft: Option<NoteDraft> = serde_json::from_slice(&bytes)?;
-    anyhow::ensure!(
-        draft
-            .as_ref()
-            .is_none_or(|d| d.content.len() <= 10 * 1024 * 1024),
-        "Markdown 超过 10 MiB"
-    );
-    Ok(draft)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DraftStatus {
+    Active,
+    Saved { note_id: String, hash: String },
+    Deleted,
 }
 
-fn write_draft(path: &Path, draft: Option<&NoteDraft>) -> anyhow::Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DraftRecord {
+    pub schema: u32,
+    pub id: String,
+    pub revision: u64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub status: DraftStatus,
+    pub draft: NoteDraft,
+    #[serde(default)]
+    pub source_path: Option<PathBuf>,
+    #[serde(default)]
+    pub media_bindings: BTreeMap<String, String>,
+    #[serde(default)]
+    pub legacy_digest: Option<String>,
+    #[serde(default)]
+    pub save_target: Option<String>,
+}
+impl DraftRecord {
+    pub fn new(mut draft: NoteDraft, now: i64) -> Self {
+        if draft.asset_group.is_empty() {
+            draft.asset_group = uuid::Uuid::new_v4().to_string();
+        }
+        Self {
+            schema: 2,
+            id: uuid::Uuid::new_v4().to_string(),
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+            status: DraftStatus::Active,
+            draft,
+            source_path: None,
+            media_bindings: BTreeMap::new(),
+            legacy_digest: None,
+            save_target: None,
+        }
     }
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos();
-    let next = path.with_extension(format!("{}.{}.next", std::process::id(), nonce));
-    let bytes = serde_json::to_vec(&draft)?;
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&next)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(next, path)?;
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
+    pub fn active(&self) -> bool {
+        self.status == DraftStatus::Active
+    }
+    pub fn update(&mut self, draft: NoteDraft, now: i64) {
+        if self.draft != draft {
+            self.draft = draft;
+            self.touch(now);
+        }
+    }
+    pub fn touch(&mut self, now: i64) {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("draft revision overflow");
+        self.updated_at = now;
+    }
+    pub fn retire(&mut self, status: DraftStatus, now: i64) {
+        self.status = status;
+        self.touch(now);
+    }
+}
+
+const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
+fn ordinary(path: &Path, directory: bool) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(
+        !metadata.file_type().is_symlink()
+            && if directory {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            },
+        "草稿路径必须是普通文件或目录"
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        ensure!(
+            metadata.file_attributes() & 0x400 == 0,
+            "草稿路径不能是重解析链接"
+        );
     }
     Ok(())
 }
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    ordinary(path, false)?;
+    let file = std::fs::File::open(path)?;
+    ensure!(file.metadata()?.len() <= MAX_JSON_BYTES, "草稿超过大小限制");
+    let mut bytes = Vec::new();
+    file.take(MAX_JSON_BYTES + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= MAX_JSON_BYTES, "草稿超过大小限制");
+    Ok(serde_json::from_slice(&bytes)?)
+}
+fn validate(record: &DraftRecord) -> Result<()> {
+    ensure!(
+        record.schema == 2 && record.revision > 0,
+        "不支持的草稿格式"
+    );
+    ensure!(
+        uuid::Uuid::parse_str(&record.id).is_ok_and(|id| id.to_string() == record.id),
+        "草稿身份无效"
+    );
+    ensure!(
+        record.draft.content.len() <= 10 * 1024 * 1024,
+        "Markdown 超过 10 MiB"
+    );
+    ensure!(record.media_bindings.len() <= 200, "草稿图片绑定过多");
+    Ok(())
+}
+fn read_record(path: &Path) -> Result<DraftRecord> {
+    let record: DraftRecord = read_json(path)?;
+    validate(&record)?;
+    ensure!(
+        path.file_stem().and_then(|s| s.to_str()) == Some(record.id.as_str()),
+        "草稿文件身份不一致"
+    );
+    Ok(record)
+}
+fn write_record(library: &str, record: &DraftRecord) -> Result<()> {
+    validate(record)?;
+    let path = DraftStore::record_path(library, &record.id)?;
+    let parent = path.parent().context("草稿目录无效")?;
+    std::fs::create_dir_all(parent)?;
+    ordinary(parent, true)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let previous = read_record(&path)?;
+            ensure!(record.revision >= previous.revision, "忽略过期草稿写入");
+            if record.revision == previous.revision {
+                ensure!(previous == *record, "相同草稿版本的内容不一致");
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let bytes = serde_json::to_vec(record)?;
+    ensure!(bytes.len() as u64 <= MAX_JSON_BYTES, "草稿超过大小限制");
+    let next = parent.join(format!("{}.{}.next", record.id, uuid::Uuid::new_v4()));
+    let mut output = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&next)?;
+    output.write_all(&bytes)?;
+    output.sync_all()?;
+    drop(output);
+    std::fs::rename(next, &path)?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+fn catalog(library: &str) -> (Vec<DraftRecord>, Vec<String>) {
+    let mut records = Vec::new();
+    let mut errors = Vec::new();
+    let directory = DraftStore::directory(library);
+    let scan = || -> Result<Vec<PathBuf>> {
+        match ordinary(&directory, true) {
+            Ok(()) => {}
+            Err(_) if !directory.try_exists().unwrap_or(true) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        }
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                paths.push(path);
+            }
+        }
+        Ok(paths)
+    };
+    match scan() {
+        Ok(paths) => {
+            for path in paths {
+                match read_record(&path) {
+                    Ok(record) => records.push(record),
+                    Err(error) => errors.push(format!("{}：{error:#}", path.display())),
+                }
+            }
+        }
+        Err(error) => errors.push(format!("草稿目录读取失败，原文件保留：{error:#}")),
+    }
+    let legacy_path = DraftStore::path(library);
+    if legacy_path.try_exists().unwrap_or(true) {
+        let migrate = || -> Result<Option<DraftRecord>> {
+            ordinary(&legacy_path, false)?;
+            let bytes = std::fs::read(&legacy_path)?;
+            ensure!(bytes.len() as u64 <= MAX_JSON_BYTES, "旧草稿超过大小限制");
+            let draft: Option<NoteDraft> = serde_json::from_slice(&bytes)?;
+            let Some(draft) = draft else {
+                return Ok(None);
+            };
+            let digest = Sha256::digest(&bytes);
+            let id = uuid::Uuid::from_bytes(digest[..16].try_into().unwrap()).to_string();
+            let path = DraftStore::record_path(library, &id)?;
+            if path.try_exists()? {
+                return Ok(None);
+            }
+            let mut draft = draft;
+            if draft.asset_group.is_empty() {
+                draft.asset_group.clone_from(&id);
+            }
+            let mut record = DraftRecord::new(draft, 0);
+            record.id = id;
+            record.legacy_digest = Some(format!("{digest:x}"));
+            write_record(library, &record)?;
+            Ok(Some(record))
+        };
+        match migrate() {
+            Ok(Some(record)) => records.push(record),
+            Ok(None) => {}
+            Err(error) => errors.push(format!("旧草稿未修改，可重试恢复：{error:#}")),
+        }
+    }
+    records.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    (records, errors)
+}
 
 enum Request {
-    Load(PathBuf),
-    Save(PathBuf, Option<NoteDraft>),
-    Discard(PathBuf, u64),
-    Persist(PathBuf, Option<NoteDraft>, u64),
+    Load(String),
+    Save(String, Box<DraftRecord>, Option<u64>),
+    Drain(String, u64),
     Stop,
 }
-
 pub enum DraftUpdate {
-    Loaded(PathBuf, Option<NoteDraft>),
-    Error(PathBuf, String),
-    Discarded(PathBuf, u64),
-    DiscardFailed(PathBuf, u64, String),
-    Persisted(PathBuf, u64),
-    PersistFailed(PathBuf, u64, String),
+    Catalog {
+        library: String,
+        records: Vec<DraftRecord>,
+        errors: Vec<String>,
+    },
+    Written {
+        library: String,
+        id: String,
+        revision: u64,
+        token: Option<u64>,
+    },
+    Error {
+        library: String,
+        id: Option<String>,
+        revision: u64,
+        token: Option<u64>,
+        message: String,
+    },
+    Drained {
+        library: String,
+        token: u64,
+        result: Result<(), String>,
+    },
 }
-
-/// A single serial writer prevents delayed writes from reviving a saved draft.
-/// Shutdown drains the latest debounce before joining; no files are deleted.
+struct Pending {
+    record: Box<DraftRecord>,
+    due: Instant,
+}
+type Key = (String, String);
+fn publish(
+    library: &str,
+    record: Box<DraftRecord>,
+    token: Option<u64>,
+    updates: &mpsc::Sender<DraftUpdate>,
+    failed: &mut BTreeMap<Key, Box<DraftRecord>>,
+) -> Result<(), String> {
+    let key = (library.to_owned(), record.id.clone());
+    if let Ok(path) = DraftStore::record_path(library, &record.id)
+        && let Ok(previous) = read_record(&path)
+        && (previous.revision > record.revision
+            || (!previous.active() && previous != *record && previous.revision >= record.revision))
+    {
+        if token.is_none() {
+            return Ok(());
+        }
+        let message = "草稿已由更新的操作完成，请重新选择。".to_owned();
+        let _ = updates.send(DraftUpdate::Error {
+            library: library.into(),
+            id: Some(record.id),
+            revision: record.revision,
+            token,
+            message: message.clone(),
+        });
+        return Err(message);
+    }
+    match write_record(library, &record) {
+        Ok(()) => {
+            failed.remove(&key);
+            let _ = updates.send(DraftUpdate::Written {
+                library: library.into(),
+                id: record.id,
+                revision: record.revision,
+                token,
+            });
+            Ok(())
+        }
+        Err(error) => {
+            let message = format!("草稿保存失败，原文件和编辑内容仍保留：{error:#}");
+            // A terminal record remains authoritative even if an old queued save follows it.
+            if failed
+                .get(&key)
+                .is_none_or(|old| old.revision <= record.revision)
+            {
+                failed.insert(key, record.clone());
+            }
+            let _ = updates.send(DraftUpdate::Error {
+                library: library.into(),
+                id: Some(record.id),
+                revision: record.revision,
+                token,
+                message: message.clone(),
+            });
+            Err(message)
+        }
+    }
+}
+fn flush(
+    library: Option<&str>,
+    pending: &mut BTreeMap<Key, Pending>,
+    failed: &mut BTreeMap<Key, Box<DraftRecord>>,
+    updates: &mpsc::Sender<DraftUpdate>,
+    due_only: bool,
+) {
+    let keys = pending
+        .iter()
+        .filter(|((root, _), p)| {
+            library.is_none_or(|l| l == root) && (!due_only || p.due <= Instant::now())
+        })
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for key in keys {
+        let pending = pending.remove(&key).unwrap();
+        let _ = publish(&key.0, pending.record, None, updates, failed);
+    }
+}
+/// One serial writer, independently coalesced records, bounded first-write deadlines.
+/// Terminal records are durable tombstones; no source, asset or draft file is removed.
 pub struct DraftStore {
     sender: mpsc::Sender<Request>,
     pub receiver: mpsc::Receiver<DraftUpdate>,
     thread: Option<thread::JoinHandle<()>>,
 }
-
 impl DraftStore {
     pub fn new() -> Self {
         let (sender, requests) = mpsc::channel();
         let (updates, receiver) = mpsc::channel();
         let thread = thread::spawn(move || {
-            let mut pending: Option<(PathBuf, Option<NoteDraft>)> = None;
-            let flush = |pending: &mut Option<(PathBuf, Option<NoteDraft>)>| {
-                if let Some((path, draft)) = pending.take()
-                    && let Err(error) = write_draft(&path, draft.as_ref())
-                {
-                    let _ = updates.send(DraftUpdate::Error(
-                        path,
-                        format!("草稿保存失败，请保留编辑器并重试：{error:#}"),
-                    ));
-                }
-            };
+            let mut pending: BTreeMap<Key, Pending> = BTreeMap::new();
+            let mut failed = BTreeMap::new();
             loop {
-                match requests.recv_timeout(Duration::from_millis(650)) {
-                    Ok(Request::Save(path, draft)) => {
-                        if pending.as_ref().is_some_and(|(old, _)| old != &path) {
-                            flush(&mut pending);
-                        }
-                        let clear = draft.is_none();
-                        pending = Some((path, draft));
-                        if clear {
-                            flush(&mut pending);
+                flush(None, &mut pending, &mut failed, &updates, true);
+                let delay = pending
+                    .values()
+                    .map(|p| p.due.saturating_duration_since(Instant::now()))
+                    .min()
+                    .unwrap_or(Duration::from_secs(60));
+                match requests.recv_timeout(delay) {
+                    Ok(Request::Save(library, record, token)) => {
+                        let key = (library.clone(), record.id.clone());
+                        if token.is_some() || !record.active() {
+                            pending.remove(&key);
+                            let _ = publish(&library, record, token, &updates, &mut failed);
+                        } else if failed
+                            .get(&key)
+                            .is_none_or(|old| old.revision < record.revision)
+                        {
+                            let due = pending
+                                .get(&key)
+                                .map(|p| p.due)
+                                .unwrap_or_else(|| Instant::now() + Duration::from_millis(650));
+                            if pending
+                                .get(&key)
+                                .is_none_or(|old| old.record.revision <= record.revision)
+                            {
+                                pending.insert(key, Pending { record, due });
+                            }
                         }
                     }
-                    Ok(Request::Discard(path, token)) => {
-                        if pending.as_ref().is_some_and(|(old, _)| old != &path) {
-                            flush(&mut pending);
+                    Ok(Request::Load(library)) => {
+                        flush(Some(&library), &mut pending, &mut failed, &updates, false);
+                        let (records, errors) = catalog(&library);
+                        let _ = updates.send(DraftUpdate::Catalog {
+                            library,
+                            records,
+                            errors,
+                        });
+                    }
+                    Ok(Request::Drain(library, token)) => {
+                        flush(Some(&library), &mut pending, &mut failed, &updates, false);
+                        let retry = failed
+                            .iter()
+                            .filter(|((root, _), _)| root == &library)
+                            .map(|(_, r)| r.clone())
+                            .collect::<Vec<_>>();
+                        let mut failures = Vec::new();
+                        for record in retry {
+                            if let Err(error) =
+                                publish(&library, record, None, &updates, &mut failed)
+                            {
+                                failures.push(error);
+                            }
+                        }
+                        let result = if failures.is_empty() {
+                            Ok(())
                         } else {
-                            // Discard supersedes the same-library debounce even
-                            // if publishing null fails. The UI retains recovery
-                            // content until this request is acknowledged.
-                            pending = None;
-                        }
-                        let update = match write_draft(&path, None) {
-                            Ok(()) => DraftUpdate::Discarded(path, token),
-                            Err(error) => DraftUpdate::DiscardFailed(
-                                path,
-                                token,
-                                format!("草稿删除失败，恢复内容仍保留，请重试：{error:#}"),
-                            ),
+                            Err(failures.join("；"))
                         };
-                        let _ = updates.send(update);
+                        let _ = updates.send(DraftUpdate::Drained {
+                            library,
+                            token,
+                            result,
+                        });
                     }
-                    Ok(Request::Persist(path, draft, token)) => {
-                        if pending.as_ref().is_some_and(|(old, _)| old != &path) {
-                            flush(&mut pending);
-                        } else {
-                            pending = None;
-                        }
-                        let update = match write_draft(&path, draft.as_ref()) {
-                            Ok(()) => DraftUpdate::Persisted(path, token),
-                            Err(error) => DraftUpdate::PersistFailed(
-                                path,
-                                token,
-                                format!("草稿保存失败，请保留当前内容并重试：{error:#}"),
-                            ),
-                        };
-                        let _ = updates.send(update);
-                    }
-                    Ok(Request::Load(path)) => {
-                        flush(&mut pending);
-                        let result = read_draft(&path);
-                        let update = match result {
-                            Ok(draft) => DraftUpdate::Loaded(path, draft),
-                            Err(e) => DraftUpdate::Error(
-                                path,
-                                format!("无法恢复草稿，原文件仍保留：{e:#}"),
-                            ),
-                        };
-                        let _ = updates.send(update);
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => flush(&mut pending),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Ok(Request::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        flush(&mut pending);
+                        flush(None, &mut pending, &mut failed, &updates, false);
                         break;
                     }
                 }
@@ -180,39 +452,44 @@ impl DraftStore {
             thread: Some(thread),
         }
     }
-
+    /// Read-only legacy location. New writes never mutate this file.
     pub fn path(library: &str) -> PathBuf {
         Path::new(library)
             .parent()
-            .unwrap_or_else(|| Path::new("."))
+            .unwrap_or(Path::new("."))
             .join("note-draft.json")
     }
+    pub fn directory(library: &str) -> PathBuf {
+        Path::new(library)
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("drafts")
+    }
+    pub fn record_path(library: &str, id: &str) -> Result<PathBuf> {
+        ensure!(
+            !library.is_empty()
+                && uuid::Uuid::parse_str(id).is_ok_and(|value| value.to_string() == id),
+            "草稿身份无效"
+        );
+        Ok(Self::directory(library).join(format!("{id}.json")))
+    }
     pub fn load(&self, library: &str) {
-        let _ = self.sender.send(Request::Load(Self::path(library)));
+        let _ = self.sender.send(Request::Load(library.into()));
     }
-    pub fn save(&self, library: &str, draft: Option<NoteDraft>) {
-        if !library.is_empty() {
-            let _ = self.sender.send(Request::Save(Self::path(library), draft));
-        }
+    pub fn save_record(&self, library: &str, record: DraftRecord) {
+        let _ = self
+            .sender
+            .send(Request::Save(library.into(), Box::new(record), None));
     }
-    pub fn discard(&self, library: &str, token: u64) {
-        if !library.is_empty() {
-            let _ = self
-                .sender
-                .send(Request::Discard(Self::path(library), token));
-        }
+    pub fn persist_record(&self, library: &str, record: DraftRecord, token: u64) {
+        let _ = self
+            .sender
+            .send(Request::Save(library.into(), Box::new(record), Some(token)));
     }
-    /// Explicit lifecycle persistence bypasses debounce and acknowledges the
-    /// completed write. Callers retain their draft until path and token match.
-    pub fn persist(&self, library: &str, draft: Option<NoteDraft>, token: u64) {
-        if !library.is_empty() {
-            let _ = self
-                .sender
-                .send(Request::Persist(Self::path(library), draft, token));
-        }
+    pub fn drain(&self, library: &str, token: u64) {
+        let _ = self.sender.send(Request::Drain(library.into(), token));
     }
 }
-
 impl Drop for DraftStore {
     fn drop(&mut self) {
         let _ = self.sender.send(Request::Stop);
@@ -223,361 +500,5 @@ impl Drop for DraftStore {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn image_ownership_survives_restart_and_legacy_drafts_still_load() {
-        let legacy = r#"{"note_id":null,"expected_hash":null,"title":"旧草稿","content":"正文"}"#;
-        let mut draft: NoteDraft = serde_json::from_str(legacy).unwrap();
-        assert!(draft.asset_group.is_empty());
-        draft.asset_group = "36b79f08-5128-43ab-a1cb-13f318c455f7".into();
-        let saved = serde_json::to_vec(&draft).unwrap();
-        assert_eq!(serde_json::from_slice::<NoteDraft>(&saved).unwrap(), draft);
-    }
-
-    #[test]
-    fn valid_markdown_with_json_escapes_can_be_recovered() {
-        let directory = tempfile::tempdir().unwrap().keep();
-        let library = directory
-            .join("studyapp.sqlite3")
-            .to_string_lossy()
-            .into_owned();
-        let draft = NoteDraft {
-            asset_group: String::new(),
-            note_id: None,
-            expected_hash: None,
-            folder_id: None,
-            title: "转义字符".into(),
-            content: "\\".repeat(7 * 1024 * 1024),
-        };
-        write_draft(&DraftStore::path(&library), Some(&draft)).unwrap();
-        let store = DraftStore::new();
-        store.load(&library);
-        let update = store
-            .receiver
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap();
-        match update {
-            DraftUpdate::Loaded(_, Some(recovered)) => {
-                assert_eq!(recovered.content.len(), draft.content.len())
-            }
-            _ => panic!("valid Markdown must survive JSON escaping on disk"),
-        }
-    }
-
-    #[test]
-    fn draft_survives_restart_and_clear_does_not_delete_files() {
-        let directory = tempfile::tempdir().unwrap().keep();
-        let path = directory.join("note-draft.json");
-        let draft = NoteDraft {
-            asset_group: String::new(),
-            note_id: Some("note-id".into()),
-            expected_hash: Some("version-hash".into()),
-            folder_id: None,
-            title: "未保存的中文标题".into(),
-            content: "# 草稿\n不能丢失的内容".into(),
-        };
-        write_draft(&path, Some(&draft)).unwrap();
-        let recovered: Option<NoteDraft> =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(recovered, Some(draft));
-        write_draft(&path, None).unwrap();
-        assert!(path.is_file());
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "null");
-    }
-
-    #[test]
-    fn shutdown_flushes_latest_draft_and_keeps_libraries_separate() {
-        let directory = tempfile::tempdir().unwrap().keep();
-        let first = directory
-            .join("first/studyapp.sqlite3")
-            .to_string_lossy()
-            .into_owned();
-        let second = directory
-            .join("second/studyapp.sqlite3")
-            .to_string_lossy()
-            .into_owned();
-        let draft = |content: &str| NoteDraft {
-            asset_group: String::new(),
-            note_id: None,
-            expected_hash: None,
-            folder_id: None,
-            title: "草稿".into(),
-            content: content.into(),
-        };
-        let store = DraftStore::new();
-        store.save(&first, Some(draft("较早的输入")));
-        store.save(&first, Some(draft("最后一次输入")));
-        store.save(&second, Some(draft("另一个资料库")));
-        drop(store);
-        let read = |library: &str| {
-            serde_json::from_slice::<Option<NoteDraft>>(
-                &std::fs::read(DraftStore::path(library)).unwrap(),
-            )
-            .unwrap()
-            .unwrap()
-        };
-        assert_eq!(read(&first).content, "最后一次输入");
-        assert_eq!(read(&second).content, "另一个资料库");
-    }
-
-    #[test]
-    fn clearing_a_draft_cannot_be_undone_by_delayed_debounce() {
-        let directory = tempfile::tempdir().unwrap().keep();
-        let library = directory
-            .join("studyapp.sqlite3")
-            .to_string_lossy()
-            .into_owned();
-        let store = DraftStore::new();
-        store.save(
-            &library,
-            Some(NoteDraft {
-                asset_group: String::new(),
-                note_id: None,
-                expected_hash: None,
-                folder_id: None,
-                title: "旧草稿".into(),
-                content: "已保存".into(),
-            }),
-        );
-        store.save(&library, None);
-        drop(store);
-        assert_eq!(
-            std::fs::read_to_string(DraftStore::path(&library)).unwrap(),
-            "null"
-        );
-    }
-
-    #[test]
-    fn a_corrupt_draft_reports_error_without_modifying_original_bytes() {
-        let directory = tempfile::tempdir().unwrap().keep();
-        let library = directory
-            .join("studyapp.sqlite3")
-            .to_string_lossy()
-            .into_owned();
-        let path = DraftStore::path(&library);
-        std::fs::write(&path, b"{interrupted data").unwrap();
-        let store = DraftStore::new();
-        store.load(&library);
-        assert!(matches!(
-            store.receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
-            DraftUpdate::Error(_, _)
-        ));
-        drop(store);
-        assert_eq!(std::fs::read(path).unwrap(), b"{interrupted data");
-    }
-
-    fn draft(content: &str) -> NoteDraft {
-        NoteDraft {
-            asset_group: String::new(),
-            note_id: None,
-            expected_hash: None,
-            folder_id: None,
-            title: "草稿".into(),
-            content: content.into(),
-        }
-    }
-
-    #[test]
-    fn explicit_discard_acknowledges_null_before_restart_without_debounce_resurrection() {
-        let directory = tempfile::tempdir().unwrap().keep();
-        let library = directory
-            .join("study.sqlite")
-            .to_string_lossy()
-            .into_owned();
-        let path = DraftStore::path(&library);
-        let store = DraftStore::new();
-        store.save(&library, Some(draft("pending unsaved content")));
-        store.discard(&library, 73);
-        assert!(matches!(
-            store.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
-            DraftUpdate::Discarded(ref saved_path, 73) if saved_path == &path
-        ));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "null");
-        drop(store);
-        let restarted = DraftStore::new();
-        restarted.load(&library);
-        assert!(matches!(
-            restarted.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
-            DraftUpdate::Loaded(ref saved_path, None) if saved_path == &path
-        ));
-        assert!(path.is_file());
-    }
-
-    #[test]
-    fn discard_flushes_other_library_pending_save_without_clearing_it() {
-        let directory = tempfile::tempdir().unwrap().keep();
-        let first = directory
-            .join("first/study.sqlite")
-            .to_string_lossy()
-            .into_owned();
-        let second = directory
-            .join("second/study.sqlite")
-            .to_string_lossy()
-            .into_owned();
-        let store = DraftStore::new();
-        store.save(&first, Some(draft("other library latest draft")));
-        store.discard(&second, 41);
-        assert!(matches!(
-            store.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
-            DraftUpdate::Discarded(ref path, 41) if path == &DraftStore::path(&second)
-        ));
-        let first_draft: Option<NoteDraft> =
-            serde_json::from_slice(&std::fs::read(DraftStore::path(&first)).unwrap()).unwrap();
-        assert_eq!(first_draft, Some(draft("other library latest draft")));
-        assert_eq!(
-            std::fs::read_to_string(DraftStore::path(&second)).unwrap(),
-            "null"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn failed_discard_preserves_original_file_and_never_acknowledges_success() {
-        use std::os::windows::fs::OpenOptionsExt;
-        let directory = tempfile::tempdir().unwrap().keep();
-        let library = directory
-            .join("study.sqlite")
-            .to_string_lossy()
-            .into_owned();
-        let path = DraftStore::path(&library);
-        write_draft(&path, Some(&draft("original recovery content"))).unwrap();
-        let original = std::fs::read(&path).unwrap();
-        // Deny replacement while permitting the verification read.
-        let locked = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(1)
-            .open(&path)
-            .unwrap();
-        let store = DraftStore::new();
-        store.save(&library, Some(draft("pending input must not be published")));
-        store.discard(&library, 88);
-        assert!(matches!(
-            store.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
-            DraftUpdate::DiscardFailed(ref failed_path, 88, ref error)
-                if failed_path == &path && !error.is_empty()
-        ));
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-        drop(locked);
-        store.load(&library);
-        assert!(matches!(
-            store.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
-            DraftUpdate::Loaded(ref loaded_path, Some(ref recovered))
-                if loaded_path == &path && recovered == &draft("original recovery content")
-        ));
-        drop(store);
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-    }
-
-    #[test]
-    fn fresh_draft_after_acknowledged_discard_is_saved_normally() {
-        let directory = tempfile::tempdir().unwrap().keep();
-        let library = directory
-            .join("study.sqlite")
-            .to_string_lossy()
-            .into_owned();
-        let store = DraftStore::new();
-        store.save(&library, Some(draft("old")));
-        store.discard(&library, 9);
-        assert!(matches!(
-            store.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
-            DraftUpdate::Discarded(_, 9)
-        ));
-        store.save(&library, Some(draft("new draft")));
-        drop(store);
-        let saved: Option<NoteDraft> =
-            serde_json::from_slice(&std::fs::read(DraftStore::path(&library)).unwrap()).unwrap();
-        assert_eq!(saved, Some(draft("new draft")));
-    }
-
-    #[test]
-    fn explicit_persist_supersedes_debounce_and_acknowledges_durable_latest_content() {
-        let directory = tempfile::tempdir().unwrap().keep();
-        let library = directory
-            .join("study.sqlite")
-            .to_string_lossy()
-            .into_owned();
-        let path = DraftStore::path(&library);
-        let store = DraftStore::new();
-        store.save(&library, Some(draft("older queued input")));
-        store.persist(&library, Some(draft("latest flushed input")), 51);
-        assert!(matches!(
-            store.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
-            DraftUpdate::Persisted(ref saved_path, 51) if saved_path == &path
-        ));
-        let saved: Option<NoteDraft> =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(saved, Some(draft("latest flushed input")));
-        drop(store);
-        let restarted = DraftStore::new();
-        restarted.load(&library);
-        assert!(matches!(
-            restarted.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
-            DraftUpdate::Loaded(ref loaded_path, Some(ref recovered))
-                if loaded_path == &path && recovered == &draft("latest flushed input")
-        ));
-    }
-
-    #[test]
-    fn acknowledged_clear_flushes_the_other_library_first() {
-        let directory = tempfile::tempdir().unwrap().keep();
-        let first = directory
-            .join("first/study.sqlite")
-            .to_string_lossy()
-            .into_owned();
-        let second = directory
-            .join("second/study.sqlite")
-            .to_string_lossy()
-            .into_owned();
-        let store = DraftStore::new();
-        store.save(&first, Some(draft("other library content")));
-        store.persist(&second, None, 52);
-        assert!(matches!(
-            store.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
-            DraftUpdate::Persisted(ref path, 52) if path == &DraftStore::path(&second)
-        ));
-        let saved: Option<NoteDraft> =
-            serde_json::from_slice(&std::fs::read(DraftStore::path(&first)).unwrap()).unwrap();
-        assert_eq!(saved, Some(draft("other library content")));
-        assert_eq!(
-            std::fs::read_to_string(DraftStore::path(&second)).unwrap(),
-            "null"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn failed_persist_preserves_disk_bytes_and_only_emits_tokenized_failure() {
-        use std::os::windows::fs::OpenOptionsExt;
-        let directory = tempfile::tempdir().unwrap().keep();
-        let library = directory
-            .join("study.sqlite")
-            .to_string_lossy()
-            .into_owned();
-        let path = DraftStore::path(&library);
-        write_draft(&path, Some(&draft("original disk content"))).unwrap();
-        let original = std::fs::read(&path).unwrap();
-        let locked = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(1)
-            .open(&path)
-            .unwrap();
-        let store = DraftStore::new();
-        store.save(&library, Some(draft("stale debounce")));
-        store.persist(&library, Some(draft("latest input")), 53);
-        assert!(matches!(
-            store.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
-            DraftUpdate::PersistFailed(ref failed_path, 53, ref error)
-                if failed_path == &path && !error.is_empty()
-        ));
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-        drop(locked);
-        store.load(&library);
-        assert!(matches!(
-            store.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
-            DraftUpdate::Loaded(ref loaded_path, Some(ref recovered))
-                if loaded_path == &path && recovered == &draft("original disk content")
-        ));
-    }
-}
+#[path = "drafts_tests.rs"]
+mod tests;

@@ -400,7 +400,14 @@ pub async fn exercise(
     for recovered in [false, true] {
         window
             .update(cx, |_, window, cx| {
-                crate::smoke_library::library_add(window, false, cx)
+                view.update(cx, |app, cx| app.clear_notices(cx));
+                window.render_frame(cx);
+                crate::smoke_library::library_add(window, false, cx);
+                assert!(
+                    view.read(cx).note_editor.as_ref().is_some_and(|draft| {
+                        draft.note_id.is_none() && draft.content.is_empty()
+                    })
+                );
             })
             .unwrap();
         bridge(
@@ -690,7 +697,7 @@ pub async fn exercise_multiple_drafts(
                 let active = window
                     .find(SharedString::from(format!("draft-row-{id}")))
                     .bounds();
-                let viewport = window.find("folder-tree-scroll").bounds();
+                let viewport = window.find("note-list-scroll").bounds();
                 let first = expected
                     .iter()
                     .map(|(id, _, _, _)| {

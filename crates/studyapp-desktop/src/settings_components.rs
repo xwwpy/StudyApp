@@ -37,6 +37,7 @@ pub fn field(label: impl Into<SharedString>, control: impl IntoElement) -> Div {
 pub fn input(state: &Entity<InputState>, disabled: bool) -> Input {
     Input::new(state)
         .small()
+        .h(px(32.))
         .disabled(disabled)
         .rounded_md()
         .border_color(crate::theme::color(BORDER))

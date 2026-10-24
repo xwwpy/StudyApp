@@ -104,11 +104,12 @@ pub(crate) async fn until(
         if started.elapsed() >= TIMEOUT {
             let diagnostic = window.update(cx, |_, _, cx| {
                 let app = view.read(cx);
-                format!("page={:?}; notice={:?}; storage_busy={}; note_saving={}; draft_loading={}; media_busy={}; preferences_busy={}; replacing={}; dirty={}; leave={}; preferences_error={:?}; modal={}; last_library={}; notes={}",
+                format!("page={:?}; notice={:?}; storage_busy={}; note_saving={}; draft_loading={}; media_busy={}; preferences_busy={}; replacing={}; dirty={}; leave={}; preferences_error={:?}; modal={}; last_library={}; notes={}; active_draft={:?}; draft_folder={:?}; intent={:?}",
                     app.page, app.notice, app.storage_busy, app.note_saving, app.draft_loading,
                     app.media_busy(), app.preferences_ui.busy, app.preferences_ui.replacing,
                     app.settings_dirty(cx), app.preferences_ui.leave.is_some(), app.preferences_ui.error,
-                    app.has_modal(cx), app.last_library, app.snapshot.as_ref().map_or(0, |snapshot| snapshot.notes.len()))
+                    app.has_modal(cx), app.last_library, app.snapshot.as_ref().map_or(0, |snapshot| snapshot.notes.len()),
+                    app.active_draft_id, app.note_editor.as_ref().map(|draft| &draft.folder_id), app.note_intent.is_some())
             }).unwrap();
             panic!("library smoke timed out: {description}; {diagnostic}");
         }
@@ -856,17 +857,24 @@ pub async fn exercise(
                 .id
                 .clone();
             window.click(SharedString::from(format!("folder-row-{id}")), cx);
+            id
+        })
+        .unwrap();
+    // FolderEvent::Filter is delivered at the end of this input update. Match
+    // two real clicks: finish navigation before creating the draft in its folder.
+    window
+        .update(cx, |_, window, cx| {
+            let id = &draft_folder;
             crate::smoke_library::library_add(window, false, view, cx);
             view.update(cx, |app, cx| {
                 assert_eq!(
                     app.note_editor.as_ref().unwrap().folder_id.as_ref(),
-                    Some(&id)
+                    Some(id)
                 );
                 app.note_title.update(cx, |title, cx| {
                     title.set_value("目录删除后的草稿", window, cx)
                 });
             });
-            id
         })
         .unwrap();
     let draft_text = "目录删除后仍保留的草稿内容。\n";

@@ -442,6 +442,17 @@ pub async fn exercise(
     let original_file = std::fs::read(&note.path).unwrap();
     window
         .update(cx, |_, window, cx| {
+            // This fixture is created by a background command, so it must not
+            // change the user's current reader selection implicitly.
+            view.update(cx, |app, cx| app.clear_notices(cx));
+            window.render_frame(cx);
+            click_scrolled(
+                window,
+                SharedString::from(format!("note-{}", note.id)),
+                "note-list-scroll",
+                cx,
+            );
+            assert_eq!(view.read(cx).selected_note.as_ref(), Some(&note.id));
             reader_action(window, 1, cx);
             window.click(
                 SharedString::from(format!("folder-destination-{child_id}")),

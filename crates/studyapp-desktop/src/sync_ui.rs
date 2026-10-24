@@ -107,7 +107,11 @@ impl SyncPanel {
         ] {
             cx.subscribe(
                 input,
-                |_, _, _: &gpui_kit::component::input::InputEvent, cx| cx.notify(),
+                |_, _, event: &gpui_kit::component::input::InputEvent, cx| {
+                    if matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                        cx.notify();
+                    }
+                },
             )
             .detach();
         }

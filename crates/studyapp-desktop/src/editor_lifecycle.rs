@@ -552,8 +552,16 @@ impl StudyApp {
     /// Load a read-only document into the same persistent browser surface.
     /// Reading and writing therefore share highlighting and viewport limits.
     pub fn prepare_document_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut show = self.page == Page::Notes
-            && self.confirmation.is_none()
+        // Other pages only need to hide the persistent native editor. Do not
+        // search note history or prepare a diff on their input/scroll frames.
+        if self.page != Page::Notes {
+            self.note_content.update(cx, |editor, cx| {
+                editor.set_can_request_edit(false, cx);
+                editor.set_visible(false, cx);
+            });
+            return;
+        }
+        let mut show = self.confirmation.is_none()
             && self.storage_confirm.is_none()
             && !self.folders.read(cx).dialog_open()
             && self.preferences_ui.leave.is_none()
@@ -561,9 +569,9 @@ impl StudyApp {
             && self.draft_discard.is_none();
         show &= !self.external_drop.active();
         if self.note_editor.is_none() {
-            let version = self.snapshot.as_ref().and_then(|s| {
-                s.versions.iter().rev().find(|v| {
-                    Some(&v.note_id) == self.selected_note.as_ref()
+            let version = self.selected_note.as_ref().and_then(|note_id| {
+                self.snapshot.as_ref()?.versions.iter().rev().find(|v| {
+                    &v.note_id == note_id
                         && self.selected_version.as_ref().is_none_or(|id| id == &v.id)
                 })
             });

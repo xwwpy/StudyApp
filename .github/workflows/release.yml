@@ -85,6 +85,13 @@ jobs:
           $smokeDir = Join-Path $env:RUNNER_TEMP ('studyapp-release-smoke-' + [guid]::NewGuid().ToString('N'))
           "SMOKE_DIR=$smokeDir" >> $env:GITHUB_ENV
           ./scripts/smoke.ps1 -DataDirectory $smokeDir
+      - name: Verify settings interactions and performance independently
+        if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          $settingsDir = Join-Path $env:RUNNER_TEMP ('studyapp-release-settings-' + [guid]::NewGuid().ToString('N'))
+          "SETTINGS_DIR=$settingsDir" >> $env:GITHUB_ENV
+          ./scripts/smoke-settings.ps1 -DataDirectory $settingsDir
       - name: Verify native window movement
         if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
         timeout-minutes: 2
@@ -123,6 +130,9 @@ jobs:
             ${{ env.SMOKE_DIR }}/settings-*.png
             ${{ env.SMOKE_DIR }}/settings-render-timing.json
             ${{ env.SMOKE_DIR }}/*.log
+            ${{ env.SETTINGS_DIR }}/settings-*
+            ${{ env.SETTINGS_DIR }}/*.log
+            ${{ env.SETTINGS_DIR }}/smoke-input-mode.txt
             ${{ env.DRAG_DIR }}/window-drag-*
             ${{ env.DRAG_DIR }}/window-controls-result.txt
             ${{ env.DRAG_DIR }}.jsonl

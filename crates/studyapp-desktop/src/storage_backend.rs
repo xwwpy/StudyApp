@@ -183,7 +183,14 @@ pub(crate) fn guard_directories(path: &Path, create: bool) -> Result<Vec<File>> 
     ancestors.reverse();
     for directory in ancestors {
         if create && !directory.try_exists()? {
-            std::fs::create_dir(directory)?;
+            match std::fs::create_dir(directory) {
+                Ok(()) => {}
+                // Another asset worker can create this ancestor after the
+                // existence check. The handle below still validates its type
+                // and rejects links/reparse points before any child is used.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         guards.push(plain_handle(directory, true, false)?);
     }

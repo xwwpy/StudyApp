@@ -611,12 +611,35 @@ pub async fn exercise(
             // The preceding version save is fixture setup. Its success toast
             // must not intercept the history-tab interaction under test.
             view.update(cx, |app, cx| app.clear_notices(cx));
+            // Selecting All above deliberately chooses its first note. A
+            // background fixture save preserves that reader selection.
+            click_scrolled(
+                window,
+                SharedString::from(format!("note-{}", note.id)),
+                "note-list-scroll",
+                cx,
+            );
+            assert_eq!(view.read(cx).selected_note.as_ref(), Some(&note.id));
+            assert!(view.read(cx).selected_version.is_none());
+            let latest = view
+                .read(cx)
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .versions
+                .iter()
+                .rev()
+                .find(|version| version.note_id == note.id)
+                .unwrap();
+            assert_eq!(latest.content, long_content);
+            assert!(!latest.diff.is_empty());
             window.click("history-tab", cx);
             window.render_frame(cx);
             assert!(
                 view.read(cx).history,
                 "history tab interaction was intercepted"
             );
+            assert!(view.read(cx).history_preview.rows.len() > 1500);
         })
         .unwrap();
     let history_layout_started = Instant::now();

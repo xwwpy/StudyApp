@@ -41,3 +41,21 @@ drag on Today, Notes and Settings and checks WebView bounds/visibility/regions.
 Re-evaluate this narrow patch when upgrading GPUI. Do not replace it with
 skipping or delaying the native moved callback: anchored overlays and other
 bounds observers require prompt updates.
+
+`ListState::set_item_focus_handle` updates an existing row's focus registration
+without replacing its measured size or estimated height. Settings uses this for
+offscreen inline shortcut recording and appearance input groups. The original
+`splice_focusable` API intentionally invalidates replaced row contents and remains
+unchanged. A headless regression reproduces the previous loss of 140 px of scroll
+extent when ending an offscreen recording, then verifies stable extent, anchors,
+and keyboard dispatch with the new API.
+
+## Variable-height list estimates
+
+`src/elements/list.rs` preserves each item's previous height as an unmeasured
+size hint when the viewport width changes, including its first layout. The
+visible rows still run layout at the new width. Previously this invalidation
+erased `with_uniform_item_height` hints for every offscreen row, collapsing the
+scrollbar extent to only the rows already visited. StudyApp's headless settings
+regression checks initial layout, width changes and inline row-height changes
+without constructing the entire list.

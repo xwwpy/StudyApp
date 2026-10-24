@@ -28,7 +28,6 @@ impl<K: PartialEq, T> InputCache<K, T> {
         value
     }
 
-    #[cfg(any(test, feature = "ui-test"))]
     pub fn rebuilds(&self) -> u64 {
         self.rebuilds.get()
     }

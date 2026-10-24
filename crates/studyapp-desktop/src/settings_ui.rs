@@ -82,10 +82,42 @@ struct ShortcutAnalysis {
 }
 
 type AppearanceInputKey = (Vec<SharedString>, studyapp_core::MarkdownLayout);
+type AppearanceViewKey = (
+    AppearanceInputKey,
+    u8,
+    studyapp_core::Settings,
+    crate::theme::ResolvedTheme,
+    bool,
+    bool,
+    Option<String>,
+    u64,
+);
+
+pub struct AppearanceView {
+    owner: WeakEntity<StudyApp>,
+    key: Option<AppearanceViewKey>,
+}
+
+impl Render for AppearanceView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.owner
+            .update(cx, |owner, cx| owner.appearance_workspace(cx))
+            .unwrap_or_else(|_| column())
+    }
+}
 
 struct MarkdownPreview {
     preset: studyapp_core::ThemePreset,
     colors: [u32; 24],
+}
+
+#[derive(PartialEq)]
+struct ShortcutLayout {
+    analysis_revision: u64,
+    recording: Option<String>,
+    recording_error: Option<String>,
+    font_size: u16,
+    spacing: u16,
 }
 
 pub enum SettingsContinuation {
@@ -114,9 +146,25 @@ pub struct PreferencesUi {
     pub draft: Option<studyapp_core::Settings>,
     pub shortcuts: BTreeMap<String, Entity<InputState>>,
     shortcut_analysis: InputCache<Vec<SharedString>, ShortcutAnalysis>,
+    shortcut_rows: form::VirtualRows<ShortcutLayout>,
+    #[cfg(feature = "ui-test")]
+    pub shortcut_eager_baseline: bool,
+    #[cfg(feature = "ui-test")]
+    shortcut_row_builds: std::cell::Cell<u64>,
+    #[cfg(feature = "ui-test")]
+    shortcut_frame_rows: std::cell::Cell<u64>,
     pub shortcut_search: Option<Entity<InputState>>,
     pub appearance_fields: BTreeMap<&'static str, Entity<InputState>>,
     markdown_preview: InputCache<AppearanceInputKey, MarkdownPreview>,
+    appearance_rows: form::VirtualRows<AppearanceViewKey>,
+    appearance_focus: Vec<FocusHandle>,
+    appearance_view: Option<Entity<AppearanceView>>,
+    #[cfg(feature = "ui-test")]
+    pub appearance_eager_baseline: bool,
+    #[cfg(feature = "ui-test")]
+    appearance_part_builds: std::cell::Cell<u64>,
+    #[cfg(feature = "ui-test")]
+    appearance_frame_parts: std::cell::Cell<u64>,
     pub appearance_touched: bool,
     pub editing_preset: Option<String>,
     pub appearance_layout: studyapp_core::MarkdownLayout,
@@ -213,6 +261,21 @@ impl StudyApp {
         self.preferences_ui.shortcut_analysis.rebuilds()
     }
 
+    #[cfg(feature = "ui-test")]
+    pub fn shortcut_render_work(&self) -> (u64, u32) {
+        (
+            self.preferences_ui.shortcut_row_builds.get(),
+            self.preferences_ui.shortcut_frame_rows.get().count_ones(),
+        )
+    }
+
+    #[cfg(feature = "ui-test")]
+    pub fn reset_shortcut_scroll(&self) {
+        self.preferences_ui.shortcut_rows.scroll_to_top();
+        self.preferences_ui.appearance_rows.scroll_to_top();
+        self.settings_scroll.set_offset(point(px(0.), px(0.)));
+    }
+
     fn markdown_preview(&self, cx: &Context<Self>) -> Rc<MarkdownPreview> {
         let values = self
             .preferences_ui
@@ -242,6 +305,8 @@ impl StudyApp {
                 self.preferences_ui.section_revision.wrapping_add(1);
             self.preferences_ui.section_changed_at = Some(Instant::now());
             self.settings_scroll.set_offset(point(px(0.), px(0.)));
+            self.preferences_ui.shortcut_rows.scroll_to_top();
+            self.preferences_ui.appearance_rows.scroll_to_top();
         }
         self.preferences_ui.recording = None;
         self.preferences_ui.recording_error = None;
@@ -267,6 +332,12 @@ impl StudyApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.preferences_ui.appearance_view.is_none() {
+            let owner = cx.weak_entity();
+            self.preferences_ui.appearance_view =
+                Some(cx.new(|_| AppearanceView { owner, key: None }));
+            self.preferences_ui.appearance_focus = (0..5).map(|_| cx.focus_handle()).collect();
+        }
         let preset = settings
             .custom_presets
             .iter()
@@ -315,8 +386,8 @@ impl StudyApp {
                 cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.preferences_ui.appearance_touched = true;
+                        cx.notify();
                     }
-                    cx.notify();
                 })
                 .detach();
                 self.preferences_ui.appearance_fields.insert(key, input);
@@ -649,15 +720,23 @@ impl StudyApp {
                     .placeholder("留空使用资料库 images 目录")
                     .default_value(root)
             });
-            cx.subscribe(&input, |_, _, _: &InputEvent, cx| cx.notify())
-                .detach();
+            cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
+            .detach();
             self.preferences_ui.image_root = Some(input);
         }
         if self.preferences_ui.shortcut_search.is_none() {
             let input =
                 cx.new(|cx| InputState::new(window, cx).placeholder("搜索操作、分组或快捷键"));
-            cx.subscribe(&input, |_, _, _: &InputEvent, cx| cx.notify())
-                .detach();
+            cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
+            .detach();
             self.preferences_ui.shortcut_search = Some(input);
         }
         for action in crate::shortcuts::SHORTCUT_ACTIONS {
@@ -670,8 +749,12 @@ impl StudyApp {
                         .placeholder("未绑定；例如 Ctrl+Shift+S")
                         .default_value(binding)
                 });
-                cx.subscribe(&input, |_, _, _: &InputEvent, cx| cx.notify())
-                    .detach();
+                cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                })
+                .detach();
                 self.preferences_ui
                     .shortcuts
                     .insert(action.id.into(), input);
@@ -1210,14 +1293,16 @@ impl StudyApp {
                 .child(muted(
                     "保存后生效；询问间隔从下一时间段生效，复习间隔只影响新建计划。",
                 )),
-            SettingsSection::Appearance => self.appearance_controls(cx),
-            SettingsSection::Shortcuts => self.shortcut_controls(cx),
+            SettingsSection::Appearance => column(),
+            // The shortcut list owns the bounded viewport, outside this
+            // auto-height form used by the other categories.
+            SettingsSection::Shortcuts => column(),
             SettingsSection::Storage => self.image_settings_controls(cx),
             _ => column(),
         }
     }
 
-    fn markdown_style_controls(&self, busy: bool, cx: &mut Context<Self>) -> Div {
+    fn markdown_style_preview(&self, cx: &mut Context<Self>) -> Div {
         use studyapp_core::ReadingFont;
         let preview = self.markdown_preview(cx);
         let preset = &preview.preset;
@@ -1344,38 +1429,47 @@ impl StudyApp {
                             .child(div().flex_1().child("进行中")),
                     ),
             );
-        let mut panel = column()
+        column()
             .gap_3()
             .child(heading("Markdown 样式"))
             .child(muted(
                 "颜色留空会按主题自动适配；样例随输入更新。保存主题后可在笔记中使用。",
             ))
             .child(sample)
-            .child(
-                row().flex_wrap().children(
-                    ["文字与版式", "引用与代码", "表格与列表", "语法高亮"]
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, label)| {
-                            Button::new(("markdown-style-group", index))
-                                .small()
-                                .label(format!(
-                                    "{}{}",
-                                    if self.preferences_ui.appearance_group as usize == index {
-                                        "✓ "
-                                    } else {
-                                        ""
-                                    },
-                                    label
-                                ))
-                                .disabled(busy)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.preferences_ui.appearance_group = index as u8;
-                                    cx.notify();
-                                }))
-                        }),
-                ),
-            );
+    }
+
+    fn markdown_style_controls(&self, busy: bool, cx: &mut Context<Self>) -> Div {
+        use studyapp_core::ReadingFont;
+        let preview = self.markdown_preview(cx);
+        let preset = &preview.preset;
+        let colors = &preview.colors;
+        let p = &preset.markdown.layout;
+        let color = |index| gpui_kit::rgb(colors[index]);
+        let mut panel = column().gap_3().child(
+            row().flex_wrap().children(
+                ["文字与版式", "引用与代码", "表格与列表", "语法高亮"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, label)| {
+                        Button::new(("markdown-style-group", index))
+                            .small()
+                            .label(format!(
+                                "{}{}",
+                                if self.preferences_ui.appearance_group as usize == index {
+                                    "✓ "
+                                } else {
+                                    ""
+                                },
+                                label
+                            ))
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.preferences_ui.appearance_group = index as u8;
+                                cx.notify();
+                            }))
+                    }),
+            ),
+        );
         for (index, (key, _, label, group)) in MARKDOWN_FIELDS.iter().enumerate() {
             if *group != self.preferences_ui.appearance_group {
                 continue;
@@ -1552,77 +1646,200 @@ impl StudyApp {
         )
     }
 
-    fn appearance_controls(&self, cx: &mut Context<Self>) -> Div {
+    fn appearance_view_key(&self, cx: &App) -> AppearanceViewKey {
+        #[cfg(not(feature = "ui-test"))]
+        let eager = false;
+        #[cfg(feature = "ui-test")]
+        let eager = self.preferences_ui.appearance_eager_baseline;
+        (
+            (
+                self.preferences_ui
+                    .appearance_fields
+                    .values()
+                    .map(|input| input.read(cx).value())
+                    .collect(),
+                self.preferences_ui.appearance_layout,
+            ),
+            self.preferences_ui.appearance_group,
+            self.preferences_ui.draft.clone().unwrap_or_default(),
+            crate::theme::palette(),
+            self.preferences_ui.busy || self.preferences_ui.replacing || self.storage_busy,
+            eager,
+            self.preferences_ui.editing_preset.clone(),
+            self.preferences_ui.section_revision,
+        )
+    }
+
+    /// A definite-size view boundary lets GPUI reuse unchanged appearance
+    /// layout/paint when only the parent shell (timer, notices) is notified.
+    pub fn appearance_surface(&self, cx: &mut Context<Self>) -> Div {
+        let Some(view) = self.preferences_ui.appearance_view.as_ref() else {
+            return column();
+        };
+        let key = self.appearance_view_key(cx);
+        view.update(cx, |view, cx| {
+            if view.key.as_ref() != Some(&key) {
+                view.key = Some(key);
+                cx.notify();
+            }
+        });
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .max_w(px(960.))
+            .child(view.clone().cached(StyleRefinement::default().size_full()))
+    }
+
+    fn appearance_workspace(&self, cx: &mut Context<Self>) -> Div {
+        // Keep programmatic field changes reflected even when the sample is
+        // outside the viewport; cached resolution is independent of row layout.
+        let _ = self.markdown_preview(cx);
+        let key = self.appearance_view_key(cx);
+        self.preferences_ui
+            .appearance_rows
+            .sync_with_height(&[0, 1, 2, 3, 4], key, px(320.));
+        self.preferences_ui.appearance_rows.track_focuses(
+            self.preferences_ui
+                .appearance_focus
+                .iter()
+                .cloned()
+                .enumerate()
+                .collect(),
+        );
+        #[cfg(feature = "ui-test")]
+        self.preferences_ui.appearance_frame_parts.set(0);
+        #[cfg(feature = "ui-test")]
+        if self.preferences_ui.appearance_eager_baseline {
+            return column().size_full().min_h_0().child(
+                scroll_body("settings-section-scroll", &self.settings_scroll)
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .gap_0()
+                    .px_4()
+                    .children(
+                        (0..5).map(|part| div().py_2().child(self.appearance_part(part, cx))),
+                    ),
+            );
+        }
+        let owner = cx.entity();
+        column().size_full().min_h_0().child(form::virtual_rows(
+            &self.preferences_ui.appearance_rows.scroll,
+            move |part, _, cx| {
+                owner
+                    .update(cx, |owner, cx| {
+                        div()
+                            .py_2()
+                            .track_focus(&owner.preferences_ui.appearance_focus[part])
+                            .child(owner.appearance_part(part, cx))
+                    })
+                    .into_any_element()
+            },
+        ))
+    }
+
+    #[cfg(feature = "ui-test")]
+    pub fn appearance_render_work(&self) -> (u64, u32) {
+        (
+            self.preferences_ui.appearance_part_builds.get(),
+            self.preferences_ui
+                .appearance_frame_parts
+                .get()
+                .count_ones(),
+        )
+    }
+
+    fn appearance_part(&self, part: usize, cx: &mut Context<Self>) -> Div {
+        #[cfg(feature = "ui-test")]
+        {
+            self.preferences_ui
+                .appearance_part_builds
+                .set(self.preferences_ui.appearance_part_builds.get() + 1);
+            self.preferences_ui
+                .appearance_frame_parts
+                .set(self.preferences_ui.appearance_frame_parts.get() | (1 << part));
+        }
         use studyapp_core::ThemeMode;
         let busy = self.preferences_ui.busy || self.preferences_ui.replacing || self.storage_busy;
-        let draft = self.preferences_ui.draft.clone().unwrap_or_default();
+        let fallback;
+        let draft = if let Some(draft) = self.preferences_ui.draft.as_ref() {
+            draft
+        } else {
+            fallback = studyapp_core::Settings::default();
+            &fallback
+        };
         let appearance = &draft.appearance;
-        let mut panel = column().gap_3().child(
-            form::section("主题与阅读")
-                .child(
-                    row().flex_wrap().children(
-                        [
-                            (ThemeMode::System, "system", "跟随系统"),
-                            (ThemeMode::Light, "light", "浅色"),
-                            (ThemeMode::Dark, "dark", "深色"),
-                        ]
-                        .into_iter()
-                        .map(|(mode, id, label)| {
-                            let button =
-                                Button::new(SharedString::from(format!("theme-mode-{id}")))
+        if part == 0 {
+            return column().gap_3().child(
+                form::section("主题与阅读")
+                    .child(
+                        row().flex_wrap().children(
+                            [
+                                (ThemeMode::System, "system", "跟随系统"),
+                                (ThemeMode::Light, "light", "浅色"),
+                                (ThemeMode::Dark, "dark", "深色"),
+                            ]
+                            .into_iter()
+                            .map(|(mode, id, label)| {
+                                let button =
+                                    Button::new(SharedString::from(format!("theme-mode-{id}")))
+                                        .small()
+                                        .label(label)
+                                        .disabled(busy)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            if let Some(draft) = &mut this.preferences_ui.draft {
+                                                draft.appearance.mode = mode;
+                                            }
+                                            this.refresh_appearance(window, cx);
+                                            cx.notify();
+                                        }));
+                                if appearance.mode == mode {
+                                    button.primary()
+                                } else {
+                                    button
+                                }
+                            }),
+                        ),
+                    )
+                    .child(
+                        row()
+                            .child(div().flex_1().child("界面字号"))
+                            .child(
+                                Button::new("theme-font-smaller")
                                     .small()
-                                    .label(label)
-                                    .disabled(busy)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                    .label("−")
+                                    .disabled(busy || appearance.font_size <= 12)
+                                    .on_click(cx.listener(|this, _, window, cx| {
                                         if let Some(draft) = &mut this.preferences_ui.draft {
-                                            draft.appearance.mode = mode;
+                                            draft.appearance.font_size = draft
+                                                .appearance
+                                                .font_size
+                                                .saturating_sub(1)
+                                                .max(12);
                                         }
                                         this.refresh_appearance(window, cx);
                                         cx.notify();
-                                    }));
-                            if appearance.mode == mode {
-                                button.primary()
-                            } else {
-                                button
-                            }
-                        }),
-                    ),
-                )
-                .child(
-                    row()
-                        .child(div().flex_1().child("界面字号"))
-                        .child(
-                            Button::new("theme-font-smaller")
-                                .small()
-                                .label("−")
-                                .disabled(busy || appearance.font_size <= 12)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    if let Some(draft) = &mut this.preferences_ui.draft {
-                                        draft.appearance.font_size =
-                                            draft.appearance.font_size.saturating_sub(1).max(12);
-                                    }
-                                    this.refresh_appearance(window, cx);
-                                    cx.notify();
-                                })),
-                        )
-                        .child(muted(format!("{} px", appearance.font_size)))
-                        .child(
-                            Button::new("theme-font-larger")
-                                .small()
-                                .label("+")
-                                .disabled(busy || appearance.font_size >= 22)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    if let Some(draft) = &mut this.preferences_ui.draft {
-                                        draft.appearance.font_size =
-                                            (draft.appearance.font_size + 1).min(22);
-                                    }
-                                    this.refresh_appearance(window, cx);
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(
-                    row().child(div().flex_1().child("内容间距")).children(
+                                    })),
+                            )
+                            .child(muted(format!("{} px", appearance.font_size)))
+                            .child(
+                                Button::new("theme-font-larger")
+                                    .small()
+                                    .label("+")
+                                    .disabled(busy || appearance.font_size >= 22)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if let Some(draft) = &mut this.preferences_ui.draft {
+                                            draft.appearance.font_size =
+                                                (draft.appearance.font_size + 1).min(22);
+                                        }
+                                        this.refresh_appearance(window, cx);
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(row().child(div().flex_1().child("内容间距")).children(
                         [(4, "紧凑"), (8, "标准"), (12, "宽松")].into_iter().map(
                             |(spacing, label)| {
                                 let button = Button::new(("theme-spacing", spacing as usize))
@@ -1643,150 +1860,160 @@ impl StudyApp {
                                 }
                             },
                         ),
-                    ),
-                )
-                .child(muted("修改可即时预览；保存全部设置后才会写入资料库。")),
-        );
-        let mut custom = card().gap_3().child(
-            row()
-                .child(heading("自定义主题"))
-                .child(div().flex_1())
-                .child(
-                    Button::new("new-custom-theme")
-                        .small()
-                        .label("+ 新建")
-                        .disabled(busy)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if this.preferences_ui.appearance_touched
-                                && !this.stage_custom_appearance(cx)
-                            {
-                                return;
-                            }
-                            this.fill_appearance_fields(
-                                &studyapp_core::AppearanceSettings::default(),
-                                window,
-                                cx,
-                            );
-                            cx.notify();
-                        })),
-                ),
-        );
-        for preset in &appearance.custom_presets {
-            let id = preset.id.clone();
-            let delete_id = id.clone();
-            let selected = appearance.mode == ThemeMode::Custom
-                && appearance.active_preset.as_ref() == Some(&id);
-            let mut select = Button::new(SharedString::from(format!("select-theme-{id}")))
-                .small()
-                .label(format!(
-                    "{}{}",
-                    if selected { "✓ " } else { "" },
-                    preset.name
-                ))
-                .disabled(busy)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    let pending = this
-                        .preferences_ui
-                        .appearance_touched
-                        .then(|| this.custom_appearance_input(cx));
-                    let settings = if let Some(draft) = &mut this.preferences_ui.draft {
-                        if let Err(error) =
-                            select_custom_preset(&mut draft.appearance, pending, &id)
-                        {
-                            this.preferences_ui.error = Some(error.to_string());
-                            cx.notify();
-                            return;
-                        }
-                        this.preferences_ui.error = None;
-                        Some(draft.appearance.clone())
-                    } else {
-                        None
-                    };
-                    if let Some(settings) = settings {
-                        this.fill_appearance_fields(&settings, window, cx);
-                    }
-                    this.refresh_appearance(window, cx);
-                    cx.notify();
-                }));
-            if selected {
-                select = select.primary();
-            }
-            custom = custom.child(
-                row().child(select).child(div().flex_1()).child(
-                    Button::new(SharedString::from(format!("delete-theme-{delete_id}")))
-                        .small()
-                        .label("删除")
-                        .disabled(busy)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if let Some(draft) = &mut this.preferences_ui.draft {
-                                draft
-                                    .appearance
-                                    .custom_presets
-                                    .retain(|preset| preset.id != delete_id);
-                                if draft.appearance.active_preset.as_ref() == Some(&delete_id) {
-                                    draft.appearance.active_preset = None;
-                                    draft.appearance.mode = ThemeMode::System;
+                    ))
+                    .child(muted("修改可即时预览；保存全部设置后才会写入资料库。")),
+            );
+        }
+        if part == 1 {
+            let mut custom = card().gap_3().child(
+                row()
+                    .child(heading("自定义主题"))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("new-custom-theme")
+                            .small()
+                            .label("+ 新建")
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.preferences_ui.appearance_touched
+                                    && !this.stage_custom_appearance(cx)
+                                {
+                                    return;
                                 }
-                            }
-                            if this.preferences_ui.editing_preset.as_ref() == Some(&delete_id) {
                                 this.fill_appearance_fields(
                                     &studyapp_core::AppearanceSettings::default(),
                                     window,
                                     cx,
                                 );
-                            }
-                            this.refresh_appearance(window, cx);
-                            cx.notify();
-                        })),
-                ),
+                                cx.notify();
+                            })),
+                    ),
             );
-        }
-        for (key, label) in [
-            ("name", "主题名称"),
-            ("accent", "强调色"),
-            ("background", "窗口背景"),
-            ("surface", "卡片背景"),
-            ("text", "文字颜色"),
-        ] {
-            if let Some(input) = self.preferences_ui.appearance_fields.get(key) {
-                let mut field = row().child(div().w(px(100.)).text_sm().child(label));
-                if key != "name" {
-                    let color = studyapp_core::parse_theme_color(input.read(cx).value().trim())
-                        .unwrap_or(crate::theme::palette().surface);
-                    field = field.child(
-                        div()
-                            .size(px(22.))
-                            .rounded_md()
-                            .border_1()
-                            .border_color(crate::theme::color(BORDER))
-                            .bg(gpui_kit::rgb(color)),
-                    );
-                }
-                custom = custom.child(field.child(div().flex_1().child(form::input(input, busy))));
-            }
-        }
-        custom = custom.child(self.markdown_style_controls(busy, cx));
-        custom = custom.child(
-            row()
-                .child(
-                    Button::new("preview-custom-theme")
-                        .small()
-                        .primary()
-                        .label(if self.preferences_ui.editing_preset.is_some() {
-                            "更新并预览"
-                        } else {
-                            "创建并预览"
-                        })
-                        .disabled(busy)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if this.stage_custom_appearance(cx) {
-                                this.refresh_appearance(window, cx);
+            for preset in &appearance.custom_presets {
+                let id = preset.id.clone();
+                let delete_id = id.clone();
+                let selected = appearance.mode == ThemeMode::Custom
+                    && appearance.active_preset.as_ref() == Some(&id);
+                let mut select = Button::new(SharedString::from(format!("select-theme-{id}")))
+                    .small()
+                    .label(format!(
+                        "{}{}",
+                        if selected { "✓ " } else { "" },
+                        preset.name
+                    ))
+                    .disabled(busy)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let pending = this
+                            .preferences_ui
+                            .appearance_touched
+                            .then(|| this.custom_appearance_input(cx));
+                        let settings = if let Some(draft) = &mut this.preferences_ui.draft {
+                            if let Err(error) =
+                                select_custom_preset(&mut draft.appearance, pending, &id)
+                            {
+                                this.preferences_ui.error = Some(error.to_string());
+                                cx.notify();
+                                return;
                             }
-                        })),
-                )
-                .child(muted("#RRGGBB · 自动检查文字对比度")),
-        );
-        panel = panel.child(custom).child(
+                            this.preferences_ui.error = None;
+                            Some(draft.appearance.clone())
+                        } else {
+                            None
+                        };
+                        if let Some(settings) = settings {
+                            this.fill_appearance_fields(&settings, window, cx);
+                        }
+                        this.refresh_appearance(window, cx);
+                        cx.notify();
+                    }));
+                if selected {
+                    select = select.primary();
+                }
+                custom = custom.child(
+                    row().child(select).child(div().flex_1()).child(
+                        Button::new(SharedString::from(format!("delete-theme-{delete_id}")))
+                            .small()
+                            .label("删除")
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(draft) = &mut this.preferences_ui.draft {
+                                    draft
+                                        .appearance
+                                        .custom_presets
+                                        .retain(|preset| preset.id != delete_id);
+                                    if draft.appearance.active_preset.as_ref() == Some(&delete_id) {
+                                        draft.appearance.active_preset = None;
+                                        draft.appearance.mode = ThemeMode::System;
+                                    }
+                                }
+                                if this.preferences_ui.editing_preset.as_ref() == Some(&delete_id) {
+                                    this.fill_appearance_fields(
+                                        &studyapp_core::AppearanceSettings::default(),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                                this.refresh_appearance(window, cx);
+                                cx.notify();
+                            })),
+                    ),
+                );
+            }
+            for (key, label) in [
+                ("name", "主题名称"),
+                ("accent", "强调色"),
+                ("background", "窗口背景"),
+                ("surface", "卡片背景"),
+                ("text", "文字颜色"),
+            ] {
+                if let Some(input) = self.preferences_ui.appearance_fields.get(key) {
+                    let mut field = row().child(div().w(px(100.)).text_sm().child(label));
+                    if key != "name" {
+                        let color = studyapp_core::parse_theme_color(input.read(cx).value().trim())
+                            .unwrap_or(crate::theme::palette().surface);
+                        field = field.child(
+                            div()
+                                .size(px(22.))
+                                .rounded_md()
+                                .border_1()
+                                .border_color(crate::theme::color(BORDER))
+                                .bg(gpui_kit::rgb(color)),
+                        );
+                    }
+                    custom =
+                        custom.child(field.child(div().flex_1().child(form::input(input, busy))));
+                }
+            }
+            return custom;
+        }
+        if part == 2 {
+            return form::section("Markdown 预览").child(self.markdown_style_preview(cx));
+        }
+        if part == 3 {
+            return form::section("Markdown 参数")
+                .child(self.markdown_style_controls(busy, cx))
+                .child(
+                    row()
+                        .child(
+                            Button::new("preview-custom-theme")
+                                .small()
+                                .primary()
+                                .label(if self.preferences_ui.editing_preset.is_some() {
+                                    "更新并预览"
+                                } else {
+                                    "创建并预览"
+                                })
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    if this.stage_custom_appearance(cx) {
+                                        this.refresh_appearance(window, cx);
+                                    }
+                                })),
+                        )
+                        .child(muted("#RRGGBB · 自动检查文字对比度")),
+                );
+        }
+        column().child(
             card()
                 .gap_3()
                 .child(heading("工作区"))
@@ -1826,8 +2053,7 @@ impl StudyApp {
                                 })),
                         ),
                 ),
-        );
-        panel
+        )
     }
 
     pub fn poll_image_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2083,14 +2309,14 @@ impl StudyApp {
         panel.child(muted("云端模式保留本地离线缓存；上传失败时本地图片仍保留，可重试。更改存储方式不会自动补传旧图片，请保存后点击重试图片上传。"))
     }
 
-    fn shortcut_controls(&self, cx: &mut Context<Self>) -> Div {
+    pub fn shortcut_controls(&self, cx: &mut Context<Self>) -> Div {
         let busy = self.preferences_ui.busy || self.preferences_ui.replacing || self.storage_busy;
         let analysis = self.shortcut_analysis(cx);
-        let mut shortcuts = form::section("快捷键").child(muted(
+        let mut header = form::section("快捷键").child(muted(
             "点击当前绑定录制，Esc 取消；＋追加组合，×清空。冲突会显示在对应操作下。",
         ));
         if let Some(search) = &self.preferences_ui.shortcut_search {
-            shortcuts = shortcuts.child(form::input(search, busy));
+            header = header.child(form::input(search, busy));
         }
         let query = self
             .preferences_ui
@@ -2098,207 +2324,297 @@ impl StudyApp {
             .as_ref()
             .map(|search| search.read(cx).value().trim().to_lowercase())
             .unwrap_or_default();
-        let mut group = "";
-        let mut shown = 0;
-        for action in crate::shortcuts::SHORTCUT_ACTIONS {
-            let id = action.id;
-            let recording = self
-                .preferences_ui
+        let rows: Vec<usize> = crate::shortcuts::SHORTCUT_ACTIONS
+            .iter()
+            .enumerate()
+            .filter(|(_, action)| {
+                self.preferences_ui
+                    .recording
+                    .as_ref()
+                    .is_some_and(|recording| recording.action == action.id)
+                    || query.is_empty()
+                    || analysis
+                        .search
+                        .get(action.id)
+                        .is_some_and(|search| search.contains(&query))
+            })
+            .map(|(ix, _)| ix)
+            .collect();
+        let theme = crate::theme::palette();
+        self.preferences_ui.shortcut_rows.sync(
+            &rows,
+            ShortcutLayout {
+                analysis_revision: self.preferences_ui.shortcut_analysis.rebuilds(),
+                recording: self
+                    .preferences_ui
+                    .recording
+                    .as_ref()
+                    .map(|recording| recording.action.clone()),
+                recording_error: self.preferences_ui.recording_error.clone(),
+                font_size: theme.font_size,
+                spacing: theme.spacing,
+            },
+        );
+        self.preferences_ui.shortcut_rows.track_focus(
+            self.preferences_ui
                 .recording
                 .as_ref()
-                .is_some_and(|recording| recording.action == id);
-            if !recording
-                && !query.is_empty()
-                && !analysis
-                    .search
-                    .get(id)
-                    .is_some_and(|search| search.contains(&query))
-            {
-                continue;
-            }
-            let Some(binding) = analysis.bindings.get(id) else {
-                continue;
-            };
-            shown += 1;
-            if action.group != group {
-                group = action.group;
-                shortcuts = shortcuts.child(
-                    div()
-                        .pt_3()
-                        .pb_1()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(group),
-                );
-            }
-            let error = analysis.errors.get(id);
-            let counterparts = analysis.conflicts.get(id).map(|others| {
-                others
-                    .iter()
-                    .map(|other| {
-                        crate::shortcuts::SHORTCUT_ACTIONS
-                            .iter()
-                            .find(|action| action.id == other)
-                            .map_or(other.as_str(), |action| action.label)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("、")
-            });
-            let invalid = error.is_some() || counterparts.is_some();
-            let mut keys = form::binding_cell()
-                .id(SharedString::from(format!("record-shortcut-{id}")))
-                .test_support()
-                .flex_1()
-                .min_w(px(170.))
-                .flex_wrap()
-                .border_color(crate::theme::color(if recording {
-                    GREEN
-                } else if invalid {
-                    0xBE3434
-                } else {
-                    BORDER
-                }));
-            if !busy && !recording {
-                keys = keys
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.start_shortcut_recording(id, false, window, cx)
-                    }));
-            }
-            if recording {
-                let mut capture = row()
-                    .id("shortcut-recording-target")
+                .and_then(|recording| {
+                    let row = rows.iter().position(|&ix| {
+                        crate::shortcuts::SHORTCUT_ACTIONS[ix].id == recording.action
+                    })?;
+                    self.preferences_ui
+                        .recording_focus
+                        .clone()
+                        .map(|focus| (row, focus))
+                }),
+        );
+        #[cfg(feature = "ui-test")]
+        self.preferences_ui.shortcut_frame_rows.set(0);
+        let workspace = column()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .max_w(px(960.))
+            .gap_3()
+            .child(header);
+        if rows.is_empty() {
+            return workspace.child(
+                div()
+                    .id("settings-section-scroll")
                     .test_support()
                     .flex_1()
-                    .min_w_0()
-                    .gap_2()
+                    .child(muted("没有匹配的快捷键")),
+            );
+        }
+        // Keep an exact eager control only in the CI binary. Both paths use the
+        // same row builder, typography and variable-height contents for A/B timing.
+        #[cfg(feature = "ui-test")]
+        if self.preferences_ui.shortcut_eager_baseline {
+            return workspace.child(
+                scroll_body("settings-section-scroll", &self.settings_scroll)
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .gap_0()
+                    .px_4()
+                    .pb_4()
+                    .children(rows.iter().enumerate().map(|(row, &ix)| {
+                        let group = row == 0
+                            || crate::shortcuts::SHORTCUT_ACTIONS[rows[row - 1]].group
+                                != crate::shortcuts::SHORTCUT_ACTIONS[ix].group;
+                        self.shortcut_row(ix, group, &analysis, cx)
+                    })),
+            );
+        }
+        let owner = cx.entity();
+        workspace.child(form::virtual_rows(
+            &self.preferences_ui.shortcut_rows.scroll,
+            move |row, _, cx| {
+                let ix = rows[row];
+                let group = row == 0
+                    || crate::shortcuts::SHORTCUT_ACTIONS[rows[row - 1]].group
+                        != crate::shortcuts::SHORTCUT_ACTIONS[ix].group;
+                owner
+                    .update(cx, |this, cx| this.shortcut_row(ix, group, &analysis, cx))
+                    .into_any_element()
+            },
+        ))
+    }
+
+    fn shortcut_row(
+        &self,
+        index: usize,
+        show_group: bool,
+        analysis: &ShortcutAnalysis,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let busy = self.preferences_ui.busy || self.preferences_ui.replacing || self.storage_busy;
+        let action = &crate::shortcuts::SHORTCUT_ACTIONS[index];
+        let id = action.id;
+        #[cfg(feature = "ui-test")]
+        {
+            self.preferences_ui
+                .shortcut_row_builds
+                .set(self.preferences_ui.shortcut_row_builds.get() + 1);
+            self.preferences_ui
+                .shortcut_frame_rows
+                .set(self.preferences_ui.shortcut_frame_rows.get() | (1 << index));
+        }
+        let recording = self
+            .preferences_ui
+            .recording
+            .as_ref()
+            .is_some_and(|recording| recording.action == id);
+        let binding = analysis.bindings.get(id).map_or("", String::as_str);
+        let error = analysis.errors.get(id);
+        let counterparts = analysis.conflicts.get(id).map(|others| {
+            others
+                .iter()
+                .map(|other| {
+                    crate::shortcuts::SHORTCUT_ACTIONS
+                        .iter()
+                        .find(|action| action.id == other)
+                        .map_or(other.as_str(), |action| action.label)
+                })
+                .collect::<Vec<_>>()
+                .join("、")
+        });
+        let invalid = error.is_some() || counterparts.is_some();
+        let mut keys = form::binding_cell()
+            .id(SharedString::from(format!("record-shortcut-{id}")))
+            .test_support()
+            .flex_1()
+            .min_w(px(170.))
+            .flex_wrap()
+            .border_color(crate::theme::color(if recording {
+                GREEN
+            } else if invalid {
+                0xBE3434
+            } else {
+                BORDER
+            }));
+        if !busy && !recording {
+            keys = keys
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.start_shortcut_recording(id, false, window, cx)
+                }));
+        }
+        if recording {
+            let mut capture = row()
+                .id("shortcut-recording-target")
+                .test_support()
+                .flex_1()
+                .min_w_0()
+                .gap_2()
+                .flex_wrap()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .text_color(crate::theme::color(GREEN))
+                        .child("请按组合键…"),
+                )
+                .child(
+                    Button::new("cancel-shortcut-recording")
+                        .small()
+                        .ghost()
+                        .label("取消 · Esc")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.preferences_ui.recording = None;
+                            this.preferences_ui.recording_error = None;
+                            if let Some(search) = &this.preferences_ui.shortcut_search {
+                                search.read(cx).focus_handle(cx).focus(window, cx);
+                            }
+                            cx.notify();
+                        })),
+                );
+            if let Some(focus) = &self.preferences_ui.recording_focus {
+                capture = capture.track_focus(focus);
+            }
+            keys = keys.child(capture);
+        } else if binding.trim().is_empty() {
+            keys = keys.child(muted("点击设置"));
+        } else {
+            for (index, alias) in binding.split(';').enumerate() {
+                if index > 0 {
+                    keys = keys.child(muted(" / "));
+                }
+                for key in alias.split('+') {
+                    keys = keys.child(
+                        div()
+                            .px_1()
+                            .py_0p5()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(crate::theme::color(BORDER))
+                            .bg(crate::theme::color(0xFFFFFF))
+                            .text_xs()
+                            .text_color(crate::theme::color(if invalid { 0xBE3434 } else { INK }))
+                            .child(form::keycap_label(key).to_owned()),
+                    );
+                }
+            }
+        }
+        let mut entry = column()
+            .id(SharedString::from(format!("shortcut-row-{id}")))
+            .test_support()
+            .gap_1()
+            .py_2()
+            .border_b_1()
+            .border_color(crate::theme::color(BORDER))
+            .child(
+                row()
                     .flex_wrap()
+                    .gap_2()
                     .child(
                         div()
-                            .flex_1()
+                            .w(px(136.))
                             .text_sm()
-                            .text_color(crate::theme::color(GREEN))
-                            .child("请按组合键…"),
+                            .text_color(crate::theme::color(INK))
+                            .child(action.label),
                     )
+                    .child(keys)
                     .child(
-                        Button::new("cancel-shortcut-recording")
+                        Button::new(SharedString::from(format!("append-shortcut-{id}")))
                             .small()
                             .ghost()
-                            .label("取消 · Esc")
-                            .on_click(cx.listener(|this, _, window, cx| {
+                            .label("＋")
+                            .tooltip("追加快捷键")
+                            .disabled(busy || recording)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.start_shortcut_recording(id, true, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("clear-shortcut-{id}")))
+                            .small()
+                            .ghost()
+                            .label("×")
+                            .tooltip("清空快捷键")
+                            .disabled(busy || recording)
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 this.preferences_ui.recording = None;
                                 this.preferences_ui.recording_error = None;
-                                if let Some(search) = &this.preferences_ui.shortcut_search {
-                                    search.read(cx).focus_handle(cx).focus(window, cx);
+                                if let Some(input) = this.preferences_ui.shortcuts.get(id) {
+                                    input.update(cx, |input, cx| input.set_value("", window, cx));
                                 }
                                 cx.notify();
                             })),
-                    );
-                if let Some(focus) = &self.preferences_ui.recording_focus {
-                    capture = capture.track_focus(focus);
-                }
-                keys = keys.child(capture);
-            } else if binding.trim().is_empty() {
-                keys = keys.child(muted("点击设置"));
-            } else {
-                for (index, alias) in binding.split(';').enumerate() {
-                    if index > 0 {
-                        keys = keys.child(muted(" / "));
-                    }
-                    for key in alias.split('+') {
-                        keys = keys.child(
-                            div()
-                                .px_1()
-                                .py_0p5()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(crate::theme::color(BORDER))
-                                .bg(crate::theme::color(0xFFFFFF))
-                                .text_xs()
-                                .text_color(crate::theme::color(if invalid {
-                                    0xBE3434
-                                } else {
-                                    INK
-                                }))
-                                .child(form::keycap_label(key).to_owned()),
-                        );
-                    }
-                }
-            }
-            let mut entry = column()
-                .id(SharedString::from(format!("shortcut-row-{id}")))
-                .test_support()
-                .gap_1()
-                .py_2()
-                .border_b_1()
-                .border_color(crate::theme::color(BORDER))
-                .child(
-                    row()
-                        .flex_wrap()
-                        .gap_2()
-                        .child(
-                            div()
-                                .w(px(136.))
-                                .text_sm()
-                                .text_color(crate::theme::color(INK))
-                                .child(action.label),
-                        )
-                        .child(keys)
-                        .child(
-                            Button::new(SharedString::from(format!("append-shortcut-{id}")))
-                                .small()
-                                .ghost()
-                                .label("＋")
-                                .tooltip("追加快捷键")
-                                .disabled(busy || recording)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.start_shortcut_recording(id, true, window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("clear-shortcut-{id}")))
-                                .small()
-                                .ghost()
-                                .label("×")
-                                .tooltip("清空快捷键")
-                                .disabled(busy || recording)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.preferences_ui.recording = None;
-                                    this.preferences_ui.recording_error = None;
-                                    if let Some(input) = this.preferences_ui.shortcuts.get(id) {
-                                        input.update(cx, |input, cx| {
-                                            input.set_value("", window, cx)
-                                        });
-                                    }
-                                    cx.notify();
-                                })),
-                        ),
-                );
-            if let Some(counterparts) = counterparts {
-                entry = entry.child(
-                    muted(format!("冲突：{counterparts}"))
-                        .id(SharedString::from(format!("shortcut-conflict-{id}")))
-                        .test_support()
-                        .text_color(crate::theme::color(0xBE3434)),
-                );
-            }
-            if let Some(error) = error {
-                entry = entry.child(muted(error.clone()).text_color(crate::theme::color(0xBE3434)));
-            }
-            if recording && let Some(error) = &self.preferences_ui.recording_error {
-                entry = entry.child(
-                    muted(error.clone())
-                        .id("shortcut-recording-error")
-                        .test_support()
-                        .text_color(crate::theme::color(0xBE3434)),
-                );
-            }
-            shortcuts = shortcuts.child(entry);
+                    ),
+            );
+        if let Some(counterparts) = counterparts {
+            entry = entry.child(
+                muted(format!("冲突：{counterparts}"))
+                    .id(SharedString::from(format!("shortcut-conflict-{id}")))
+                    .test_support()
+                    .text_color(crate::theme::color(0xBE3434)),
+            );
         }
-        if shown == 0 {
-            shortcuts = shortcuts.child(muted("没有匹配的快捷键"));
+        if let Some(error) = error {
+            entry = entry.child(muted(error.clone()).text_color(crate::theme::color(0xBE3434)));
         }
-        shortcuts
+        if recording && let Some(error) = &self.preferences_ui.recording_error {
+            entry = entry.child(
+                muted(error.clone())
+                    .id("shortcut-recording-error")
+                    .test_support()
+                    .text_color(crate::theme::color(0xBE3434)),
+            );
+        }
+
+        column()
+            .gap_0()
+            .children(show_group.then(|| {
+                div()
+                    .pt_3()
+                    .pb_1()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(action.group)
+            }))
+            .child(entry)
     }
 }
 

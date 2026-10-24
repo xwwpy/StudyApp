@@ -498,6 +498,32 @@ impl ListState {
         Some(scroll_top >= scroll_max)
     }
 
+    /// Update the keyboard focus registration for one existing item, preserving
+    /// its measured size or unmeasured size hint and the current scroll anchor.
+    /// Unlike `splice_focusable`, this does not replace the item's contents.
+    pub fn set_item_focus_handle(&self, index: usize, focus: Option<FocusHandle>) {
+        let state = &mut *self.0.borrow_mut();
+        let mut cursor = state.items.cursor::<Count>(());
+        let mut items = cursor.slice(&Count(index), Bias::Right);
+        let Some(mut item) = cursor.item().cloned() else {
+            return;
+        };
+        match &mut item {
+            ListItem::Measured { focus_handle, .. }
+            | ListItem::Unmeasured { focus_handle, .. } => {
+                if *focus_handle == focus {
+                    return;
+                }
+                *focus_handle = focus;
+            }
+        }
+        items.extend(std::iter::once(item), ());
+        cursor.next();
+        items.append(cursor.suffix(), ());
+        drop(cursor);
+        state.items = items;
+    }
+
     /// Inform the list state that the items in `old_range` have been replaced
     /// by `count` new items that must be recalculated.
     pub fn splice(&self, old_range: Range<usize>, count: usize) {
@@ -1547,7 +1573,9 @@ impl Element for List {
         {
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
-                    size_hint: None,
+                    // Width invalidates the measured layout, not the estimated
+                    // scroll extent. Visible rows are measured again below.
+                    size_hint: item.size_hint(),
                     focus_handle: item.focus_handle(),
                 }),
                 (),

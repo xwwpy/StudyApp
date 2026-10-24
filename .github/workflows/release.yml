@@ -142,6 +142,26 @@ jobs:
             ${{ env.CLIPBOARD_DIR }}/*.log
           if-no-files-found: warn
           retention-days: 30
+      - name: Build optimized settings validation binary
+        run: cargo build --locked --release -p studyapp-desktop --features ui-test
+      - name: Verify optimized settings rendering
+        timeout-minutes: 5
+        run: |
+          $settingsDir = Join-Path $env:RUNNER_TEMP ('studyapp-optimized-settings-' + [guid]::NewGuid().ToString('N'))
+          "OPTIMIZED_SETTINGS_DIR=$settingsDir" >> $env:GITHUB_ENV
+          ./scripts/smoke-settings.ps1 -DataDirectory $settingsDir -BinaryPath ./target/release/studyapp.exe
+      - name: Preserve optimized settings evidence
+        if: always() && env.OPTIMIZED_SETTINGS_DIR != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-optimized-settings
+          path: |
+            ${{ env.OPTIMIZED_SETTINGS_DIR }}/settings-*
+            ${{ env.OPTIMIZED_SETTINGS_DIR }}/*.log
+            ${{ env.OPTIMIZED_SETTINGS_DIR }}/smoke-input-mode.txt
+          if-no-files-found: error
+          retention-days: 30
+      # Ship a normal executable after testing the optimized UI-test build.
       - run: cargo build --locked --release -p studyapp-desktop
       - name: Package portable executable and notices
         run: ./scripts/package.ps1 -Version $env:RELEASE_VERSION

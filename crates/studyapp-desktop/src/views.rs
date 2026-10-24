@@ -907,7 +907,11 @@ impl StudyApp {
                             .test_support()
                             .flex_shrink_0(),
                     )
-                    .child(
+                    .child(if section == SettingsSection::Shortcuts {
+                        self.shortcut_controls(cx).into_any_element()
+                    } else if section == SettingsSection::Appearance {
+                        self.appearance_surface(cx).into_any_element()
+                    } else {
                         scroll_body("settings-section-scroll", &self.settings_scroll)
                             .test_support()
                             .flex_1()
@@ -915,8 +919,9 @@ impl StudyApp {
                             .min_w_0()
                             .pr_4()
                             .pb_4()
-                            .child(content),
-                    ),
+                            .child(content)
+                            .into_any_element()
+                    }),
             )
     }
 }

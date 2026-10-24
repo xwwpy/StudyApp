@@ -26,6 +26,281 @@ fn settings_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     result
 }
 
+fn timing_summary(mut samples: Vec<u64>) -> serde_json::Value {
+    samples.sort_unstable();
+    let count = samples.len();
+    serde_json::json!({
+        "count": count,
+        "p50_us": samples[count.div_ceil(2) - 1],
+        "p95_us": samples[(count * 95).div_ceil(100) - 1],
+        "samples_us_sorted": samples,
+    })
+}
+
+/// Same-process A/B on the actual row builder. Event measurements end after
+/// GPUI's refresh/draw/clear, not compositor presentation or OS input delivery.
+fn measure_settings(window: &mut Window, view: &Entity<StudyApp>, database: &Path, cx: &mut App) {
+    let mut results = Vec::new();
+    for (section, category, eager) in [
+        (SettingsSection::Shortcuts, "shortcuts_eager_control", true),
+        (SettingsSection::Shortcuts, "shortcuts_virtual", false),
+        (SettingsSection::Learning, "learning", false),
+        (
+            SettingsSection::Appearance,
+            "appearance_eager_control",
+            true,
+        ),
+        (
+            SettingsSection::Appearance,
+            "appearance_virtual_cached",
+            false,
+        ),
+    ] {
+        view.update(cx, |app, cx| {
+            app.select_settings_section(section, cx);
+            app.preferences_ui.section_changed_at = None;
+            app.preferences_ui.shortcut_eager_baseline = eager;
+            app.preferences_ui.appearance_eager_baseline = eager;
+            app.reset_shortcut_scroll();
+            cx.notify();
+        });
+        for _ in 0..3 {
+            window.render_frame(cx);
+        }
+        let input = match section {
+            SettingsSection::Shortcuts => view
+                .read(cx)
+                .preferences_ui
+                .shortcut_search
+                .as_ref()
+                .unwrap()
+                .clone(),
+            SettingsSection::Learning => view.read(cx).interval.clone(),
+            SettingsSection::Appearance => {
+                view.read(cx).preferences_ui.appearance_fields["name"].clone()
+            }
+            _ => unreachable!(),
+        };
+        let original = input.read(cx).value();
+        let appearance_touched = view.read(cx).preferences_ui.appearance_touched;
+        let mut frames = Vec::new();
+        let mut builds = Vec::new();
+        let mut distinct = Vec::new();
+        let work = |app: &StudyApp| {
+            if section == SettingsSection::Appearance {
+                app.appearance_render_work()
+            } else {
+                app.shortcut_render_work()
+            }
+        };
+        for _ in 0..20 {
+            view.update(cx, |_, cx| cx.notify());
+            let before = work(view.read(cx)).0;
+            let start = std::time::Instant::now();
+            window.render_frame(cx);
+            frames.push(start.elapsed().as_micros() as u64);
+            let (after, rows) = work(view.read(cx));
+            builds.push(after - before);
+            distinct.push(rows);
+        }
+        if section == SettingsSection::Shortcuts {
+            if eager {
+                assert!(
+                    distinct
+                        .iter()
+                        .all(|&rows| rows as usize == crate::shortcuts::SHORTCUT_ACTIONS.len())
+                );
+            } else {
+                assert!(
+                    distinct.iter().all(|&rows| rows > 0
+                        && (rows as usize) < crate::shortcuts::SHORTCUT_ACTIONS.len()),
+                    "shortcut viewport still constructs every row"
+                );
+            }
+        }
+        if section == SettingsSection::Appearance {
+            assert!(
+                distinct.iter().all(|&parts| if eager {
+                    parts == 5
+                } else {
+                    parts > 0 && parts < 5
+                }),
+                "appearance still constructs every section outside the viewport"
+            );
+        }
+        input.read(cx).focus_handle(cx).focus(window, cx);
+        window.press("end", cx);
+        window.render_frame(cx);
+        let mut inputs = Vec::new();
+        let mut input_builds = Vec::new();
+        for ix in 0..20 {
+            let before = work(view.read(cx)).0;
+            let start = std::time::Instant::now();
+            let keystroke = if ix % 2 == 0 {
+                let mut key = Keystroke::parse("h").unwrap();
+                key.key_char = Some("h".into());
+                key
+            } else {
+                Keystroke::parse("backspace").unwrap().with_simulated_ime()
+            };
+            window.dispatch_keystroke(keystroke.clone(), cx);
+            window.dispatch_event(KeyUpEvent { keystroke }.to_platform_input(), cx);
+            window.render_frame(cx);
+            inputs.push(start.elapsed().as_micros() as u64);
+            input_builds.push(work(view.read(cx)).0 - before);
+        }
+        assert_eq!(
+            input.read(cx).value(),
+            original,
+            "performance input sequence changed the draft"
+        );
+        // Restore the touched flag: the benchmark types and erases a temporary
+        // character, and must not change subsequent save/leave assertions.
+        view.update(cx, |app, cx| {
+            app.preferences_ui.appearance_touched = appearance_touched;
+            app.reset_shortcut_scroll();
+            cx.notify();
+        });
+        window.render_frame(cx);
+        let mut wheels = Vec::new();
+        let mut wheel_builds = Vec::new();
+        for ix in 0..20 {
+            let viewport = window.find("settings-section-scroll").bounds();
+            let before = work(view.read(cx)).0;
+            let start = std::time::Instant::now();
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position: point(viewport.left() + px(5.), viewport.center().y),
+                    delta: ScrollDelta::Pixels(point(
+                        px(0.),
+                        px(if ix < 10 { -100. } else { 100. }),
+                    )),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+            wheels.push(start.elapsed().as_micros() as u64);
+            wheel_builds.push(work(view.read(cx)).0 - before);
+        }
+        results.push(serde_json::json!({
+            "category": category,
+            "unchanged_render_frame": timing_summary(frames),
+            "input_dispatch_and_render": timing_summary(inputs),
+            "wheel_dispatch_and_render": timing_summary(wheels),
+            "row_or_section_builder_calls_per_unchanged_frame": (section != SettingsSection::Learning).then_some(builds),
+            "distinct_rows_or_sections_per_unchanged_frame": (section != SettingsSection::Learning).then_some(distinct),
+            "row_or_section_builder_calls_per_input_frame": (section != SettingsSection::Learning).then_some(input_builds),
+            "row_or_section_builder_calls_per_wheel_frame": (section != SettingsSection::Learning).then_some(wheel_builds),
+        }));
+    }
+    view.update(cx, |app, cx| {
+        app.preferences_ui.shortcut_eager_baseline = false;
+        app.preferences_ui.appearance_eager_baseline = false;
+        app.select_settings_section(SettingsSection::Shortcuts, cx);
+        app.preferences_ui.section_changed_at = None;
+        app.reset_shortcut_scroll();
+        cx.notify();
+    });
+    window.render_frame(cx);
+    std::fs::write(database.with_file_name("settings-render-timing.json"), serde_json::to_string_pretty(&serde_json::json!({
+        "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "measurement": "GPUI TestWindowExt refresh/draw/clear. Input and wheel include GPUI event dispatch; excludes OS input transit and compositor presentation. Eager and virtual use the same row builder in this binary; this is not a historical executable comparison.",
+        "viewport": { "width": f32::from(window.viewport_size().width), "height": f32::from(window.viewport_size().height) },
+        "shortcut_actions": crate::shortcuts::SHORTCUT_ACTIONS.len(),
+        "results": results,
+    })).unwrap()).unwrap();
+}
+
+async fn measure_appearance_cache(
+    window: AnyWindowHandle,
+    view: &Entity<StudyApp>,
+    database: &Path,
+    cx: &mut AsyncApp,
+) {
+    window
+        .update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.navigate(Page::Settings, window, cx);
+                app.select_settings_section(SettingsSection::Appearance, cx);
+                app.preferences_ui.section_changed_at = None;
+                app.preferences_ui.appearance_eager_baseline = false;
+                cx.notify();
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+    let mut samples = Vec::new();
+    let mut builds = Vec::new();
+    for _ in 0..20 {
+        // Flush the parent notification in its own update. A render_frame call
+        // would force Window::refresh and deliberately bypass GPUI view caches.
+        window
+            .update(cx, |_, _, cx| view.update(cx, |_, cx| cx.notify()))
+            .unwrap();
+        let (micros, count) = window
+            .update(cx, |_, window, cx| {
+                let before = view.read(cx).appearance_render_work().0;
+                let started = std::time::Instant::now();
+                window.draw(cx).clear(cx);
+                (
+                    started.elapsed().as_micros() as u64,
+                    view.read(cx).appearance_render_work().0 - before,
+                )
+            })
+            .unwrap();
+        samples.push(micros);
+        builds.push(count);
+    }
+    let (input, original, before_edit) = window
+        .update(cx, |_, _, cx| {
+            let input = view.read(cx).preferences_ui.appearance_fields["name"].clone();
+            let original = input.read(cx).value();
+            (input, original, view.read(cx).appearance_render_work().0)
+        })
+        .unwrap();
+    window
+        .update(cx, |_, window, cx| {
+            input.update(cx, |input, cx| {
+                input.set_value(format!("{original} cache-probe"), window, cx)
+            });
+            view.update(cx, |_, cx| cx.notify());
+        })
+        .unwrap();
+    let after_edit = window
+        .update(cx, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            view.read(cx).appearance_render_work().0
+        })
+        .unwrap();
+    window
+        .update(cx, |_, window, cx| {
+            input.update(cx, |input, cx| input.set_value(original, window, cx));
+            view.update(cx, |_, cx| cx.notify());
+        })
+        .unwrap();
+    window
+        .update(cx, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    std::fs::write(database.with_file_name("settings-appearance-cache-timing.json"), serde_json::to_string_pretty(&serde_json::json!({
+        "measurement": "Parent cx.notify flushed in a separate update, then Window::draw/clear WITHOUT Window::refresh; excludes OS presentation. Zero section builds means the cached viewport was reused, not zero GPU work.",
+        "parent_notify_draw": timing_summary(samples),
+        "section_builder_calls_per_draw": builds,
+        "section_builder_calls_for_changed_field": after_edit - before_edit,
+    })).unwrap()).unwrap();
+    assert!(
+        builds.iter().all(|&count| count == 0),
+        "unchanged parent notifications rebuilt the appearance viewport"
+    );
+    assert!(
+        after_edit > before_edit,
+        "changed appearance input did not invalidate the cached viewport"
+    );
+}
+
 pub async fn exercise(
     window: AnyWindowHandle,
     view: &Entity<StudyApp>,
@@ -33,6 +308,7 @@ pub async fn exercise(
     cx: &mut AsyncApp,
 ) {
     settled(window, view, cx).await;
+    measure_appearance_cache(window, view, database, cx).await;
     window
         .update(cx, |_, window, cx| {
             crate::smoke_library::resize(window, size(px(1280.), px(900.)));
@@ -58,15 +334,28 @@ pub async fn exercise(
                 "settings-section-scroll",
                 cx,
             );
-            assert_eq!(view.read(cx).appearance_preview_rebuilds(), preview_rebuilds, "unrelated appearance checkbox rebuilt Markdown preview colors");
+            assert_eq!(
+                view.read(cx).appearance_preview_rebuilds(),
+                preview_rebuilds,
+                "unrelated appearance checkbox rebuilt Markdown preview colors"
+            );
             let body_size = view.read(cx).preferences_ui.appearance_fields["md-body-size"].clone();
             let original_body_size = body_size.read(cx).value();
             body_size.update(cx, |input, cx| input.set_value("18", window, cx));
             window.render_frame(cx);
-            assert_eq!(view.read(cx).appearance_preview_rebuilds(), preview_rebuilds + 1, "programmatic field change did not refresh preview");
-            body_size.update(cx, |input, cx| input.set_value(original_body_size, window, cx));
+            assert_eq!(
+                view.read(cx).appearance_preview_rebuilds(),
+                preview_rebuilds + 1,
+                "programmatic field change did not refresh preview"
+            );
+            body_size.update(cx, |input, cx| {
+                input.set_value(original_body_size, window, cx)
+            });
             window.render_frame(cx);
-            assert_eq!(view.read(cx).appearance_preview_rebuilds(), preview_rebuilds + 2);
+            assert_eq!(
+                view.read(cx).appearance_preview_rebuilds(),
+                preview_rebuilds + 2
+            );
             for (section, id, _) in SettingsSection::ALL {
                 window.click(SharedString::from(format!("settings-section-{id}")), cx);
                 window.render_frame(cx);
@@ -148,21 +437,7 @@ pub async fn exercise(
                 );
             }
             let rebuilds = view.read(cx).shortcut_analysis_rebuilds();
-            let mut frame_micros = Vec::with_capacity(20);
-            for _ in 0..20 {
-                view.update(cx, |_, cx| cx.notify());
-                let started = std::time::Instant::now();
-                window.render_frame(cx);
-                frame_micros.push(started.elapsed().as_micros() as u64);
-            }
-            frame_micros.sort_unstable();
-            std::fs::write(database.with_file_name("settings-render-timing.json"), serde_json::to_string_pretty(&serde_json::json!({
-                "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
-                "measurement": "GPUI TestWindowExt render_frame (refresh + draw + clear), unchanged shortcuts page",
-                "frames": frame_micros.len(), "actions": crate::shortcuts::SHORTCUT_ACTIONS.len(),
-                "p50_us": frame_micros[9], "p95_us": frame_micros[18], "samples_us": frame_micros,
-                "analysis_rebuilds_before": rebuilds, "analysis_rebuilds_after": view.read(cx).shortcut_analysis_rebuilds(),
-            })).unwrap()).unwrap();
+            measure_settings(window, view, database, cx);
             assert_eq!(
                 view.read(cx).shortcut_analysis_rebuilds(),
                 rebuilds,
@@ -183,7 +458,11 @@ pub async fn exercise(
                 capture.top() >= cell.top() && capture.bottom() <= cell.bottom(),
                 "key capture escaped its binding cell"
             );
-            window.render_to_image().unwrap().save(database.with_file_name("settings-inline-recording.png")).unwrap();
+            window
+                .render_to_image()
+                .unwrap()
+                .save(database.with_file_name("settings-inline-recording.png"))
+                .unwrap();
             window.press("ctrl-s", cx);
             window.render_frame(cx);
             assert!(view.read(cx).preferences_ui.recording.is_none());
